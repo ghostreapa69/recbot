@@ -70,6 +70,34 @@ app.use(async (req, res, next) => {
 
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 
+// ----------------------------------------------
+// FFmpeg concurrency + configuration
+// ----------------------------------------------
+const FFMPEG_MAX_CONCURRENCY = parseInt(process.env.FFMPEG_MAX_CONCURRENCY || '2');
+const FFMPEG_OUTPUT_HZ = process.env.FFMPEG_OUTPUT_HZ || '16000'; // lower for smaller payloads
+let ffmpegActive = 0;
+const ffmpegQueue = [];
+function acquireFfmpegSlot() {
+  return new Promise(resolve => {
+    const tryStart = () => {
+      if (ffmpegActive < FFMPEG_MAX_CONCURRENCY) {
+        ffmpegActive++;
+        resolve();
+        return true;
+      }
+      return false;
+    };
+    if (!tryStart()) ffmpegQueue.push(tryStart);
+  });
+}
+function releaseFfmpegSlot() {
+  ffmpegActive = Math.max(0, ffmpegActive - 1);
+  while (ffmpegQueue.length && ffmpegActive < FFMPEG_MAX_CONCURRENCY) {
+    const starter = ffmpegQueue.shift();
+    if (starter) starter();
+  }
+}
+
 // --- AUTO SESSION EXPIRATION (4h) ---
 const MAX_SESSION_HOURS = parseInt(process.env.MAX_SESSION_HOURS || '4');
 const MAX_INACTIVITY_MINUTES = parseInt(process.env.MAX_INACTIVITY_MINUTES || '30');
@@ -387,19 +415,34 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
     console.log(`🔄 [CONVERT] Starting FFmpeg WAV conversion: ${s3Key}`);
     const conversionStartTime = Date.now();
     
-    // FFmpeg command to convert and save to temp file
-    const ffmpeg = spawn('ffmpeg', [
-      '-i', 'pipe:0',           // Input from stdin
-      '-f', 'wav',              // WAV format 
-      '-acodec', 'pcm_s16le',   // PCM 16-bit 
-      '-ac', '1',               // Mono for faster processing
-      '-ar', '22050',           // Lower sample rate for faster processing
-      tmpCachePath              // Output to temp file
-    ]);
+    // Ensure we do not exceed concurrent ffmpeg processes
+    await acquireFfmpegSlot();
+    
+    const ffmpegArgs = [
+      '-hide_banner',
+      '-loglevel', process.env.FFMPEG_LOGLEVEL || 'warning',
+      '-nostdin',
+      '-i', 'pipe:0',            // Input from stdin
+      '-fflags', '+discardcorrupt',
+      '-err_detect', 'ignore_err', // treat minor decode errors as non-fatal
+      '-f', 'wav',
+      '-acodec', 'pcm_s16le',
+      '-ac', '1',
+      '-ar', FFMPEG_OUTPUT_HZ,
+      '-y',                      // overwrite temp file if exists
+      tmpCachePath
+    ];
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
 
     // Error handling
     ffmpeg.stderr.on('data', (data) => {
-      console.error(`FFmpeg stderr: ${data}`);
+      const msg = data.toString();
+      // Suppress repetitive benign warnings while keeping them visible for diagnostics
+      if (/Packet is too small/i.test(msg)) {
+        console.warn(`⚠️  [FFmpeg WARN] ${msg.trim()}`);
+      } else {
+        console.error(`FFmpeg stderr: ${msg}`);
+      }
     });
 
     ffmpeg.on('error', (error) => {
@@ -408,6 +451,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
         res.status(500).json({ error: 'Audio conversion failed' });
       }
       if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
+      releaseFfmpegSlot();
     });
 
     // Stream input to FFmpeg
@@ -417,12 +461,21 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
       const conversionTime = Date.now() - conversionStartTime;
       console.log(`⏱️ [CONVERSION] Completed in ${conversionTime}ms`);
       
-      if (code !== 0) {
-        console.error(`❌ FFmpeg process exited with code ${code}`);
+      // Even if non-zero, sometimes partial output exists; validate file size
+      let tmpOk = false;
+      try {
+        if (fs.existsSync(tmpCachePath)) {
+          const st = fs.statSync(tmpCachePath);
+            tmpOk = st.size > 1024; // require minimal size
+        }
+      } catch {}
+      if (code !== 0 && !tmpOk) {
+        console.error(`❌ FFmpeg exited with code ${code} and no usable output.`);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Failed to convert audio' });
         }
         if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
+        releaseFfmpegSlot();
         return;
       }
 
@@ -475,6 +528,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
         }
         if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
       }
+      releaseFfmpegSlot();
     });
   } catch (err) {
     console.error('Error streaming S3 file:', err);
