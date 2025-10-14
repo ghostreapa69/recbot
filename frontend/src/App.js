@@ -19,6 +19,7 @@ import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
 import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import FileViewer from './FileViewer';
 import AdminPage from './AdminPage';
+import ReportsPage from './ReportsPage';
 
 // Try build-time env var first, then runtime config
 const CLERK_PUBLISHABLE_KEY = process.env.REACT_APP_CLERK_PUBLISHABLE_KEY;
@@ -122,7 +123,10 @@ function Navigation({ darkMode, setDarkMode }) {
           )}
           
           <Button component={Link} to="/" variant="text" size="small">
-            Files
+            Recordings
+          </Button>
+          <Button component={Link} to="/reports" variant="text" size="small">
+            Reports
           </Button>
           
           <FormControlLabel
@@ -159,6 +163,7 @@ function AppContent() {
               <Routes>
                 <Route path="/" element={<FileViewer darkMode={darkMode} />} />
                 <Route path="/admin" element={<AdminPage darkMode={darkMode} />} />
+                <Route path="/reports" element={<ReportsPage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Routes>
             </DomainValidator>

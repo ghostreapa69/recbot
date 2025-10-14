@@ -6,8 +6,29 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Database path
-const DB_PATH = process.env.DB_PATH || '/root/db/recbot.db';
+// Database path. Provide cross-platform fallback if /root not available (e.g., Windows dev)
+let DB_PATH = process.env.DB_PATH || '/root/db/recbot.db';
+try {
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) {
+    // If attempting to create /root/... fails or path starts with /root on non-Unix, fallback
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      const fallback = path.join(process.cwd(), 'data');
+      if (!fs.existsSync(fallback)) fs.mkdirSync(fallback, { recursive: true });
+      DB_PATH = path.join(fallback, 'recbot.db');
+      console.warn(`⚠️  Falling back DB path to ${DB_PATH}`);
+    }
+  }
+} catch (e) {
+  console.warn('⚠️  DB path initialization issue, using local fallback:', e.message);
+  const fallback = path.join(process.cwd(), 'data');
+  if (!fs.existsSync(fallback)) {
+    try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
+  }
+  DB_PATH = path.join(fallback, 'recbot.db');
+}
 
 // Initialize database
 const db = new Database(DB_PATH);
@@ -27,11 +48,44 @@ db.exec(`
     email TEXT,
     call_date TEXT,  -- Store as YYYY-MM-DD for easy querying
     call_time TEXT,  -- Store as HH:MM:SS
-    call_id TEXT,    -- New: numeric call identifier extracted from filename
+    call_id TEXT,    -- numeric call identifier extracted from filename
     duration_ms INTEGER,
     file_size INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// Reporting table (separate)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reporting (
+    call_id TEXT PRIMARY KEY,
+    timestamp TEXT,
+    campaign TEXT,
+    call_type TEXT,
+    agent TEXT,
+    agent_name TEXT,
+    disposition TEXT,
+    ani TEXT,
+    customer_name TEXT,
+    dnis TEXT,
+    call_time INTEGER,
+    bill_time_rounded INTEGER,
+    cost REAL,
+    ivr_time INTEGER,
+    queue_wait_time INTEGER,
+    ring_time INTEGER,
+    talk_time INTEGER,
+    hold_time INTEGER,
+    park_time INTEGER,
+    after_call_work_time INTEGER,
+    transfers INTEGER,
+    conferences INTEGER,
+    holds INTEGER,
+    abandoned INTEGER,
+    recordings TEXT,
+    raw_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -60,6 +114,44 @@ try {
   }
 } catch (e) {
   console.warn('⚠️  [MIGRATION] files.call_id migration/index issue:', e.message);
+}
+
+// Reporting table indexes (ensured after table creation earlier)
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reporting_timestamp ON reporting(timestamp);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reporting_agent ON reporting(agent);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reporting_campaign ON reporting(campaign);`);
+} catch (e) {
+  console.warn('⚠️  [MIGRATION] reporting index creation issue:', e.message);
+}
+
+// Migration: Normalize non-ISO timestamps in reporting table (run lightly with limit to avoid huge locks)
+try {
+  const toFix = db.prepare(`SELECT call_id, timestamp FROM reporting WHERE timestamp IS NOT NULL AND timestamp NOT LIKE '%T%' LIMIT 500`).all();
+  if (toFix.length) {
+    const updateStmt = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
+    const parseCandidates = [
+      'YYYY-MM-DD HH:mm:ss',
+      'MM/DD/YYYY HH:mm:ss',
+      'MM/DD/YYYY hh:mm:ss A',
+      'MM/DD/YY HH:mm:ss',
+      'MM/DD/YY hh:mm:ss A'
+    ];
+    let converted = 0;
+    for (const row of toFix) {
+      let iso = null;
+      const raw = row.timestamp;
+      for (const fmt of parseCandidates) {
+        const d = new Date(raw);
+        // Fallback simple: rely on Date parse first (ensures we don't add heavy deps here)
+        if (!isNaN(d.getTime())) { iso = d.toISOString(); break; }
+      }
+      if (iso) { updateStmt.run(iso, row.call_id); converted++; }
+    }
+    if (converted) console.log(`🛠️  [MIGRATION] Normalized ${converted} reporting timestamps to ISO`);
+  }
+} catch (e) {
+  console.warn('⚠️  [MIGRATION] reporting timestamp normalization issue:', e.message);
 }
 
 // Create audit logging tables
@@ -342,6 +434,62 @@ const statements = {
     LIMIT ?
   `)
 };
+
+// Reporting prepared statements
+statements.upsertReport = db.prepare(`
+  INSERT INTO reporting (call_id, timestamp, campaign, call_type, agent, agent_name, disposition, ani, customer_name, dnis, call_time, bill_time_rounded, cost, ivr_time, queue_wait_time, ring_time, talk_time, hold_time, park_time, after_call_work_time, transfers, conferences, holds, abandoned, recordings, raw_json)
+  VALUES (@call_id, @timestamp, @campaign, @call_type, @agent, @agent_name, @disposition, @ani, @customer_name, @dnis, @call_time, @bill_time_rounded, @cost, @ivr_time, @queue_wait_time, @ring_time, @talk_time, @hold_time, @park_time, @after_call_work_time, @transfers, @conferences, @holds, @abandoned, @recordings, @raw_json)
+  ON CONFLICT(call_id) DO UPDATE SET
+    timestamp=excluded.timestamp,
+    campaign=excluded.campaign,
+    call_type=excluded.call_type,
+    agent=excluded.agent,
+    agent_name=excluded.agent_name,
+    disposition=excluded.disposition,
+    ani=excluded.ani,
+    customer_name=excluded.customer_name,
+    dnis=excluded.dnis,
+    call_time=excluded.call_time,
+    bill_time_rounded=excluded.bill_time_rounded,
+    cost=excluded.cost,
+    ivr_time=excluded.ivr_time,
+    queue_wait_time=excluded.queue_wait_time,
+    ring_time=excluded.ring_time,
+    talk_time=excluded.talk_time,
+    hold_time=excluded.hold_time,
+    park_time=excluded.park_time,
+    after_call_work_time=excluded.after_call_work_time,
+    transfers=excluded.transfers,
+    conferences=excluded.conferences,
+    holds=excluded.holds,
+    abandoned=excluded.abandoned,
+    recordings=excluded.recordings,
+    raw_json=excluded.raw_json;
+`);
+statements.queryReports = db.prepare(`
+  SELECT * FROM reporting
+  WHERE 1=1
+    AND (? IS NULL OR datetime(timestamp) >= datetime(?))
+    AND (? IS NULL OR datetime(timestamp) <= datetime(?))
+    AND (? IS NULL OR agent LIKE '%' || ? || '%')
+    AND (? IS NULL OR campaign = ?)
+    AND (? IS NULL OR call_type = ?)
+    AND (? IS NULL OR ani LIKE '%' || ? || '%')
+    AND (? IS NULL OR dnis LIKE '%' || ? || '%')
+  ORDER BY datetime(timestamp) DESC
+  LIMIT ? OFFSET ?;
+`);
+statements.countReports = db.prepare(`
+  SELECT COUNT(*) as total FROM reporting
+  WHERE 1=1
+    AND (? IS NULL OR datetime(timestamp) >= datetime(?))
+    AND (? IS NULL OR datetime(timestamp) <= datetime(?))
+    AND (? IS NULL OR agent LIKE '%' || ? || '%')
+    AND (? IS NULL OR campaign = ?)
+    AND (? IS NULL OR call_type = ?)
+    AND (? IS NULL OR ani LIKE '%' || ? || '%')
+    AND (? IS NULL OR dnis LIKE '%' || ? || '%');
+`);
 
 // Additional maintenance statements for backfilling missing call_id values on audit_logs
 try {
@@ -853,6 +1001,66 @@ export function getDistinctUsers(search = null, limit = 20) {
     console.error('Error getting distinct users:', error);
     return [];
   }
+}
+
+// ----------------------------------------------
+// Reporting helpers
+// ----------------------------------------------
+export function upsertReportRow(row) {
+  try {
+    statements.upsertReport.run(row);
+    return true;
+  } catch (e) {
+    console.error('Failed to upsert report row', e.message, row?.call_id);
+    return false;
+  }
+}
+
+export function bulkUpsertReports(rows = []) {
+  const tx = db.transaction((items) => {
+    let inserted = 0;
+    for (const r of items) {
+      try { statements.upsertReport.run(r); inserted++; } catch { /* ignore duplicate errors */ }
+    }
+    return inserted;
+  });
+  return tx(rows);
+}
+
+export function queryReports({ start=null, end=null, agent=null, campaign=null, callType=null, ani=null, dnis=null, limit=100, offset=0 } = {}) {
+  try {
+    const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
+    const s = norm(start);
+    const e = norm(end);
+    const a = norm(agent);
+    const c = norm(campaign);
+    const ct = norm(callType);
+    const an = norm(ani);
+    const dn = norm(dnis);
+    const rows = statements.queryReports.all(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn, limit, offset);
+    const { total } = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn);
+    return { rows, total };
+  } catch (e) {
+    console.error('Failed to query reports', e);
+    return { rows: [], total: 0 };
+  }
+}
+
+// Debug summary for reporting (min/max timestamps & total rows) -- used by an optional endpoint
+export function getReportingSummary() {
+  try {
+    const row = db.prepare(`SELECT COUNT(*) as total, MIN(timestamp) as minTs, MAX(timestamp) as maxTs FROM reporting`).get();
+    return row || { total:0, minTs:null, maxTs:null };
+  } catch (e) {
+    return { total:0, minTs:null, maxTs:null, error: e.message };
+  }
+}
+
+export function getDistinctCampaigns() {
+  try { return db.prepare(`SELECT DISTINCT campaign FROM reporting WHERE campaign IS NOT NULL AND campaign <> '' ORDER BY campaign`).all().map(r=>r.campaign); } catch { return []; }
+}
+export function getDistinctCallTypes() {
+  try { return db.prepare(`SELECT DISTINCT call_type FROM reporting WHERE call_type IS NOT NULL AND call_type <> '' ORDER BY call_type`).all().map(r=>r.call_type); } catch { return []; }
 }
 
 export { db, statements };

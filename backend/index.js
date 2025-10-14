@@ -15,7 +15,8 @@ import {
   PutObjectCommand,
   HeadObjectCommand
 } from "@aws-sdk/client-s3";
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds } from './database.js';
+import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes } from './database.js';
+import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -143,6 +144,86 @@ setInterval(() => {
     console.error('Auto session expiry error:', e);
   }
 }, 5 * 60 * 1000);
+
+// Kick off 45-minute Five9 ingestion scheduler with immediate startup run
+scheduleRecurringIngestion45();
+
+// Endpoint to manually trigger last hour report fetch (admin only)
+app.post('/api/reports/ingest', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const result = await fetchLastHourCallLog({ auditUser: req.user });
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Query reports with filters
+app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
+  try {
+    const { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0 } = req.query;
+    const result = queryReports({ start: start || null, end: end || null, agent: agent || null, campaign: campaign || null, callType: callType || null, ani: ani || null, dnis: dnis || null, limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 });
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_VIEW',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          filters: { start: start || null, end: end || null, agent: agent || null, campaign: campaign || null, callType: callType || null, ani: ani || null, dnis: dnis || null },
+          pagination: { limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 },
+          returned: result.rows ? result.rows.length : 0,
+          total: result.total || 0
+        }
+      );
+    } catch (e) {
+      console.warn('REPORT_VIEW audit log failed:', e.message);
+    }
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Distinct meta for dropdowns
+app.get('/api/reports/meta', requireAuth, ensureSession, async (req, res) => {
+  try {
+    const campaigns = getDistinctCampaigns();
+    const callTypes = getDistinctCallTypes();
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_META_VIEW',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        { campaigns: campaigns.length, callTypes: callTypes.length }
+      );
+    } catch (e) {
+      console.warn('REPORT_META_VIEW audit log failed:', e.message);
+    }
+    res.json({ success:true, campaigns, callTypes });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Debug summary endpoint for reporting (admin only for safety)
+app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, (req, res) => {
+  try {
+    const summary = getReportingSummary();
+    res.json({ success:true, summary });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // Public endpoint to get client configuration
 app.get('/api/config', (req, res) => {
