@@ -15,6 +15,9 @@ import {
   PutObjectCommand,
   HeadObjectCommand
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import http from 'http';
+import https from 'https';
 import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
@@ -69,7 +72,54 @@ app.use(async (req, res, next) => {
   return next();
 });
 
-const s3 = new S3Client({ region: process.env.AWS_REGION });
+// Tunable S3 HTTP configuration to avoid socket exhaustion under heavy parallel audio/waveform requests
+const S3_MAX_SOCKETS = parseInt(process.env.S3_MAX_SOCKETS || '200', 10); // default 50 -> raise
+const S3_SOCKET_TIMEOUT_MS = parseInt(process.env.S3_SOCKET_TIMEOUT_MS || '60000', 10);
+const S3_CONNECTION_TIMEOUT_MS = parseInt(process.env.S3_CONNECTION_TIMEOUT_MS || '10000', 10);
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  requestHandler: new NodeHttpHandler({
+    connectionTimeout: S3_CONNECTION_TIMEOUT_MS,
+    socketTimeout: S3_SOCKET_TIMEOUT_MS,
+    httpAgent: new http.Agent({ keepAlive: true, maxSockets: S3_MAX_SOCKETS }),
+    httpsAgent: new https.Agent({ keepAlive: true, maxSockets: S3_MAX_SOCKETS })
+  })
+});
+console.log(`[S3] Client initialized region=${process.env.AWS_REGION} maxSockets=${S3_MAX_SOCKETS} socketTimeoutMs=${S3_SOCKET_TIMEOUT_MS}`);
+
+// Lightweight HEAD cache to reduce duplicate S3 HeadObject traffic (TTL 60s)
+const headCacheTTL = parseInt(process.env.S3_HEAD_CACHE_TTL_MS || '60000', 10);
+const headCache = new Map(); // key -> { ts, exists }
+function headCacheGet(key){
+  const v = headCache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.ts > headCacheTTL){ headCache.delete(key); return null; }
+  return v.exists;
+}
+function headCacheSet(key, exists){ headCache.set(key, { ts: Date.now(), exists }); }
+
+// Concurrency limiter for audio S3 operations (avoid enqueuing hundreds exceeding socket capacity)
+const AUDIO_S3_MAX_CONCURRENT = parseInt(process.env.AUDIO_S3_MAX_CONCURRENT || '30', 10);
+let audioS3Active = 0; const audioS3Queue = [];
+function acquireAudioS3(){
+  return new Promise(resolve => {
+    const tryStart = () => {
+      if (audioS3Active < AUDIO_S3_MAX_CONCURRENT){ audioS3Active++; resolve(); return true; }
+      return false;
+    };
+    if (!tryStart()) audioS3Queue.push(tryStart);
+  });
+}
+function releaseAudioS3(){
+  audioS3Active = Math.max(0, audioS3Active - 1);
+  while (audioS3Queue.length && audioS3Active < AUDIO_S3_MAX_CONCURRENT){
+    const starter = audioS3Queue.shift();
+    if (starter) starter();
+  }
+}
+setInterval(()=>{
+  if (audioS3Active) console.log(`[AUDIO S3] active=${audioS3Active} queued=${audioS3Queue.length}`);
+}, 15000);
 
 // ----------------------------------------------
 // FFmpeg concurrency + configuration
@@ -443,26 +493,17 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
 
     // Check if already cached
     if (!forceNoCache) {
-      try {
-        const headStarted = Date.now();
-        const headPromise = s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: cacheKey }));
-        // Add a 5s timeout to avoid indefinite hang
-        const headResult = await Promise.race([
-          headPromise,
-          new Promise((_, reject) => setTimeout(()=> reject(new Error('Head timeout after 5000ms')), 5000))
-        ]);
-        if (headResult) {
-          console.log(`⚡ [CACHE HIT][${requestId}] Found cached file in ${Date.now()-headStarted}ms: ${cacheKey}`);
-          req._playAudit = { cacheHit: true };
-          const range = req.headers.range;
-          const params = { Bucket: BUCKET_NAME, Key: cacheKey };
-          if (range) {
-            params.Range = range;
-            res.status(206);
-          }
-          const cachedCommand = new GetObjectCommand(params);
-            const cachedFetchStart = Date.now();
-          const cachedResponse = await s3.send(cachedCommand);
+      const cachedHead = headCacheGet(cacheKey);
+      if (cachedHead) {
+        console.log(`⚡ [CACHE HIT][${requestId}] (HEAD cache) ${cacheKey}`);
+        req._playAudit = { cacheHit: true, cachedHead: true };
+        const range = req.headers.range;
+        const params = { Bucket: BUCKET_NAME, Key: cacheKey };
+        if (range) { params.Range = range; res.status(206); }
+        await acquireAudioS3();
+        try {
+          const cachedFetchStart = Date.now();
+          const cachedResponse = await s3.send(new GetObjectCommand(params));
           console.log(`⚡ [CACHE FETCH][${requestId}] Stream start after ${Date.now()-cachedFetchStart}ms`);
           res.setHeader('Content-Type', 'audio/wav');
           res.setHeader('Accept-Ranges', 'bytes');
@@ -473,11 +514,50 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           cachedResponse.Body.on('error', e=> console.error(`❌ [CACHE STREAM ERR][${requestId}]`, e));
           res.on('close', ()=> console.log(`📤 [CACHE STREAM CLOSED][${requestId}] durationMs=${Date.now()-startedTs}`));
           cachedResponse.Body.pipe(res);
+          releaseAudioS3();
           return;
+        } catch (e) {
+          releaseAudioS3();
+          console.warn(`⚠️ [CACHE FETCH FAIL][${requestId}] proceeding to convert: ${e.message}`);
         }
-      } catch (e) {
-        console.log(`📦 [CACHE MISS][${requestId}] (${e.message}) Need to convert: ${s3Key}`);
-        req._playAudit = { cacheHit: false, headError: e.message };
+      } else {
+        try {
+          const headStarted = Date.now();
+          await acquireAudioS3();
+          const headPromise = s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: cacheKey }));
+          const headResult = await Promise.race([
+            headPromise,
+            new Promise((_, reject) => setTimeout(()=> reject(new Error('Head timeout after 5000ms')), 5000))
+          ]);
+          releaseAudioS3();
+          if (headResult) {
+            headCacheSet(cacheKey, true);
+            console.log(`⚡ [CACHE HIT][${requestId}] Found cached file in ${Date.now()-headStarted}ms: ${cacheKey}`);
+            req._playAudit = { cacheHit: true };
+            const range = req.headers.range;
+            const params = { Bucket: BUCKET_NAME, Key: cacheKey };
+            if (range) { params.Range = range; res.status(206); }
+            await acquireAudioS3();
+            const cachedFetchStart = Date.now();
+            const cachedResponse = await s3.send(new GetObjectCommand(params));
+            releaseAudioS3();
+            console.log(`⚡ [CACHE FETCH][${requestId}] Stream start after ${Date.now()-cachedFetchStart}ms`);
+            res.setHeader('Content-Type', 'audio/wav');
+            res.setHeader('Accept-Ranges', 'bytes');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
+            if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
+            if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
+            cachedResponse.Body.on('error', e=> console.error(`❌ [CACHE STREAM ERR][${requestId}]`, e));
+            res.on('close', ()=> console.log(`📤 [CACHE STREAM CLOSED][${requestId}] durationMs=${Date.now()-startedTs}`));
+            cachedResponse.Body.pipe(res);
+            return;
+          }
+        } catch (e) {
+          releaseAudioS3();
+          console.log(`📦 [CACHE MISS][${requestId}] (${e.message}) Need to convert: ${s3Key}`);
+          req._playAudit = { cacheHit: false, headError: e.message };
+        }
       }
     } else {
       console.log(`🚫 [CACHE BYPASS][${requestId}] Forced conversion due to query param`);
