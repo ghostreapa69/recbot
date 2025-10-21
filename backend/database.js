@@ -435,6 +435,36 @@ const statements = {
   `)
 };
 
+statements.userUsageReport = db.prepare(`
+  SELECT 
+    al.user_id AS user_id,
+    al.user_email AS user_email,
+    COUNT(*) AS total_actions,
+    SUM(al.action_type = 'LOGIN') AS login_count,
+    SUM(al.action_type = 'LOGOUT') AS logout_count,
+    SUM(al.action_type = 'PLAY_FILE') AS play_count,
+    SUM(al.action_type = 'DOWNLOAD_FILE') AS download_count,
+    SUM(al.action_type = 'VIEW_FILES') AS view_count,
+    SUM(al.action_type = 'REPORT_VIEW') AS report_view_count,
+    SUM(al.action_type = 'REPORT_DOWNLOAD') AS report_download_count,
+    MAX(al.action_timestamp) AS last_action_at,
+    COALESCE((
+      SELECT SUM(us.session_duration_ms)
+      FROM user_sessions us
+      WHERE us.user_id = al.user_id
+        AND (? IS NULL OR DATE(us.login_time) >= ?)
+        AND (? IS NULL OR DATE(us.login_time) <= ?)
+    ), 0) AS total_session_ms
+  FROM audit_logs al
+  WHERE (? IS NULL OR DATE(al.action_timestamp) >= ?)
+    AND (? IS NULL OR DATE(al.action_timestamp) <= ?)
+  GROUP BY al.user_id, al.user_email
+  ORDER BY total_actions DESC, al.user_email ASC
+`);
+
+const AUDIT_EXPORT_MAX_ROWS = parseInt(process.env.AUDIT_EXPORT_MAX_ROWS || '10000', 10);
+const USER_USAGE_EXPORT_MAX_ROWS = parseInt(process.env.USER_USAGE_EXPORT_MAX_ROWS || '5000', 10);
+
 // Reporting prepared statements
 statements.upsertReport = db.prepare(`
   INSERT INTO reporting (call_id, timestamp, campaign, call_type, agent, agent_name, disposition, ani, customer_name, dnis, call_time, bill_time_rounded, cost, ivr_time, queue_wait_time, ring_time, talk_time, hold_time, park_time, after_call_work_time, transfers, conferences, holds, abandoned, recordings, raw_json)
@@ -897,6 +927,55 @@ export function getAuditLogs(userId = null, actionType = null, startDate = null,
   }
 }
 
+export function exportAuditLogs(filters = {}, maxRows = AUDIT_EXPORT_MAX_ROWS) {
+  const {
+    userId = null,
+    actionType = null,
+    startDate = null,
+    endDate = null,
+    callId = null
+  } = filters;
+
+  try {
+    const { total } = statements.countAuditLogs.get(
+      userId, userId,
+      actionType, actionType,
+      startDate, startDate,
+      endDate, endDate,
+      callId, callId
+    );
+
+    if (total > maxRows) {
+      return { rows: [], total, truncated: true, maxRows };
+    }
+
+    const rows = [];
+    const chunkSize = 500;
+    let offset = 0;
+
+    while (offset < total) {
+      const chunk = statements.getAuditLogs.all(
+        userId, userId,
+        actionType, actionType,
+        startDate, startDate,
+        endDate, endDate,
+        callId, callId,
+        chunkSize,
+        offset
+      );
+
+      if (!chunk.length) break;
+      rows.push(...chunk);
+      offset += chunk.length;
+    }
+
+    return { rows, total, truncated: false, maxRows };
+  } catch (error) {
+    console.error('Error exporting audit logs:', error);
+    return { rows: [], total: 0, truncated: false, maxRows, error: error.message };
+  }
+}
+
 export function getUserSessions(userId = null, startDate = null, endDate = null, limit = 100, offset = 0) {
   try {
     return statements.getUserSessions.all(
@@ -909,6 +988,43 @@ export function getUserSessions(userId = null, startDate = null, endDate = null,
     console.error('Error getting user sessions:', error);
     return [];
   }
+}
+
+export function getUserUsageReport(startDate = null, endDate = null) {
+  try {
+    const rows = statements.userUsageReport.all(
+      startDate, startDate,
+      endDate, endDate,
+      startDate, startDate,
+      endDate, endDate
+    );
+
+    return rows.map(row => ({
+      user_id: row.user_id,
+      user_email: row.user_email,
+      total_actions: Number(row.total_actions) || 0,
+      login_count: Number(row.login_count) || 0,
+      logout_count: Number(row.logout_count) || 0,
+      play_count: Number(row.play_count) || 0,
+      download_count: Number(row.download_count) || 0,
+      view_count: Number(row.view_count) || 0,
+      report_view_count: Number(row.report_view_count) || 0,
+      report_download_count: Number(row.report_download_count) || 0,
+      last_action_at: row.last_action_at || null,
+      total_session_ms: Number(row.total_session_ms) || 0
+    }));
+  } catch (error) {
+    console.error('Error generating user usage report:', error);
+    return [];
+  }
+}
+
+export function exportUserUsageReport(startDate = null, endDate = null, maxRows = USER_USAGE_EXPORT_MAX_ROWS) {
+  const rows = getUserUsageReport(startDate, endDate);
+  if (rows.length > maxRows) {
+    return { rows: [], total: rows.length, truncated: true, maxRows };
+  }
+  return { rows, total: rows.length, truncated: false, maxRows };
 }
 
 export function getLastLogin(userId) {

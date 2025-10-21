@@ -18,7 +18,7 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes } from './database.js';
+import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
 
@@ -120,6 +120,26 @@ function releaseAudioS3(){
 setInterval(()=>{
   if (audioS3Active) console.log(`[AUDIO S3] active=${audioS3Active} queued=${audioS3Queue.length}`);
 }, 15000);
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (str.length === 0) return '';
+  const needsQuotes = /[",\n\r]/.test(str);
+  const escaped = str.replace(/"/g, '""');
+  return needsQuotes ? `"${escaped}"` : escaped;
+}
+
+function buildCsv(rows, columns) {
+  const headerLine = columns.map(col => escapeCsvValue(col.header)).join(',');
+  const dataLines = rows.map(row => columns.map(col => {
+    if (typeof col.accessor === 'function') {
+      return escapeCsvValue(col.accessor(row));
+    }
+    return escapeCsvValue(row[col.key]);
+  }).join(','));
+  return [headerLine, ...dataLines].join('\r\n');
+}
 
 // ----------------------------------------------
 // FFmpeg concurrency + configuration
@@ -1318,6 +1338,81 @@ app.get('/api/audit-logs', requireAuth, ensureSession, requireAdmin, (req, res) 
   }
 });
 
+app.get('/api/audit-logs/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const {
+      userId,
+      actionType,
+      startDate,
+      endDate,
+      callId
+    } = req.query;
+
+    const exportResult = exportAuditLogs({
+      userId: userId || null,
+      actionType: actionType || null,
+      startDate: startDate || null,
+      endDate: endDate || null,
+      callId: callId || null
+    });
+
+    if (exportResult.error) {
+      throw new Error(exportResult.error);
+    }
+
+    if (exportResult.truncated) {
+      return res.status(400).json({
+        error: `Too many matching audit rows (${exportResult.total}). Narrow your filters to export fewer than ${exportResult.maxRows} rows.`,
+        total: exportResult.total,
+        maxRows: exportResult.maxRows
+      });
+    }
+
+    const nowIso = new Date().toISOString().replace(/[:]/g, '-');
+    const csv = buildCsv(exportResult.rows, [
+      { key: 'id', header: 'id' },
+      { key: 'user_id', header: 'user_id' },
+      { key: 'user_email', header: 'user_email' },
+      { key: 'action_type', header: 'action_type' },
+      { key: 'file_path', header: 'file_path' },
+      { key: 'call_id', header: 'call_id' },
+      { key: 'action_timestamp', header: 'action_timestamp' },
+      { key: 'ip_address', header: 'ip_address' },
+      { key: 'user_agent', header: 'user_agent' },
+      { key: 'session_id', header: 'session_id' },
+      { key: 'additional_data', header: 'additional_data' }
+    ]);
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_DOWNLOAD',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'audit_logs',
+          filters: { userId: userId || null, actionType: actionType || null, startDate: startDate || null, endDate: endDate || null, callId: callId || null },
+          exported: exportResult.rows.length
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_DOWNLOAD audit log failed:', auditErr.message);
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="audit-logs-${nowIso}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('Error exporting audit logs:', err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Maintenance endpoint to backfill missing audit log call_ids from additional_data JSON
 app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin, (req, res) => {
   try {
@@ -1328,6 +1423,138 @@ app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin
   } catch (e) {
     console.error('Error backfilling audit call_ids:', e);
     res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const rows = getUserUsageReport(startDate || null, endDate || null);
+
+    const payloadRows = rows.map(row => ({
+      userId: row.user_id,
+      userEmail: row.user_email,
+      totalActions: row.total_actions,
+      loginCount: row.login_count,
+      logoutCount: row.logout_count,
+      playCount: row.play_count,
+      downloadCount: row.download_count,
+      viewCount: row.view_count,
+      reportViewCount: row.report_view_count,
+      reportDownloadCount: row.report_download_count,
+      lastActionAt: row.last_action_at,
+      totalSessionMs: row.total_session_ms,
+      totalSessionMinutes: row.total_session_ms ? Math.round(row.total_session_ms / 60000) : 0
+    }));
+
+    const summary = payloadRows.reduce((acc, row) => {
+      acc.totalUsers += 1;
+      acc.totalActions += row.totalActions;
+      acc.loginCount += row.loginCount;
+      acc.downloadCount += row.downloadCount;
+      acc.playCount += row.playCount;
+      acc.reportViewCount += row.reportViewCount;
+      acc.reportDownloadCount += row.reportDownloadCount;
+      acc.totalSessionMinutes += row.totalSessionMinutes;
+      return acc;
+    }, {
+      totalUsers: 0,
+      totalActions: 0,
+      loginCount: 0,
+      downloadCount: 0,
+      playCount: 0,
+      reportViewCount: 0,
+      reportDownloadCount: 0,
+      totalSessionMinutes: 0
+    });
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_VIEW',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'user_usage',
+          filters: { startDate: startDate || null, endDate: endDate || null },
+          returned: payloadRows.length
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_VIEW audit log failed:', auditErr.message);
+    }
+
+    res.json({ success: true, rows: payloadRows, summary });
+  } catch (err) {
+    console.error('Error loading user usage report:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireAdmin, (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const exportResult = exportUserUsageReport(startDate || null, endDate || null);
+
+    if (exportResult.truncated) {
+      return res.status(400).json({
+        error: `Too many users (${exportResult.total}) to export. Narrow the date range to fewer than ${exportResult.maxRows} rows.`,
+        total: exportResult.total,
+        maxRows: exportResult.maxRows
+      });
+    }
+
+    const nowIso = new Date().toISOString().replace(/[:]/g, '-');
+    const csv = buildCsv(exportResult.rows, [
+      { key: 'user_id', header: 'user_id' },
+      { key: 'user_email', header: 'user_email' },
+      { key: 'total_actions', header: 'total_actions' },
+      { key: 'login_count', header: 'login_count' },
+      { key: 'logout_count', header: 'logout_count' },
+      { key: 'play_count', header: 'play_count' },
+      { key: 'download_count', header: 'download_count' },
+      { key: 'view_count', header: 'view_count' },
+      { key: 'report_view_count', header: 'report_view_count' },
+      { key: 'report_download_count', header: 'report_download_count' },
+      { key: 'last_action_at', header: 'last_action_at' },
+      {
+        key: 'total_session_ms',
+        header: 'total_session_minutes',
+        accessor: (row) => row.total_session_ms ? Math.round(row.total_session_ms / 60000) : 0
+      }
+    ]);
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_DOWNLOAD',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'user_usage',
+          filters: { startDate: startDate || null, endDate: endDate || null },
+          exported: exportResult.rows.length
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_DOWNLOAD audit log failed:', auditErr.message);
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="user-usage-${nowIso}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('Error exporting user usage report:', err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: err.message });
   }
 });
 

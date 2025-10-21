@@ -37,7 +37,9 @@ import {
   Sync as SyncIcon,
   Warning as WarningIcon,
   Security as AuditIcon,
-  People as UsersIcon
+  People as UsersIcon,
+  Download as DownloadIcon,
+  Assessment as ReportIcon
 } from '@mui/icons-material';
 
 function AdminPage({ darkMode }) {
@@ -54,6 +56,7 @@ function AdminPage({ darkMode }) {
   const [userSessions, setUserSessions] = useState([]);
   const [sessionReasons, setSessionReasons] = useState({}); // Map sessionId -> reason string
   const [auditLoading, setAuditLoading] = useState(false);
+  const [auditExporting, setAuditExporting] = useState(false);
   const [auditFilters, setAuditFilters] = useState({
     actionType: '',
     startDate: '',
@@ -90,6 +93,16 @@ function AdminPage({ darkMode }) {
   const [auditPage, setAuditPage] = useState(1);
   const [sessionsPage, setSessionsPage] = useState(1);
   const callIdDebounceRef = React.useRef(null);
+  const usageFetchedRef = React.useRef(false);
+
+  // User usage reporting state
+  const [usageStartDate, setUsageStartDate] = useState('');
+  const [usageEndDate, setUsageEndDate] = useState('');
+  const [usageRows, setUsageRows] = useState([]);
+  const [usageSummary, setUsageSummary] = useState(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageError, setUsageError] = useState('');
+  const [usageExporting, setUsageExporting] = useState(false);
 
   // Check if user has admin role
   const isAdmin = user?.publicMetadata?.role === 'admin';
@@ -146,6 +159,52 @@ function AdminPage({ darkMode }) {
       console.error('Error fetching audit logs:', error);
     } finally {
       setAuditLoading(false);
+    }
+  };
+
+  const downloadAuditCsv = async () => {
+    if (!isAdmin || auditExporting) return;
+    setAuditExporting(true);
+    try {
+      const params = new URLSearchParams({
+        ...(auditFilters.actionType && { actionType: auditFilters.actionType }),
+        ...(auditFilters.startDate && { startDate: auditFilters.startDate }),
+        ...(auditFilters.endDate && { endDate: auditFilters.endDate }),
+        ...(auditFilters.userId && { userId: auditFilters.userId }),
+        ...(auditFilters.callId && { callId: auditFilters.callId })
+      });
+      const token = await getToken();
+      const qs = params.toString();
+      const response = await fetch(`/api/audit-logs/export${qs ? `?${qs}` : ''}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+
+      if (!response.ok) {
+        let message = 'Failed to export audit logs';
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          try {
+            const data = await response.json();
+            if (data?.error) message = data.error;
+          } catch {/* ignore */}
+        }
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `audit-logs-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Audit CSV export failed:', err);
+      alert(err.message || 'Failed to export audit logs');
+    } finally {
+      setAuditExporting(false);
     }
   };
 
@@ -207,6 +266,85 @@ function AdminPage({ darkMode }) {
     }
   };
 
+  const fetchUserUsage = async () => {
+    if (!isAdmin) return;
+    setUsageLoading(true);
+    setUsageError('');
+    try {
+      const params = new URLSearchParams({
+        ...(usageStartDate && { startDate: usageStartDate }),
+        ...(usageEndDate && { endDate: usageEndDate })
+      });
+      const token = await getToken();
+      const qs = params.toString();
+      const response = await fetch(`/api/reporting/user-usage${qs ? `?${qs}` : ''}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await response.json().catch(() => ({ success: false }));
+      if (!response.ok || !data.success) {
+        throw new Error(data?.error || 'Failed to load user usage report');
+      }
+      setUsageRows(data.rows || []);
+      setUsageSummary(data.summary || null);
+    } catch (err) {
+      console.error('User usage report failed:', err);
+      setUsageError(err.message || 'Failed to load report');
+      setUsageRows([]);
+      setUsageSummary(null);
+    } finally {
+      setUsageLoading(false);
+    }
+  };
+
+  const downloadUserUsageCsv = async () => {
+    if (!isAdmin || usageExporting) return;
+    setUsageExporting(true);
+    try {
+      const params = new URLSearchParams({
+        ...(usageStartDate && { startDate: usageStartDate }),
+        ...(usageEndDate && { endDate: usageEndDate })
+      });
+      const token = await getToken();
+      const qs = params.toString();
+      const response = await fetch(`/api/reporting/user-usage/export${qs ? `?${qs}` : ''}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        let message = 'Failed to export user usage report';
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          try {
+            const data = await response.json();
+            if (data?.error) message = data.error;
+          } catch {/* ignore */}
+        }
+        throw new Error(message);
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `user-usage-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('User usage CSV export failed:', err);
+      alert(err.message || 'Failed to export report');
+    } finally {
+      setUsageExporting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    if (currentTab === 3 && !usageFetchedRef.current) {
+      usageFetchedRef.current = true;
+      fetchUserUsage();
+    }
+  }, [currentTab, isAdmin]);
+
   const syncDatabase = async (dateRange = null) => {
     setSyncing(true);
     setSyncProgress("Starting database sync...");
@@ -264,6 +402,7 @@ function AdminPage({ darkMode }) {
         <Tab label="Database Management" icon={<DatabaseIcon />} />
         <Tab label="Audit Logs" icon={<AuditIcon />} />
         <Tab label="User Sessions" icon={<UsersIcon />} />
+        <Tab label="Reporting" icon={<ReportIcon />} />
       </Tabs>
 
       {currentTab === 0 && (
@@ -574,6 +713,126 @@ function AdminPage({ darkMode }) {
               </TableBody>
             </Table>
           </TableContainer>
+        </Paper>
+      )}
+
+      {currentTab === 3 && (
+        <Paper elevation={1} sx={{ p: 3, mb: 3, backgroundColor: darkMode ? 'grey.900' : 'grey.50' }}>
+          <Typography variant="h6" gutterBottom>
+            Reporting • User Usage
+          </Typography>
+
+          <Grid container spacing={2} sx={{ mb: 2 }}>
+            <Grid item xs={12} sm={6} md={3}>
+              <TextField
+                fullWidth
+                size="small"
+                label="Start Date"
+                type="date"
+                value={usageStartDate}
+                onChange={(e) => setUsageStartDate(e.target.value)}
+                InputLabelProps={{ shrink: true }}
+              />
+            </Grid>
+            <Grid item xs={12} sm={6} md={3}>
+              <TextField
+                fullWidth
+                size="small"
+                label="End Date"
+                type="date"
+                value={usageEndDate}
+                onChange={(e) => setUsageEndDate(e.target.value)}
+                InputLabelProps={{ shrink: true }}
+              />
+            </Grid>
+            <Grid item xs={12} sm={6} md={3} display="flex" alignItems="center" gap={1}>
+              <Button
+                variant="contained"
+                onClick={fetchUserUsage}
+                disabled={usageLoading}
+                startIcon={<ReportIcon />}
+              >
+                Load Report
+              </Button>
+              <Button
+                variant="outlined"
+                onClick={downloadUserUsageCsv}
+                disabled={usageLoading || usageExporting}
+                startIcon={<DownloadIcon />}
+              >
+                Export CSV
+              </Button>
+            </Grid>
+          </Grid>
+
+          {usageError && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {usageError}
+            </Alert>
+          )}
+
+          {usageSummary && (
+            <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+              <Typography variant="subtitle2" gutterBottom>Summary</Typography>
+              <Grid container spacing={2}>
+                <Grid item xs={12} sm={6} md={3}><Typography variant="body2" color="text.secondary">Users</Typography><Typography variant="h6">{usageSummary.totalUsers}</Typography></Grid>
+                <Grid item xs={12} sm={6} md={3}><Typography variant="body2" color="text.secondary">Total Actions</Typography><Typography variant="h6">{usageSummary.totalActions}</Typography></Grid>
+                <Grid item xs={12} sm={6} md={3}><Typography variant="body2" color="text.secondary">Downloads</Typography><Typography variant="h6">{usageSummary.downloadCount}</Typography></Grid>
+                <Grid item xs={12} sm={6} md={3}><Typography variant="body2" color="text.secondary">Report Views</Typography><Typography variant="h6">{usageSummary.reportViewCount}</Typography></Grid>
+                <Grid item xs={12} sm={6} md={3}><Typography variant="body2" color="text.secondary">Report Downloads</Typography><Typography variant="h6">{usageSummary.reportDownloadCount}</Typography></Grid>
+                <Grid item xs={12} sm={6} md={3}><Typography variant="body2" color="text.secondary">Total Session Minutes</Typography><Typography variant="h6">{usageSummary.totalSessionMinutes}</Typography></Grid>
+              </Grid>
+            </Paper>
+          )}
+
+          {usageLoading ? (
+            <LinearProgress />
+          ) : (
+            <TableContainer>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>User</TableCell>
+                    <TableCell align="right">Total Actions</TableCell>
+                    <TableCell align="right">Logins</TableCell>
+                    <TableCell align="right">Downloads</TableCell>
+                    <TableCell align="right">Plays</TableCell>
+                    <TableCell align="right">Report Views</TableCell>
+                    <TableCell align="right">Report Downloads</TableCell>
+                    <TableCell align="right">Session Minutes</TableCell>
+                    <TableCell>Last Activity</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {usageRows.map((row) => (
+                    <TableRow key={row.userId || row.userEmail}>
+                      <TableCell>
+                        <Box display="flex" flexDirection="column">
+                          <Typography variant="body2">{row.userEmail}</Typography>
+                          <Typography variant="caption" color="text.secondary">{row.userId}</Typography>
+                        </Box>
+                      </TableCell>
+                      <TableCell align="right">{row.totalActions}</TableCell>
+                      <TableCell align="right">{row.loginCount}</TableCell>
+                      <TableCell align="right">{row.downloadCount}</TableCell>
+                      <TableCell align="right">{row.playCount}</TableCell>
+                      <TableCell align="right">{row.reportViewCount}</TableCell>
+                      <TableCell align="right">{row.reportDownloadCount}</TableCell>
+                      <TableCell align="right">{row.totalSessionMinutes}</TableCell>
+                      <TableCell>{row.lastActionAt ? new Date(row.lastActionAt).toLocaleString() : '-'}</TableCell>
+                    </TableRow>
+                  ))}
+                  {usageRows.length === 0 && !usageError && (
+                    <TableRow>
+                      <TableCell colSpan={9} align="center">
+                        No data available for the selected range.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
         </Paper>
       )}
 
