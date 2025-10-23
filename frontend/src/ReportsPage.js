@@ -1,9 +1,30 @@
 import React, { useEffect, useState } from 'react';
 import { useUser, useAuth } from '@clerk/clerk-react';
 import { Container, Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Paper, Pagination, Stack, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer } from '@mui/material';
+import { LocalizationProvider, DateTimePicker } from '@mui/x-date-pickers';
+import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 function formatMs(ms){ if(!ms) return '0s'; const s=Math.floor(ms/1000); const m=Math.floor(s/60); const rem=s%60; return `${m}m ${rem}s`; }
+
+function formatTimestamp(ts) {
+  if (!ts) return '-';
+  try {
+    // Parse and convert to local time for display
+    const parsed = dayjs(ts);
+    if (parsed.isValid()) {
+      return parsed.format('YYYY-MM-DD HH:mm:ss');
+    }
+  } catch (e) {
+    console.warn('Failed to parse timestamp:', ts);
+  }
+  return ts; // Return as-is if parsing fails
+}
 
 export default function ReportsPage(){
   const { user } = useUser();
@@ -18,8 +39,8 @@ export default function ReportsPage(){
   const [dnis,setDnis]=useState('');
   const [campaigns,setCampaigns]=useState([]);
   const [callTypes,setCallTypes]=useState([]);
-  const [start,setStart]=useState('');
-  const [end,setEnd]=useState('');
+  const [startDate,setStartDate]=useState(null);
+  const [endDate,setEndDate]=useState(null);
   const [page,setPage]=useState(1); const [pageSize,setPageSize]=useState(50); const [total,setTotal]=useState(0);
   const [initialized,setInitialized]=useState(false);
   const isAdmin = user?.publicMetadata?.role === 'admin';
@@ -29,14 +50,32 @@ export default function ReportsPage(){
     try {
       const token = await getToken();
       const params = new URLSearchParams();
-      if (start) params.append('start', start);
-      if (end) params.append('end', end);
-      if (agent) params.append('agent', agent);
-      if (campaign) params.append('campaign', campaign);
+      
+      // Five9 stores data in Pacific time, so convert user's local time to Pacific
+      const FIVE9_TZ = 'America/Los_Angeles';
+      const userTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+      
+      // Convert date pickers from user's timezone to Pacific time in Five9 format
+      if (startDate) {
+        // Convert the same moment in time to Pacific timezone
+        const pacificTime = dayjs(startDate).tz(FIVE9_TZ);
+        const formatted = pacificTime.format('ddd, DD MMM YYYY HH:mm:ss');
+        params.append('start', formatted);
+        console.log(`Start: ${dayjs(startDate).format('YYYY-MM-DD HH:mm:ss')} (local) -> ${formatted} (Pacific)`);
+      }
+      if (endDate) {
+        const pacificTime = dayjs(endDate).tz(FIVE9_TZ);
+        const formatted = pacificTime.format('ddd, DD MMM YYYY HH:mm:ss');
+        params.append('end', formatted);
+        console.log(`End: ${dayjs(endDate).format('YYYY-MM-DD HH:mm:ss')} (local) -> ${formatted} (Pacific)`);
+      }
+      if (userTz) params.append('timezone', userTz);
+      if (agent && agent !== 'undefined') params.append('agent', agent);
+      if (campaign && campaign !== 'undefined') params.append('campaign', campaign);
       // Append remaining optional filters
-      if (callType) params.append('callType', callType);
-      if (ani) params.append('ani', ani);
-      if (dnis) params.append('dnis', dnis);
+      if (callType && callType !== 'undefined') params.append('callType', callType);
+      if (ani && ani !== 'undefined') params.append('ani', ani);
+      if (dnis && dnis !== 'undefined') params.append('dnis', dnis);
       params.append('limit', pageSize);
       params.append('offset', (page - 1) * pageSize);
       const res = await fetch(`/api/reports?${params.toString()}`, { headers: { Authorization: `Bearer ${token}` }});
@@ -47,7 +86,7 @@ export default function ReportsPage(){
     } catch (e) {
       setError(e.message);
     } finally { setLoading(false); }
-  }, [getToken, agent, campaign, callType, ani, dnis, start, end, page, pageSize]);
+  }, [getToken, agent, campaign, callType, ani, dnis, startDate, endDate, page, pageSize]);
 
   const ingest = async () => {
     if(!isAdmin) return;
@@ -62,18 +101,18 @@ export default function ReportsPage(){
 
   const fixTimezones = async () => {
     if(!isAdmin) return;
-    if(!window.confirm('This will convert ALL existing timestamps from Five9 timezone to UTC. This may take a minute for large datasets. Continue?')) return;
+    if(!window.confirm('This will:\n1. Delete records with invalid future years (2026+)\n2. Convert remaining timestamps from Five9 timezone to UTC\n\nThis may take a minute for large datasets. Continue?')) return;
     setLoading(true); setError(null);
     try {
       const token=await getToken();
       const res = await fetch('/api/reports/fix-timezones', { 
         method:'POST', 
         headers:{ 'Content-Type':'application/json', Authorization:`Bearer ${token}` },
-        body: JSON.stringify({ batchSize: 10000, runAll: true })
+        body: JSON.stringify({ batchSize: 10000, runAll: true, deleteInvalidYears: true })
       });
       const json = await res.json(); 
       if(!res.ok) throw new Error(json.error||'Timezone fix failed');
-      alert(`Success: ${json.updated} timestamps converted to UTC across ${json.batches} batch(es)\nProcessed: ${json.processed} rows\nErrors: ${json.errors}`);
+      alert(`Success!\n\nDeleted: ${json.deleted} invalid records\nConverted: ${json.updated} timestamps to UTC\nProcessed: ${json.processed} rows across ${json.batches} batch(es)\nErrors: ${json.errors}`);
       await fetchReports();
     } catch(e){ setError(e.message); } finally { setLoading(false); }
   };
@@ -106,26 +145,63 @@ export default function ReportsPage(){
   // Reset page to 1 when filters change to avoid empty result pages
   useEffect(() => {
     setPage(1);
-  }, [agent, campaign, callType, ani, dnis, start, end]);
+  }, [agent, campaign, callType, ani, dnis, startDate, endDate]);
 
 
   function applyPreset(p){
     const now = dayjs();
-    if (p==='lastHour') { setStart(now.subtract(1,'hour').toISOString()); setEnd(now.toISOString()); }
-    else if (p==='today') { setStart(now.startOf('day').toISOString()); setEnd(now.toISOString()); }
-    else if (p==='yesterday') { const y = now.subtract(1,'day'); setStart(y.startOf('day').toISOString()); setEnd(y.endOf('day').toISOString()); }
-    else if (p==='last24h') { setStart(now.subtract(24,'hour').toISOString()); setEnd(now.toISOString()); }
-    else if (p==='clear') { setStart(''); setEnd(''); }
+    console.log(`[Preset ${p}] Current time:`, now.format('YYYY-MM-DD HH:mm:ss'));
+    if (p==='lastHour') { 
+      const start = now.subtract(1,'hour');
+      const end = now;
+      console.log(`[Preset lastHour] Start:`, start.format('YYYY-MM-DD HH:mm:ss'), 'End:', end.format('YYYY-MM-DD HH:mm:ss'));
+      setStartDate(start); 
+      setEndDate(end); 
+    }
+    else if (p==='today') { 
+      const start = now.startOf('day');
+      const end = now;
+      console.log(`[Preset today] Start:`, start.format('YYYY-MM-DD HH:mm:ss'), 'End:', end.format('YYYY-MM-DD HH:mm:ss'));
+      setStartDate(start); 
+      setEndDate(end); 
+    }
+    else if (p==='yesterday') { 
+      const y = now.subtract(1,'day'); 
+      const start = y.startOf('day');
+      const end = y.endOf('day');
+      console.log(`[Preset yesterday] Start:`, start.format('YYYY-MM-DD HH:mm:ss'), 'End:', end.format('YYYY-MM-DD HH:mm:ss'));
+      setStartDate(start); 
+      setEndDate(end); 
+    }
+    else if (p==='last24h') { 
+      const start = now.subtract(24,'hour');
+      const end = now;
+      console.log(`[Preset last24h] Start:`, start.format('YYYY-MM-DD HH:mm:ss'), 'End:', end.format('YYYY-MM-DD HH:mm:ss'));
+      setStartDate(start); 
+      setEndDate(end); 
+    }
+    else if (p==='clear') { setStartDate(null); setEndDate(null); }
     // Don't call fetchReports() directly - let the useEffect handle it when filters change
   }
 
   return <Container maxWidth="xl" sx={{ mt:3 }}>
     <Typography variant="h5" gutterBottom>Five9 Reports</Typography>
-    <Paper sx={{ p:2, mb:2 }}>
-      <Stack direction="row" flexWrap="wrap" spacing={1} alignItems="flex-end">
-        <TextField label="Start ISO" value={start} onChange={e=>setStart(e.target.value)} size="small" sx={{ minWidth:240 }} />
-        <TextField label="End ISO" value={end} onChange={e=>setEnd(e.target.value)} size="small" sx={{ minWidth:240 }} />
-        <TextField label="Agent" value={agent} onChange={e=>setAgent(e.target.value)} size="small" />
+    <LocalizationProvider dateAdapter={AdapterDayjs}>
+      <Paper sx={{ p:2, mb:2 }}>
+        <Stack direction="row" flexWrap="wrap" spacing={1} alignItems="flex-end">
+          <DateTimePicker 
+            label="Start Date/Time" 
+            value={startDate} 
+            onChange={(newValue) => setStartDate(newValue)}
+            slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
+          />
+          <DateTimePicker 
+            label="End Date/Time" 
+            value={endDate} 
+            onChange={(newValue) => setEndDate(newValue)}
+            slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
+          />
+          <TextField label="Agent" value={agent} onChange={e=>setAgent(e.target.value)} size="small" />
         <FormControl size="small" sx={{ minWidth:160 }}>
           <InputLabel id="campaign-label">Campaign</InputLabel>
           <Select labelId="campaign-label" value={campaign} label="Campaign" onChange={e=>setCampaign(e.target.value)}>
@@ -153,6 +229,7 @@ export default function ReportsPage(){
       </Stack>
       {error && <Alert severity="error" sx={{ mt:2 }}>{error}</Alert>}
     </Paper>
+    </LocalizationProvider>
     <Paper sx={{ p:0, position:'relative' }}>
       {loading && <Box sx={{ position:'absolute', inset:0, bgcolor:'rgba(0,0,0,0.05)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:2 }}><CircularProgress size={48}/></Box>}
       <TableContainer sx={{ maxHeight: '70vh', overflowX:'auto' }}>
@@ -180,7 +257,7 @@ export default function ReportsPage(){
         <TableBody>
           {rows.map(r=> <TableRow key={r.call_id} hover>
             <TableCell>{r.call_id}</TableCell>
-            <TableCell>{r.timestamp}</TableCell>
+            <TableCell>{formatTimestamp(r.timestamp)}</TableCell>
             <TableCell>{r.campaign}</TableCell>
             <TableCell>{r.call_type}</TableCell>
             <TableCell>{r.agent}</TableCell>

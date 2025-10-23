@@ -2,6 +2,10 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import dayjs from 'dayjs';
+import customParseFormat from 'dayjs/plugin/customParseFormat.js';
+
+dayjs.extend(customParseFormat);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +36,19 @@ try {
 
 // Initialize database
 const db = new Database(DB_PATH);
+
+// Register custom function to convert Five9 timestamp to ISO format
+// "Thu, 23 Oct 2025 12:47:37" -> "2025-10-23 12:47:37"
+db.function('five9_to_iso', (timestamp) => {
+  if (!timestamp) return null;
+  try {
+    const parsed = dayjs(timestamp, 'ddd, DD MMM YYYY HH:mm:ss');
+    if (!parsed.isValid()) return null;
+    return parsed.format('YYYY-MM-DD HH:mm:ss');
+  } catch (e) {
+    return null;
+  }
+});
 
 // Enable WAL mode for better performance with concurrent reads
 db.pragma('journal_mode = WAL');
@@ -499,21 +516,21 @@ statements.upsertReport = db.prepare(`
 statements.queryReports = db.prepare(`
   SELECT * FROM reporting
   WHERE 1=1
-    AND (? IS NULL OR datetime(timestamp) >= datetime(?))
-    AND (? IS NULL OR datetime(timestamp) <= datetime(?))
+    AND (? IS NULL OR five9_to_iso(timestamp) >= ?)
+    AND (? IS NULL OR five9_to_iso(timestamp) <= ?)
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
     AND (? IS NULL OR ani LIKE '%' || ? || '%')
     AND (? IS NULL OR dnis LIKE '%' || ? || '%')
-  ORDER BY datetime(timestamp) DESC
+  ORDER BY five9_to_iso(timestamp) DESC
   LIMIT ? OFFSET ?;
 `);
 statements.countReports = db.prepare(`
   SELECT COUNT(*) as total FROM reporting
   WHERE 1=1
-    AND (? IS NULL OR datetime(timestamp) >= datetime(?))
-    AND (? IS NULL OR datetime(timestamp) <= datetime(?))
+    AND (? IS NULL OR five9_to_iso(timestamp) >= ?)
+    AND (? IS NULL OR five9_to_iso(timestamp) <= ?)
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)

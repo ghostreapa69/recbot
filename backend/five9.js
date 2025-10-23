@@ -47,8 +47,16 @@ function buildEnvelope(body, { wsSecurity = false } = {}) {
 }
 
 async function soapRequest(action, bodyFragment) {
-  if (!five9SoapClient) await establishFive9Session();
+  if (!five9SoapClient) {
+    await establishFive9Session();
+  }
+  if (!five9SoapClient) {
+    throw new Error('Five9 session initialization failed - client is null');
+  }
   const endpoint = five9SoapClient.serviceEndpoint || five9SoapClient.endpoint; // Prefer parsed service endpoint
+  if (!endpoint) {
+    throw new Error('Five9 endpoint not available after session initialization');
+  }
   const soapActions = [action, `"${action}"`, `http://service.admin.ws.five9.com/${action}`];
   let lastError;
   for (const wsSec of [false, true]) { // still allow ws-security variant attempts
@@ -99,24 +107,31 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
     return { inserted:0, total:0, error: 'session_init_failed', detail: e.message };
   }
 
-  const end = dayjs();
-  const start = end.subtract(1, 'hour');
-  // Format: 2013-04-23T21:00:00.000-07:00 (use local offset)
-  const tzOffsetMin = start.utcOffset();
+  // Use Five9's timezone for the report request window
+  // Get current time in Five9's timezone
+  const now = dayjs.tz(dayjs(), FIVE9_TIMEZONE);
+  const end = now;
+  const start = now.subtract(1, 'hour');
+  
+  // Format for Five9 API: ISO 8601 with timezone offset
   function fmt(dt) {
-    const off = dt.format('Z'); // +05:00
-    const sign = off.startsWith('-') ? '-' : '+';
-    const [hh, mm] = off.replace('+','').replace('-','').split(':');
-    return dt.format(`YYYY-MM-DDTHH:mm:00.000${sign}${hh}:${mm}`); // minute precision ok
+    const off = dt.format('Z'); // +05:00 or -05:00
+    return dt.format(`YYYY-MM-DDTHH:mm:00.000${off}`);
   }
   const startStr = fmt(start);
   const endStr = fmt(end);
+
+  console.log('🕘 [Five9] Requesting report for window (Five9 timezone:', FIVE9_TIMEZONE + ')');
+  console.log('   Current UTC:', dayjs.utc().format('YYYY-MM-DD HH:mm:ss'));
+  console.log('   Start (Five9 local):', start.format('YYYY-MM-DD HH:mm:ss'));
+  console.log('   End (Five9 local):', end.format('YYYY-MM-DD HH:mm:ss'));
+  console.log('   Start (ISO with offset):', startStr);
+  console.log('   End (ISO with offset):', endStr);
 
   // runReport
   const criteria = `<criteria><time><start xsi:type="xs:dateTime">${startStr}</start><end xsi:type="xs:dateTime">${endStr}</end></time></criteria>`;
   // Per WSDL fault, the service expects folderName, reportName, criteria directly (no runReportParameters wrapper)
   const bodyRun = `<ws:runReport><folderName>Call Log Reports</folderName><reportName>Call Log</reportName>${criteria}</ws:runReport>`;
-  console.log('🕘 [Five9] Requesting report for window', { start: startStr, end: endStr });
   let runRespXml;
   try {
     runRespXml = await soapRequest('runReport', bodyRun);
@@ -293,51 +308,19 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
   const header = lines.shift().split(',').map(h=>h.trim().replace(/^"|"$/g,''));
 
   const rows = [];
-  let timestampSamples = [];
   for (const line of lines) {
     const cols = line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(c=>c.trim().replace(/^"|"$/g,''));
     // Basic mapping by header names (normalize to uppercase without spaces for matching)
     const map = {}; header.forEach((h,i)=>{ map[h.toUpperCase().replace(/\s+/g,'_')] = cols[i]; });
     const callId = map['CALL_ID'] || map['CALLID'] || null;
     if (!callId) continue;
-    // Normalize timestamp to ISO 8601 so frontend filters (using ISO with Z) work
-    let tsRaw = map['TIMESTAMP'] || null;
-    let tsIso = null;
-    if (tsRaw) {
-      // Attempt multiple common Five9 formats
-      const candidates = [
-        'YYYY-MM-DD HH:mm:ss',
-        'MM/DD/YYYY HH:mm:ss',
-        'MM/DD/YYYY hh:mm:ss A',
-        'MM/DD/YY HH:mm:ss',
-        'MM/DD/YY hh:mm:ss A'
-      ];
-      for (const fmt of candidates) {
-        // Parse in Five9's timezone, then convert to UTC ISO
-        const d = dayjs.tz(tsRaw, fmt, FIVE9_TIMEZONE);
-        if (d.isValid()) { 
-          tsIso = d.utc().toISOString();
-          // Log first 3 samples for verification
-          if (timestampSamples.length < 3) {
-            timestampSamples.push({ raw: tsRaw, format: fmt, utc: tsIso });
-          }
-          break; 
-        }
-      }
-      if (!tsIso) {
-        // Fallback: let Date try parsing (assumes local/browser timezone, not ideal)
-        const d2 = new Date(tsRaw);
-        if (!isNaN(d2.getTime())) {
-          tsIso = d2.toISOString();
-          if (timestampSamples.length < 3) {
-            timestampSamples.push({ raw: tsRaw, format: 'fallback', utc: tsIso, warning: 'Used fallback parser' });
-          }
-        }
-      }
-    }
+    
+    // Store timestamp exactly as Five9 provides it - no conversion
+    const timestamp = map['TIMESTAMP'] || null;
+    
     rows.push({
       call_id: callId,
-      timestamp: tsIso || tsRaw,
+      timestamp: timestamp,
       campaign: map['CAMPAIGN'] || null,
       call_type: map['CALL_TYPE'] || null,
       agent: map['AGENT'] || null,
@@ -365,17 +348,24 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
     });
   }
   
-  // Log timestamp conversion summary
-  if (timestampSamples.length > 0) {
-    console.log(`🕐 [Five9][TIMESTAMP CONVERSION] Timezone: ${FIVE9_TIMEZONE} -> UTC`);
-    timestampSamples.forEach((sample, idx) => {
-      const warning = sample.warning ? ` ⚠️ ${sample.warning}` : '';
-      console.log(`   Sample ${idx + 1}: "${sample.raw}" [${sample.format}] -> "${sample.utc}"${warning}`);
-    });
-  }
-  
   const inserted = bulkUpsertReports(rows);
   console.log(`🗂️  [Five9] Upserted ${inserted}/${rows.length} rows into reporting`);
+  
+  // Log timestamp samples from Five9 (stored as-is)
+  if (rows.length > 0) {
+    console.log(`� [Five9][STORED AS-IS] Storing ${rows.length} rows with timestamps exactly as received from Five9`);
+    const timestamps = rows.slice(0, 3).map(r => r.timestamp).filter(t => t);
+    timestamps.forEach((ts, idx) => {
+      console.log(`   Sample ${idx + 1}: "${ts}"`);
+    });
+    
+    // Log range
+    const allTimestamps = rows.map(r => r.timestamp).filter(t => t).sort();
+    if (allTimestamps.length > 0) {
+      console.log('📊 [Five9][STORED RANGE] First:', allTimestamps[0]);
+      console.log('📊 [Five9][STORED RANGE] Last:', allTimestamps[allTimestamps.length - 1]);
+    }
+  }
   if (auditUser) {
     try { logAuditEvent(auditUser.id, auditUser.email, 'REPORT_INGEST', null, null, auditUser.ipAddress, auditUser.userAgent, null, { inserted, total: rows.length }); } catch {}
   }
@@ -434,9 +424,13 @@ let five9WsdlCache = null; // metadata about last WSDL fetch
 let five9SoapClient = null; // simple object representing an authenticated SoapClient-equivalent
 
 async function establishFive9Session(force=false) {
-  if (!force && five9WsdlCache && (Date.now() - five9WsdlCache.fetched) < 10 * 60 * 1000) {
+  if (!force && five9SoapClient && five9WsdlCache && (Date.now() - five9WsdlCache.fetched) < 10 * 60 * 1000) {
+    console.log('🔐 [Five9][SESSION] Reusing existing session (less than 10 min old)');
     return true; // reuse session within 10 minutes
   }
+  
+  console.log('🔐 [Five9][SESSION] Initializing new session...');
+  
   // Mirror PHP SoapClient pattern: always append &user=<username>. Try raw then encoded variant if needed.
   const baseWsdl = `${FIVE9_BASE}/${FIVE9_VERSION}/AdminWebService?wsdl`;
   const candidateUrls = [
@@ -445,6 +439,7 @@ async function establishFive9Session(force=false) {
   ];
   const authHeader = 'Basic ' + Buffer.from(`${FIVE9_USERNAME}:${FIVE9_PASSWORD}`).toString('base64');
   let lastErr = null;
+  
   for (const wsdlUrl of candidateUrls) {
     console.log('🔐 [Five9][WSDL] Fetching', wsdlUrl);
     try {
@@ -455,33 +450,64 @@ async function establishFive9Session(force=false) {
       });
       if (res.status === 401 || res.status === 403) {
         lastErr = new Error(`WSDL auth failure ${res.status}`);
+        console.error('❌ [Five9][WSDL] Auth failed:', res.status);
         continue;
       }
-      if (res.status >= 300) { lastErr = new Error(`WSDL fetch HTTP ${res.status}`); continue; }
+      if (res.status >= 300) { 
+        lastErr = new Error(`WSDL fetch HTTP ${res.status}`); 
+        console.error('❌ [Five9][WSDL] HTTP error:', res.status);
+        continue; 
+      }
       const raw = res.data?.toString?.() || '';
-      if (!/definitions/i.test(raw)) { lastErr = new Error('Unexpected WSDL content (no <definitions>)'); continue; }
+      if (!/definitions/i.test(raw)) { 
+        lastErr = new Error('Unexpected WSDL content (no <definitions>)'); 
+        console.error('❌ [Five9][WSDL] Invalid content (no definitions tag)');
+        continue; 
+      }
+      
       // Attempt to parse soap:address from WSDL to find real service endpoint
       let serviceEndpoint = null;
       try {
         const addrMatch = raw.match(/<soap:address[^>]*location="([^"]+)"/i);
-        if (addrMatch) serviceEndpoint = addrMatch[1];
-      } catch {}
+        if (addrMatch) {
+          serviceEndpoint = addrMatch[1];
+          console.log('🔗 [Five9][WSDL] Extracted service endpoint:', serviceEndpoint);
+        } else {
+          console.warn('⚠️  [Five9][WSDL] Could not extract service endpoint from WSDL, will use base URL');
+        }
+      } catch (e) {
+        console.warn('⚠️  [Five9][WSDL] Error parsing service endpoint:', e.message);
+      }
+      
+      // Fallback: construct endpoint from base if not found in WSDL
+      if (!serviceEndpoint) {
+        serviceEndpoint = `${FIVE9_BASE}/${FIVE9_VERSION}/AdminWebService`;
+        console.log('🔗 [Five9][WSDL] Using constructed endpoint:', serviceEndpoint);
+      }
+      
       five9WsdlCache = { fetched: Date.now(), length: raw.length, url: wsdlUrl };
       five9SoapClient = {
         wsdlUrl,
-        endpoint: wsdlUrl, // original WSDL URL
-        serviceEndpoint, // parsed actual SOAP endpoint if available
+        endpoint: serviceEndpoint, // Use serviceEndpoint as primary endpoint
+        serviceEndpoint, // Keep for backward compatibility
         version: FIVE9_VERSION,
         username: FIVE9_USERNAME,
         wsdlLength: raw.length
       };
-      console.log('🧩 [Five9][CLIENT] Soap client initialized:', five9SoapClient);
+      console.log('✅ [Five9][CLIENT] Soap client initialized successfully');
+      console.log('   - WSDL URL:', wsdlUrl);
+      console.log('   - Service Endpoint:', serviceEndpoint);
+      console.log('   - Version:', FIVE9_VERSION);
       return true;
     } catch (e) {
       lastErr = e;
-      console.error('❌ [Five9][WSDL] Fetch error for', wsdlUrl, e.message);
+      console.error('❌ [Five9][WSDL] Fetch error for', wsdlUrl, ':', e.message);
     }
   }
+  
+  console.error('❌ [Five9][SESSION] Failed to establish session after trying all candidate URLs');
+  five9SoapClient = null; // Ensure it's null on failure
+  five9WsdlCache = null;
   throw lastErr || new Error('Failed to fetch WSDL with user parameter');
 }
 

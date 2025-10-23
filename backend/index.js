@@ -5,6 +5,8 @@ import crypto from 'crypto';
 import dayjs from 'dayjs';
 import customParseFormat from 'dayjs/plugin/customParseFormat.js';
 import isSameOrBefore from 'dayjs/plugin/isSameOrBefore.js';
+import utcPlugin from 'dayjs/plugin/utc.js';
+import timezonePlugin from 'dayjs/plugin/timezone.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -24,11 +26,15 @@ import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuth
 
 dayjs.extend(customParseFormat);
 dayjs.extend(isSameOrBefore);
+dayjs.extend(utcPlugin);
+dayjs.extend(timezonePlugin);
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const BUILD_DIR = path.join(process.cwd(), '../frontend/build');
 const WAV_DIR = '/data/wav/recordings'; // For reference, not used with S3
+
+const REPORT_FILTER_FALLBACK_TIMEZONE = process.env.REPORTS_QUERY_TIMEZONE || process.env.FIVE9_TIMEZONE || 'UTC';
 
 app.use(cors());
 app.use(express.json()); // Parse JSON request bodies
@@ -141,6 +147,30 @@ function buildCsv(rows, columns) {
   return [headerLine, ...dataLines].join('\r\n');
 }
 
+function normalizeFilterToUtc(value, preferredTz = REPORT_FILTER_FALLBACK_TIMEZONE) {
+  if (!value) return null;
+  const trimmed = typeof value === 'string' ? value.trim() : String(value).trim();
+  if (!trimmed) return null;
+
+  const hasOffset = /Z$/i.test(trimmed) || /([+-]\d{2}:?\d{2})$/.test(trimmed);
+  if (hasOffset) {
+    const direct = dayjs(trimmed);
+    if (direct.isValid()) return direct.utc().toISOString();
+  }
+
+  try {
+    const zoned = dayjs.tz(trimmed, preferredTz);
+    if (zoned.isValid()) return zoned.utc().toISOString();
+  } catch {
+    // ignore tz parsing errors, fall through to generic parsing
+  }
+
+  const generic = dayjs(trimmed);
+  if (generic.isValid()) return generic.utc().toISOString();
+
+  return null;
+}
+
 // ----------------------------------------------
 // FFmpeg concurrency + configuration
 // ----------------------------------------------
@@ -240,15 +270,30 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
     const sourceTimezone = req.body.sourceTimezone || process.env.FIVE9_TIMEZONE || 'America/New_York';
     const batchSize = parseInt(req.body.batchSize || '10000', 10);
     const runAll = req.body.runAll !== false; // default true
+    const deleteInvalidYears = req.body.deleteInvalidYears !== false; // default true
     
-    console.log(`[TIMEZONE FIX] Starting migration from ${sourceTimezone} to UTC, batch size: ${batchSize}, runAll: ${runAll}`);
+    console.log(`[TIMEZONE FIX] Starting migration from ${sourceTimezone} to UTC, batch size: ${batchSize}, runAll: ${runAll}, deleteInvalidYears: ${deleteInvalidYears}`);
     
     const { db } = await import('./database.js');
     
     let totalUpdated = 0;
     let totalProcessed = 0;
     let totalErrors = 0;
+    let totalDeleted = 0;
     let batchCount = 0;
+    
+    // First, delete records with invalid years (2026 or beyond)
+    if (deleteInvalidYears) {
+      try {
+        const currentYear = new Date().getFullYear();
+        const futureYear = currentYear + 1;
+        const deleteResult = db.prepare(`DELETE FROM reporting WHERE timestamp LIKE '${futureYear}%' OR timestamp LIKE '${futureYear + 1}%' OR timestamp LIKE '${futureYear + 2}%'`).run();
+        totalDeleted = deleteResult.changes || 0;
+        console.log(`[TIMEZONE FIX] Deleted ${totalDeleted} rows with invalid future years (${futureYear}+)`);
+      } catch (e) {
+        console.error('[TIMEZONE FIX] Error deleting invalid years:', e.message);
+      }
+    }
     
     const updateStmt = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
     
@@ -270,23 +315,62 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
       
       for (const row of rows) {
         try {
-          // Parse as if it's in the source timezone, then convert to UTC
-          const parsed = dayjs.tz(row.timestamp, sourceTimezone);
-          if (parsed.isValid()) {
+          const rawTs = row.timestamp;
+          if (!rawTs) {
+            batchErrors++;
+            continue;
+          }
+          
+          // Skip if already in UTC ISO format (ends with Z)
+          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(rawTs)) {
+            // Already in correct UTC ISO format, skip
+            continue;
+          }
+          
+          // Try to parse with explicit format hints
+          let parsed = null;
+          const formats = [
+            'YYYY-MM-DD HH:mm:ss',
+            'M/D/YYYY HH:mm:ss',
+            'M/D/YYYY h:mm:ss A',
+            'MM/DD/YYYY HH:mm:ss',
+            'MM/DD/YYYY hh:mm:ss A',
+          ];
+          
+          for (const fmt of formats) {
+            const attempt = dayjs.tz(rawTs, fmt, sourceTimezone);
+            if (attempt.isValid() && attempt.year() >= 2020 && attempt.year() <= new Date().getFullYear() + 1) {
+              parsed = attempt;
+              break;
+            }
+          }
+          
+          // Fallback: try timezone-aware parsing without format
+          if (!parsed) {
+            parsed = dayjs.tz(rawTs, sourceTimezone);
+          }
+          
+          if (parsed && parsed.isValid()) {
             const utcIso = parsed.utc().toISOString();
             // Only update if actually different
-            if (utcIso !== row.timestamp) {
+            if (utcIso !== rawTs) {
               updateStmt.run(utcIso, row.call_id);
               batchUpdated++;
               if (totalUpdated < 5) {
-                console.log(`[TIMEZONE FIX] ${row.call_id}: "${row.timestamp}" -> "${utcIso}"`);
+                console.log(`[TIMEZONE FIX] ${row.call_id}: "${rawTs}" -> "${utcIso}"`);
               }
             }
           } else {
             batchErrors++;
+            if (batchErrors <= 3) {
+              console.warn(`[TIMEZONE FIX] Could not parse: "${rawTs}"`);
+            }
           }
         } catch (e) {
           batchErrors++;
+          if (batchErrors <= 3) {
+            console.error(`[TIMEZONE FIX] Error processing row:`, e.message);
+          }
         }
       }
       
@@ -309,15 +393,16 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
       
     } while (runAll);
     
-    console.log(`[TIMEZONE FIX] Complete: ${totalUpdated} rows updated out of ${totalProcessed} processed, ${totalErrors} errors`);
+    console.log(`[TIMEZONE FIX] Complete: ${totalUpdated} rows updated out of ${totalProcessed} processed, ${totalErrors} errors, ${totalDeleted} deleted`);
     
     res.json({ 
       success: true, 
       processed: totalProcessed, 
       updated: totalUpdated,
+      deleted: totalDeleted,
       errors: totalErrors,
       batches: batchCount,
-      message: `Converted ${totalUpdated} timestamps from ${sourceTimezone} to UTC across ${batchCount} batch(es)`
+      message: `Deleted ${totalDeleted} invalid records. Converted ${totalUpdated} timestamps from ${sourceTimezone} to UTC across ${batchCount} batch(es)`
     });
   } catch (e) {
     console.error('[TIMEZONE FIX] Error:', e);
@@ -328,9 +413,58 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    const { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0 } = req.query;
-    console.log(`[API /api/reports] Raw query params: start="${start}", end="${end}", agent="${agent}", campaign="${campaign}", callType="${callType}", ani="${ani}", dnis="${dnis}", limit=${limit}, offset=${offset}`);
-    const result = queryReports({ start: start || null, end: end || null, agent: agent || null, campaign: campaign || null, callType: callType || null, ani: ani || null, dnis: dnis || null, limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 });
+    let { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0, timezone: userTimezone } = req.query;
+    
+    // Clean up "undefined" strings
+    const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
+    start = cleanParam(start);
+    end = cleanParam(end);
+    agent = cleanParam(agent);
+    campaign = cleanParam(campaign);
+    callType = cleanParam(callType);
+    ani = cleanParam(ani);
+    dnis = cleanParam(dnis);
+    
+    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", campaign="${campaign}", callType="${callType}", ani="${ani}", dnis="${dnis}", limit=${limit}, offset=${offset}`);
+    
+    // Convert Five9 format to SQLite ISO format
+    // "Thu, 23 Oct 2025 12:47:37" -> "2025-10-23 12:47:37"
+    const five9ToISO = (dateStr) => {
+      if (!dateStr) return null;
+      try {
+        // Use dayjs to parse Five9 format and convert to ISO
+        const parsed = dayjs(dateStr, 'ddd, DD MMM YYYY HH:mm:ss');
+        if (!parsed.isValid()) return null;
+        return parsed.format('YYYY-MM-DD HH:mm:ss');
+      } catch (e) {
+        console.warn('[five9ToISO] Failed to parse:', dateStr, e.message);
+        return null;
+      }
+    };
+    
+    const startFormatted = five9ToISO(start);
+    const endFormatted = five9ToISO(end);
+    
+    if (startFormatted || endFormatted) {
+      console.log(`[API /api/reports] Formatted for SQLite: start="${startFormatted}", end="${endFormatted}"`);
+    }
+    
+    // Debug: check what's actually in the database
+    try {
+      const { db } = await import('./database.js');
+      const dbSample = db.prepare('SELECT timestamp FROM reporting ORDER BY rowid DESC LIMIT 3').all();
+      console.log('[API /api/reports] Recent timestamps in DB:', dbSample.map(r => r.timestamp));
+      
+      // Test if datetime parsing works
+      if (startFormatted) {
+        const testParse = db.prepare(`SELECT datetime(?) as parsed`).get(startFormatted);
+        console.log('[API /api/reports] Datetime parse test:', startFormatted, '->', testParse.parsed);
+      }
+    } catch (debugErr) {
+      console.warn('[API /api/reports] Debug query failed:', debugErr.message);
+    }
+    
+    const result = queryReports({ start: startFormatted, end: endFormatted, agent, campaign, callType, ani, dnis, limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 });
     try {
       logAuditEvent(
         req.user.id,
@@ -342,7 +476,15 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
         req.user.userAgent,
         req.currentSessionId || null,
         {
-          filters: { start: start || null, end: end || null, agent: agent || null, campaign: campaign || null, callType: callType || null, ani: ani || null, dnis: dnis || null },
+          filters: {
+            start: start || null,
+            end: end || null,
+            agent: agent || null,
+            campaign: campaign || null,
+            callType: callType || null,
+            ani: ani || null,
+            dnis: dnis || null
+          },
           pagination: { limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 },
           returned: result.rows ? result.rows.length : 0,
           total: result.total || 0
