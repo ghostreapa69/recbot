@@ -1,39 +1,19 @@
 version: '3.8'
 services:
-  traefik:
-    image: "traefik:v3.5"
-    container_name: "traefik"
-    command: 
-      - "--providers.docker=true"
-      - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.letsencrypt.acme.dnschallenge=true"
-      - "--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=cloudflare"
-      - "--certificatesresolvers.letsencrypt.acme.email=your-email-here"
-      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-    ports:
-      - "443:443"
-    environment:
-      - CLOUDFLARE_EMAIL=your-cloudflare-email-here
-      - CLOUDFLARE_DNS_API_TOKEN=your-dns-api-token-here
-      - CLOUDFLARE_ZONE_API_TOKEN=your-zone-api-token-here
-    volumes:
-      - "./letsencrypt:/letsencrypt"
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
   recbot:
-    image: ghostreaper69/recbot:v1.5.23
+    image: ghostreaper69/recbot:v2.2.1
     container_name: "recbot"
     labels:
       - traefik.enable=true
-      # Removed custom header rewrites; Traefik already sets X-Forwarded-For and preserves CF-Connecting-IP from Cloudflare.
+      - traefik.docker.network=traefik
       - traefik.http.routers.recbot.rule=Host(`your-domain-here`)
       - traefik.http.routers.recbot.entrypoints=websecure
       - traefik.http.routers.recbot.tls.certresolver=letsencrypt
       - traefik.http.services.recbot.loadbalancer.server.port=4000
     volumes:
-      - ./data/sqlite:/root/db
+      - recbot:/root/db
     ports:
       - "4000:4000"
-      #- "2222:2222"
     environment:
       # --- Core App Configuration ---
       - NODE_ENV=production
@@ -73,6 +53,8 @@ services:
       #- CDN_BASE_URL=https://cdn.your-domain-here
       #- FORCE_HTTPS=true
     restart: unless-stopped
+    networks:
+      - recbot
     cap_add:
       - SYS_ADMIN  # Required for FUSE
     devices:
@@ -83,3 +65,9 @@ services:
     # volumes:
     #   - ./local_wav:/data/wav
     #   - ./logs:/var/log
+volumes:
+  recbot:
+    driver: local
+networks:
+  recbot:
+    driver: bridge

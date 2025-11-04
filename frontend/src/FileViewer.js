@@ -42,7 +42,11 @@ import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
 import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { TimePicker } from "@mui/x-date-pickers/TimePicker";
+import { useLocation } from 'react-router-dom';
 import dayjs from "dayjs";
+import customParseFormat from 'dayjs/plugin/customParseFormat';
+
+dayjs.extend(customParseFormat);
 
 // Backend now returns structured file objects; this is a passthrough mapper for safety/future
 function normalizeFile(rec) {
@@ -65,9 +69,39 @@ function formatDuration(ms) {
   return `${min}:${sec.toString().padStart(2, '0')}`;
 }
 
+const DATE_PARAM_FORMATS = ['M_D_YYYY', 'M-D-YYYY', 'MM-DD-YYYY', 'YYYY-MM-DD', 'M/D/YYYY', 'MM/DD/YYYY'];
+const TIME_PARAM_FORMATS = ['h:mm A', 'hh:mm A', 'H:mm', 'HH:mm'];
+const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId']);
+
+function parseDateParam(value) {
+  if (!value) return null;
+  const trimmed = value.trim();
+  for (const format of DATE_PARAM_FORMATS) {
+    const parsed = dayjs(trimmed, format, true);
+    if (parsed.isValid()) {
+      return parsed;
+    }
+  }
+  const fallback = dayjs(trimmed);
+  return fallback.isValid() ? fallback : null;
+}
+
+function parseTimeParam(value) {
+  if (!value) return null;
+  const trimmed = value.trim();
+  for (const format of TIME_PARAM_FORMATS) {
+    const parsed = dayjs(trimmed, format, true);
+    if (parsed.isValid()) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
 function FileViewer({ darkMode }) {
   const { user, isLoaded } = useUser();
   const { getToken } = useAuth();
+  const location = useLocation();
   const [files, setFiles] = useState([]);
   const [playing, setPlaying] = useState(null);
   const [currentTrack, setCurrentTrack] = useState(null);
@@ -91,6 +125,7 @@ function FileViewer({ darkMode }) {
   const [timeMode, setTimeMode] = useState("range");
   const [callIdFilter, setCallIdFilter] = useState("");
   const callIdDebounceRef = React.useRef(null);
+  const applyingUrlParamsRef = React.useRef(false);
   const [error500, setError500] = useState(false);
   const [loading, setLoading] = useState(false);
   const [filesPerPage, setFilesPerPage] = useState(25);
@@ -103,9 +138,10 @@ function FileViewer({ darkMode }) {
   const isAdmin = userRole === 'admin';
   const isManager = userRole === 'manager';
   const canDownload = isAdmin || isManager;
+  const userEmail = user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
 
   // Fetch files only when a date is selected or changed
-  const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null) => {
+  const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null) => {
     if (!start) return;
     setLoading(true);
     setError500(false);
@@ -116,34 +152,37 @@ function FileViewer({ darkMode }) {
     // Add role-based email filtering
     // Only members are restricted to their own files
     // Admins, managers, and users with no role can see all files
+    const emailValue = customEmailFilter !== null ? customEmailFilter : emailFilter;
     const effectiveEmailFilter = isAdmin || userRole === undefined
-      ? (customEmailFilter !== null ? customEmailFilter : emailFilter)
+      ? emailValue
       : userEmail; // Only members are restricted to their own files
-    
-  url += `&offset=${offset}&limit=${limit}`;
-  if (callIdFilter) url += `&callId=${encodeURIComponent(callIdFilter.trim())}`;
+
+    const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
+    const phoneValue = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
+    const currentTimeMode = customTimeMode !== null ? customTimeMode : timeMode;
+    const startTime = customTimePickerStart !== null ? customTimePickerStart : timePickerStart;
+    const endTime = customTimePickerEnd !== null ? customTimePickerEnd : timePickerEnd;
+    const callIdValue = customCallId !== null ? customCallId : callIdFilter;
+
+    url += `&offset=${offset}&limit=${limit}`;
+    if (callIdValue && callIdValue.trim() !== '') {
+      url += `&callId=${encodeURIComponent(callIdValue.trim())}`;
+    }
     url += `&sortColumn=${customSortColumn || sortColumn}&sortDirection=${customSortDirection || sortDirection}`;
     
-    if (customDurationMin !== null && customDurationMin !== "") {
-      url += `&durationMin=${encodeURIComponent(customDurationMin)}`;
-    } else if (durationMin !== "") {
-      url += `&durationMin=${encodeURIComponent(durationMin)}`;
+    if (durationValue !== null && durationValue !== "") {
+      url += `&durationMin=${encodeURIComponent(durationValue)}`;
     }
     
-    if (customPhoneFilter !== null && customPhoneFilter !== "") {
-      url += `&phone=${encodeURIComponent(customPhoneFilter)}`;
-    } else if (phoneFilter !== "") {
-      url += `&phone=${encodeURIComponent(phoneFilter)}`;
+    if (phoneValue !== null && phoneValue !== "") {
+      url += `&phone=${encodeURIComponent(phoneValue)}`;
     }
     
     if (effectiveEmailFilter !== "") {
       url += `&email=${encodeURIComponent(effectiveEmailFilter)}`;
     }
     
-    const currentTimeMode = customTimeMode !== null ? customTimeMode : timeMode;
     if (currentTimeMode === "range") {
-      const startTime = customTimePickerStart !== null ? customTimePickerStart : timePickerStart;
-      const endTime = customTimePickerEnd !== null ? customTimePickerEnd : timePickerEnd;
       if (startTime) url += `&timeStart=${encodeURIComponent(dayjs(startTime).format("h:mm A"))}`;
       if (endTime) url += `&timeEnd=${encodeURIComponent(dayjs(endTime).format("h:mm A"))}`;
     }
@@ -185,6 +224,7 @@ function FileViewer({ darkMode }) {
 
   // Debounced fetch when callIdFilter changes (consistent auto behavior)
   useEffect(() => {
+    if (applyingUrlParamsRef.current) return;
     if (!calendarDateStart) return; // need a start date selected
     if (callIdDebounceRef.current) clearTimeout(callIdDebounceRef.current);
     callIdDebounceRef.current = setTimeout(() => {
@@ -195,6 +235,167 @@ function FileViewer({ darkMode }) {
     }, 350);
     return () => clearTimeout(callIdDebounceRef.current);
   }, [callIdFilter]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+
+    const params = new URLSearchParams(location.search || '');
+    applyingUrlParamsRef.current = true;
+    const timerId = setTimeout(() => {
+      applyingUrlParamsRef.current = false;
+    }, 0);
+
+    const startParamRaw = params.get('dateStart');
+    const endParamRaw = params.get('dateEnd');
+    let startFromQuery = parseDateParam(startParamRaw);
+    let endFromQuery = endParamRaw !== null ? parseDateParam(endParamRaw) : null;
+    let historyNeedsUpdate = false;
+
+    if (!startFromQuery) {
+      startFromQuery = dayjs();
+      params.set('dateStart', startFromQuery.format('M_D_YYYY'));
+      historyNeedsUpdate = true;
+    }
+    setCalendarDateStart(startFromQuery);
+
+    if (endParamRaw !== null) {
+      if (endParamRaw && !endFromQuery) {
+        params.delete('dateEnd');
+        historyNeedsUpdate = true;
+      }
+      setCalendarDateEnd(endFromQuery);
+    } else {
+      setCalendarDateEnd(null);
+    }
+
+    let limitValue = filesPerPage;
+    if (params.has('limit')) {
+      const parsedLimit = parseInt(params.get('limit'), 10);
+      if (!Number.isNaN(parsedLimit) && parsedLimit > 0) {
+        limitValue = parsedLimit;
+        setFilesPerPage(parsedLimit);
+      } else {
+        params.delete('limit');
+        historyNeedsUpdate = true;
+      }
+    }
+
+    let offsetValue = 0;
+    if (params.has('offset')) {
+      const parsedOffset = parseInt(params.get('offset'), 10);
+      if (!Number.isNaN(parsedOffset) && parsedOffset >= 0) {
+        offsetValue = parsedOffset;
+      } else {
+        params.delete('offset');
+        historyNeedsUpdate = true;
+      }
+    }
+
+    let sortColumnValue = sortColumn;
+    if (params.has('sortColumn')) {
+      const candidate = (params.get('sortColumn') || '').trim();
+      if (ALLOWED_SORT_COLUMNS.has(candidate)) {
+        sortColumnValue = candidate;
+        setSortColumn(candidate);
+      } else {
+        params.delete('sortColumn');
+        historyNeedsUpdate = true;
+      }
+    }
+
+    let sortDirectionValue = sortDirection;
+    if (params.has('sortDirection')) {
+      const candidate = (params.get('sortDirection') || '').toLowerCase();
+      if (candidate === 'desc' || candidate === 'asc') {
+        sortDirectionValue = candidate;
+        setSortDirection(candidate);
+      } else {
+        params.delete('sortDirection');
+        historyNeedsUpdate = true;
+      }
+    }
+
+    let durationValue = durationMin;
+    if (params.has('durationMin')) {
+      durationValue = params.get('durationMin') || '';
+      setDurationMin(durationValue);
+    }
+
+    let phoneValue = phoneFilter;
+    if (params.has('phone')) {
+      phoneValue = params.get('phone') || '';
+      setPhoneFilter(phoneValue);
+    }
+
+    let emailValue = emailFilter;
+    if (params.has('email')) {
+      emailValue = params.get('email') || '';
+      setEmailFilter(emailValue);
+    }
+
+    let callIdValue = callIdFilter;
+    if (params.has('callId')) {
+      callIdValue = params.get('callId') || '';
+      setCallIdFilter(callIdValue);
+    }
+
+    let timeModeValue = timeMode;
+    if (params.has('timeMode')) {
+      const candidate = (params.get('timeMode') || '').toLowerCase();
+      if (candidate === 'none' || candidate === 'range') {
+        timeModeValue = candidate;
+        setTimeMode(candidate);
+      } else {
+        params.delete('timeMode');
+        historyNeedsUpdate = true;
+      }
+    }
+
+    let timeStartValue = timePickerStart;
+    let timeEndValue = timePickerEnd;
+    if (timeModeValue === 'range') {
+      if (params.has('timeStart')) {
+        timeStartValue = parseTimeParam(params.get('timeStart'));
+        setTimePickerStart(timeStartValue);
+      }
+      if (params.has('timeEnd')) {
+        timeEndValue = parseTimeParam(params.get('timeEnd'));
+        setTimePickerEnd(timeEndValue);
+      }
+    } else {
+      timeStartValue = null;
+      timeEndValue = null;
+      setTimePickerStart(null);
+      setTimePickerEnd(null);
+    }
+
+    if (historyNeedsUpdate) {
+      const newSearch = params.toString();
+      const newUrl = newSearch ? `${location.pathname}?${newSearch}` : location.pathname;
+      window.history.replaceState(null, '', newUrl);
+    }
+
+    fetchFiles(
+      startFromQuery,
+      endFromQuery,
+      offsetValue,
+      limitValue,
+      sortColumnValue,
+      sortDirectionValue,
+      durationValue,
+      phoneValue,
+      emailValue,
+      timeModeValue === 'range' ? timeStartValue : null,
+      timeModeValue === 'range' ? timeEndValue : null,
+      timeModeValue,
+      callIdValue
+    );
+
+    return () => {
+      clearTimeout(timerId);
+      applyingUrlParamsRef.current = false;
+    };
+  }, [location.pathname, location.search, isLoaded]);
 
   const handleSort = (column) => {
     const normalized = column === 'duration' ? 'durationMs' : column;
@@ -653,6 +854,7 @@ function FileViewer({ darkMode }) {
   };
 
   useEffect(() => {
+    if (applyingUrlParamsRef.current) return;
     const delayedFilterChange = setTimeout(() => {
       if (calendarDateStart) {
         handleFilterChange();
