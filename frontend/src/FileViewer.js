@@ -73,6 +73,12 @@ const DATE_PARAM_FORMATS = ['M_D_YYYY', 'M-D-YYYY', 'MM-DD-YYYY', 'YYYY-MM-DD', 
 const TIME_PARAM_FORMATS = ['h:mm A', 'hh:mm A', 'H:mm', 'HH:mm'];
 const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId']);
 
+// Normalize phone filters so pasted formatting characters do not affect matching
+const stripPhoneFormatting = (input) => {
+  if (input == null) return '';
+  return String(input).replace(/[^\d]/g, '');
+};
+
 function parseDateParam(value) {
   if (!value) return null;
   const trimmed = value.trim();
@@ -157,8 +163,9 @@ function FileViewer({ darkMode }) {
       ? emailValue
       : userEmail; // Only members are restricted to their own files
 
-    const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
-    const phoneValue = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
+  const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
+  const phoneValueRaw = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
+  const normalizedPhoneValue = stripPhoneFormatting(phoneValueRaw);
     const currentTimeMode = customTimeMode !== null ? customTimeMode : timeMode;
     const startTime = customTimePickerStart !== null ? customTimePickerStart : timePickerStart;
     const endTime = customTimePickerEnd !== null ? customTimePickerEnd : timePickerEnd;
@@ -174,8 +181,8 @@ function FileViewer({ darkMode }) {
       url += `&durationMin=${encodeURIComponent(durationValue)}`;
     }
     
-    if (phoneValue !== null && phoneValue !== "") {
-      url += `&phone=${encodeURIComponent(phoneValue)}`;
+    if (normalizedPhoneValue) {
+      url += `&phone=${encodeURIComponent(normalizedPhoneValue)}`;
     }
     
     if (effectiveEmailFilter !== "") {
@@ -323,8 +330,18 @@ function FileViewer({ darkMode }) {
 
     let phoneValue = phoneFilter;
     if (params.has('phone')) {
-      phoneValue = params.get('phone') || '';
-      setPhoneFilter(phoneValue);
+      const rawPhoneParam = params.get('phone') || '';
+      const normalizedPhoneParam = stripPhoneFormatting(rawPhoneParam);
+      phoneValue = normalizedPhoneParam;
+      setPhoneFilter(normalizedPhoneParam);
+      if (rawPhoneParam !== normalizedPhoneParam) {
+        if (normalizedPhoneParam) {
+          params.set('phone', normalizedPhoneParam);
+        } else {
+          params.delete('phone');
+        }
+        historyNeedsUpdate = true;
+      }
     }
 
     let emailValue = emailFilter;
@@ -1235,7 +1252,7 @@ function FileViewer({ darkMode }) {
               size="small"
               label="Phone Number"
               value={phoneFilter}
-              onChange={(e) => setPhoneFilter(e.target.value)}
+              onChange={(e) => setPhoneFilter(stripPhoneFormatting(e.target.value))}
               InputProps={{
                 startAdornment: <InputAdornment position="start">📞</InputAdornment>,
               }}
