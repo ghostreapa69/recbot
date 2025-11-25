@@ -37,6 +37,7 @@ RUN cd backend && npm install
 # Copy backend source (without node_modules)
 COPY backend/*.js ./backend/
 COPY backend/*.json ./backend/
+COPY backend/scripts ./backend/scripts
 COPY --from=build /app/frontend/build ./frontend/build
 
 

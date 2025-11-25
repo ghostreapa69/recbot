@@ -92,6 +92,56 @@ const s3 = new S3Client({
   })
 });
 console.log(`[S3] Client initialized region=${process.env.AWS_REGION} maxSockets=${S3_MAX_SOCKETS} socketTimeoutMs=${S3_SOCKET_TIMEOUT_MS}`);
+const S3_FAILURE_UNHEALTHY_WINDOW_MS = parseInt(process.env.S3_FAILURE_UNHEALTHY_WINDOW_MS || '0', 10);
+const EXIT_ON_S3_FAILURE = /^true$/i.test(process.env.EXIT_ON_S3_FAILURE || '');
+let lastS3FetchFailureAt = null;
+let lastS3FetchFailureMessage = null;
+let lastS3FetchSuccessAt = Date.now();
+let s3FailureExitScheduled = false;
+
+function recordS3Failure(message) {
+  lastS3FetchFailureAt = Date.now();
+  lastS3FetchFailureMessage = message;
+
+  if (EXIT_ON_S3_FAILURE && !s3FailureExitScheduled) {
+    s3FailureExitScheduled = true;
+    setTimeout(() => {
+      console.error('🔁 [HEALTH] EXIT_ON_S3_FAILURE enabled; terminating process for container restart');
+      process.exit(70);
+    }, 500);
+  }
+}
+
+function recordS3Success() {
+  lastS3FetchSuccessAt = Date.now();
+  s3FailureExitScheduled = false;
+}
+
+app.get('/healthz', (req, res) => {
+  const now = Date.now();
+  const failureActive = lastS3FetchFailureAt && (!lastS3FetchSuccessAt || lastS3FetchSuccessAt < lastS3FetchFailureAt);
+  const failureAge = failureActive ? (now - lastS3FetchFailureAt) : null;
+  const degradeIndefinitely = S3_FAILURE_UNHEALTHY_WINDOW_MS <= 0;
+  const withinWindow = failureActive && (degradeIndefinitely || (failureAge !== null && failureAge <= S3_FAILURE_UNHEALTHY_WINDOW_MS));
+
+  if (failureActive && withinWindow) {
+    return res.status(503).json({
+      status: 'error',
+      reason: 'recent_s3_failure',
+      lastFailureAt: new Date(lastS3FetchFailureAt).toISOString(),
+      lastFailureMessage: lastS3FetchFailureMessage,
+      lastSuccessAt: lastS3FetchSuccessAt ? new Date(lastS3FetchSuccessAt).toISOString() : null,
+      failureAgeMs: failureAge
+    });
+  }
+
+  return res.json({
+    status: 'ok',
+    lastFailureAt: lastS3FetchFailureAt ? new Date(lastS3FetchFailureAt).toISOString() : null,
+    lastSuccessAt: lastS3FetchSuccessAt ? new Date(lastS3FetchSuccessAt).toISOString() : null,
+    failureAgeMs: failureAge
+  });
+});
 
 // Lightweight HEAD cache to reduce duplicate S3 HeadObject traffic (TTL 60s)
 const headCacheTTL = parseInt(process.env.S3_HEAD_CACHE_TTL_MS || '60000', 10);
@@ -858,8 +908,10 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
       clearTimeout(tHandle);
       const s3FetchTime = Date.now() - s3StartTime;
       console.log(`📦 [S3 FETCH][${requestId}] Retrieved file in ${s3FetchTime}ms size=${originalResponse.ContentLength || 'unknown'} timeoutMs=${timeoutMs}`);
+      recordS3Success();
     } catch (e) {
       console.error(`❌ [S3 FETCH FAIL][${requestId}] ${e.name||''} ${e.message}`);
+      recordS3Failure(`${e.name || 'Error'} ${e.message}`.trim());
       return res.status(404).json({ error: 'Original file not found', detail: e.message });
     }
 

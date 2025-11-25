@@ -21,6 +21,8 @@ services:
       - STORAGE_TYPE=aws
       - WAV_DIR=/data/wav
       - DB_PATH=/root/db/recbot.db
+      - S3_FAILURE_UNHEALTHY_WINDOW_MS=60000
+      - EXIT_ON_S3_FAILURE=false
 
       # --- AWS S3 (required) ---
       - AWS_ACCESS_KEY_ID=your-aws-access-key-id-here
@@ -52,6 +54,12 @@ services:
       # --- Future / Reserved Variables (uncomment as needed) ---
       #- CDN_BASE_URL=https://cdn.your-domain-here
       #- FORCE_HTTPS=true
+    healthcheck:
+      test: ["CMD", "node", "/app/backend/scripts/healthcheck.cjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
     networks:
       - recbot
