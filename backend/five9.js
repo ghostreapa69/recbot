@@ -4,7 +4,7 @@ import utc from 'dayjs/plugin/utc.js';
 import timezone from 'dayjs/plugin/timezone.js';
 import customParseFormat from 'dayjs/plugin/customParseFormat.js';
 import { XMLParser } from 'fast-xml-parser';
-import { bulkUpsertReports, logAuditEvent } from './database.js';
+import { bulkUpsertReports, logAuditEvent, normalizeReportTimestamp } from './database.js';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -308,6 +308,7 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
   const header = lines.shift().split(',').map(h=>h.trim().replace(/^"|"$/g,''));
 
   const rows = [];
+  const timestampSamples = [];
   for (const line of lines) {
     const cols = line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(c=>c.trim().replace(/^"|"$/g,''));
     // Basic mapping by header names (normalize to uppercase without spaces for matching)
@@ -315,8 +316,11 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
     const callId = map['CALL_ID'] || map['CALLID'] || null;
     if (!callId) continue;
     
-    // Store timestamp exactly as Five9 provides it - no conversion
-    const timestamp = map['TIMESTAMP'] || null;
+    const rawTimestamp = map['TIMESTAMP'] || null;
+    const timestamp = normalizeReportTimestamp(rawTimestamp) || rawTimestamp;
+    if (timestampSamples.length < 3) {
+      timestampSamples.push({ raw: rawTimestamp, normalized: timestamp });
+    }
     
     rows.push({
       call_id: callId,
@@ -344,7 +348,7 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
       holds: parseInt(map['HOLDS']||'0',10)||0,
       abandoned: parseInt(map['ABANDONED']||'0',10)||0,
       recordings: map['RECORDINGS'] || null,
-      raw_json: JSON.stringify(map)
+      raw_json: JSON.stringify({ ...map, TIMESTAMP_ORIGINAL: rawTimestamp })
     });
   }
   
@@ -353,17 +357,15 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
   
   // Log timestamp samples from Five9 (stored as-is)
   if (rows.length > 0) {
-    console.log(`� [Five9][STORED AS-IS] Storing ${rows.length} rows with timestamps exactly as received from Five9`);
-    const timestamps = rows.slice(0, 3).map(r => r.timestamp).filter(t => t);
-    timestamps.forEach((ts, idx) => {
-      console.log(`   Sample ${idx + 1}: "${ts}"`);
+    console.log(`� [Five9][TIMESTAMPS] Normalized ${rows.length} rows from ${FIVE9_TIMEZONE} to UTC`);
+    timestampSamples.forEach((sample, idx) => {
+      console.log(`   Sample ${idx + 1}: raw="${sample.raw}" -> utc="${sample.normalized}"`);
     });
-    
-    // Log range
+
     const allTimestamps = rows.map(r => r.timestamp).filter(t => t).sort();
     if (allTimestamps.length > 0) {
-      console.log('📊 [Five9][STORED RANGE] First:', allTimestamps[0]);
-      console.log('📊 [Five9][STORED RANGE] Last:', allTimestamps[allTimestamps.length - 1]);
+      console.log('📊 [Five9][UTC RANGE] First:', allTimestamps[0]);
+      console.log('📊 [Five9][UTC RANGE] Last:', allTimestamps[allTimestamps.length - 1]);
     }
   }
   if (auditUser) {

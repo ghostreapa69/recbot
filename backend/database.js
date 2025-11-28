@@ -4,8 +4,70 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dayjs from 'dayjs';
 import customParseFormat from 'dayjs/plugin/customParseFormat.js';
+import utc from 'dayjs/plugin/utc.js';
+import timezone from 'dayjs/plugin/timezone.js';
 
 dayjs.extend(customParseFormat);
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const REPORT_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
+const REPORT_TIMESTAMP_FORMAT = 'YYYY-MM-DDTHH:mm:ss[Z]';
+const REPORT_TIME_DEBUG = /^true$/i.test(process.env.REPORT_TIME_DEBUG || '');
+export const ISO_TIMESTAMP_GLOB = '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z';
+
+export function normalizeReportTimestamp(raw) {
+  if (raw === null || raw === undefined) return null;
+  const trimmed = typeof raw === 'string' ? raw.trim() : String(raw).trim();
+  if (!trimmed) return null;
+
+  const formatUtc = (dt) => dt && dt.isValid() ? dt.utc().format(REPORT_TIMESTAMP_FORMAT) : null;
+
+  // Already ISO-style string (contains T) – normalize and force UTC with Z suffix
+  if (trimmed.includes('T')) {
+    const parsedIso = dayjs(trimmed);
+    const normalizedIso = formatUtc(parsedIso);
+    if (normalizedIso) {
+      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] ISO parse raw="${trimmed}" -> "${normalizedIso}"`);
+      return normalizedIso;
+    }
+  }
+
+  // Legacy space-separated format "YYYY-MM-DD HH:mm:ss" – assume UTC if no offset provided
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)) {
+    const parsedSpaceUtc = dayjs.utc(trimmed.replace(' ', 'T') + 'Z');
+    const normalizedSpaceUtc = formatUtc(parsedSpaceUtc);
+    if (normalizedSpaceUtc) {
+      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Space parse (assume UTC) raw="${trimmed}" -> "${normalizedSpaceUtc}"`);
+      return normalizedSpaceUtc;
+    }
+
+    // Fallback: interpret naive timestamp using Five9 timezone for backwards compatibility
+    const parsedSpaceTz = dayjs.tz(trimmed, 'YYYY-MM-DD HH:mm:ss', REPORT_TIMEZONE);
+    const normalizedSpaceTz = formatUtc(parsedSpaceTz);
+    if (normalizedSpaceTz) {
+      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Space parse (tz fallback ${REPORT_TIMEZONE}) raw="${trimmed}" -> "${normalizedSpaceTz}"`);
+      return normalizedSpaceTz;
+    }
+  }
+
+  // Five9 CSV export format "Tue, 25 Nov 2025 09:55:01" – interpret using configured timezone
+  const parsedFive9 = dayjs.tz(trimmed, 'ddd, DD MMM YYYY HH:mm:ss', REPORT_TIMEZONE);
+  const normalizedFive9 = formatUtc(parsedFive9);
+  if (normalizedFive9) {
+    if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Five9 parse raw="${trimmed}" tz=${REPORT_TIMEZONE} -> "${normalizedFive9}"`);
+    return normalizedFive9;
+  }
+
+  // Fallback: let dayjs try its best; still coerce to UTC if valid
+  const fallback = formatUtc(dayjs(trimmed));
+  if (REPORT_TIME_DEBUG && fallback) {
+    console.log(`[REPORT_TIME] Fallback parse raw="${trimmed}" -> "${fallback}"`);
+  } else if (REPORT_TIME_DEBUG) {
+    console.log(`[REPORT_TIME] Failed parse raw="${trimmed}"`);
+  }
+  return fallback || null;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,14 +102,9 @@ const db = new Database(DB_PATH);
 // Register custom function to convert Five9 timestamp to ISO format
 // "Thu, 23 Oct 2025 12:47:37" -> "2025-10-23 12:47:37"
 db.function('five9_to_iso', (timestamp) => {
-  if (!timestamp) return null;
-  try {
-    const parsed = dayjs(timestamp, 'ddd, DD MMM YYYY HH:mm:ss');
-    if (!parsed.isValid()) return null;
-    return parsed.format('YYYY-MM-DD HH:mm:ss');
-  } catch (e) {
-    return null;
-  }
+  const normalized = normalizeReportTimestamp(timestamp);
+  if (!normalized) return null;
+  return normalized.replace('T', ' ').replace('Z', '');
 });
 
 // Enable WAL mode for better performance with concurrent reads
@@ -142,30 +199,45 @@ try {
   console.warn('⚠️  [MIGRATION] reporting index creation issue:', e.message);
 }
 
-// Migration: Normalize non-ISO timestamps in reporting table (run lightly with limit to avoid huge locks)
+// Migration: Normalize legacy Five9 timestamps to UTC ISO once on startup (batch processing)
 try {
-  const toFix = db.prepare(`SELECT call_id, timestamp FROM reporting WHERE timestamp IS NOT NULL AND timestamp NOT LIKE '%T%' LIMIT 500`).all();
-  if (toFix.length) {
-    const updateStmt = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
-    const parseCandidates = [
-      'YYYY-MM-DD HH:mm:ss',
-      'MM/DD/YYYY HH:mm:ss',
-      'MM/DD/YYYY hh:mm:ss A',
-      'MM/DD/YY HH:mm:ss',
-      'MM/DD/YY hh:mm:ss A'
-    ];
-    let converted = 0;
-    for (const row of toFix) {
-      let iso = null;
-      const raw = row.timestamp;
-      for (const fmt of parseCandidates) {
-        const d = new Date(raw);
-        // Fallback simple: rely on Date parse first (ensures we don't add heavy deps here)
-        if (!isNaN(d.getTime())) { iso = d.toISOString(); break; }
+  const selectLegacy = db.prepare(`
+    SELECT call_id, timestamp FROM reporting
+    WHERE timestamp IS NOT NULL
+      AND timestamp NOT GLOB '${ISO_TIMESTAMP_GLOB}'
+    LIMIT ?
+  `);
+  const updateLegacy = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
+  const batchSize = parseInt(process.env.REPORTING_TIMESTAMP_MIGRATION_BATCH || '1000', 10);
+
+  let totalConverted = 0;
+  while (true) {
+    const batch = selectLegacy.all(batchSize);
+    if (!batch.length) break;
+    const convertedThisBatch = db.transaction((rows) => {
+      let converted = 0;
+      for (const row of rows) {
+        const normalized = normalizeReportTimestamp(row.timestamp);
+        if (normalized && normalized !== row.timestamp) {
+          updateLegacy.run(normalized, row.call_id);
+          converted++;
+        }
       }
-      if (iso) { updateStmt.run(iso, row.call_id); converted++; }
-    }
-    if (converted) console.log(`🛠️  [MIGRATION] Normalized ${converted} reporting timestamps to ISO`);
+      return converted;
+    })(batch);
+    totalConverted += convertedThisBatch;
+    if (batch.length < batchSize) break;
+    if (!convertedThisBatch) break;
+  }
+  if (totalConverted) {
+    console.log(`🛠️  [MIGRATION] Normalized ${totalConverted} reporting timestamps to UTC ISO format`);
+  }
+  const remaining = getLegacyReportTimestampStats(5);
+  if (remaining.total > 0) {
+    console.warn(`⚠️  [MIGRATION] ${remaining.total} reporting rows still carry non-ISO timestamps (showing up to 5 samples).`);
+    remaining.samples.forEach((row, idx) => {
+      console.warn(`   [${idx + 1}] call_id=${row.call_id} timestamp="${row.timestamp}"`);
+    });
   }
 } catch (e) {
   console.warn('⚠️  [MIGRATION] reporting timestamp normalization issue:', e.message);
@@ -513,24 +585,37 @@ statements.upsertReport = db.prepare(`
     recordings=excluded.recordings,
     raw_json=excluded.raw_json;
 `);
-statements.queryReports = db.prepare(`
+statements.queryReportsDesc = db.prepare(`
   SELECT * FROM reporting
   WHERE 1=1
-    AND (? IS NULL OR five9_to_iso(timestamp) >= ?)
-    AND (? IS NULL OR five9_to_iso(timestamp) <= ?)
+    AND (? IS NULL OR timestamp >= ?)
+    AND (? IS NULL OR timestamp <= ?)
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
     AND (? IS NULL OR ani LIKE '%' || ? || '%')
     AND (? IS NULL OR dnis LIKE '%' || ? || '%')
-  ORDER BY five9_to_iso(timestamp) DESC
+  ORDER BY timestamp DESC
+  LIMIT ? OFFSET ?;
+`);
+statements.queryReportsAsc = db.prepare(`
+  SELECT * FROM reporting
+  WHERE 1=1
+    AND (? IS NULL OR timestamp >= ?)
+    AND (? IS NULL OR timestamp <= ?)
+    AND (? IS NULL OR agent LIKE '%' || ? || '%')
+    AND (? IS NULL OR campaign = ?)
+    AND (? IS NULL OR call_type = ?)
+    AND (? IS NULL OR ani LIKE '%' || ? || '%')
+    AND (? IS NULL OR dnis LIKE '%' || ? || '%')
+  ORDER BY timestamp ASC
   LIMIT ? OFFSET ?;
 `);
 statements.countReports = db.prepare(`
   SELECT COUNT(*) as total FROM reporting
   WHERE 1=1
-    AND (? IS NULL OR five9_to_iso(timestamp) >= ?)
-    AND (? IS NULL OR five9_to_iso(timestamp) <= ?)
+    AND (? IS NULL OR timestamp >= ?)
+    AND (? IS NULL OR timestamp <= ?)
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
@@ -1154,7 +1239,10 @@ export function getDistinctUsers(search = null, limit = 20) {
 // ----------------------------------------------
 export function upsertReportRow(row) {
   try {
-    statements.upsertReport.run(row);
+    const normalizedRow = { ...row };
+    const normalizedTs = normalizeReportTimestamp(normalizedRow.timestamp);
+    if (normalizedTs) normalizedRow.timestamp = normalizedTs;
+    statements.upsertReport.run(normalizedRow);
     return true;
   } catch (e) {
     console.error('Failed to upsert report row', e.message, row?.call_id);
@@ -1166,14 +1254,17 @@ export function bulkUpsertReports(rows = []) {
   const tx = db.transaction((items) => {
     let inserted = 0;
     for (const r of items) {
-      try { statements.upsertReport.run(r); inserted++; } catch { /* ignore duplicate errors */ }
+      const normalizedRow = { ...r };
+      const normalizedTs = normalizeReportTimestamp(normalizedRow.timestamp);
+      if (normalizedTs) normalizedRow.timestamp = normalizedTs;
+      try { statements.upsertReport.run(normalizedRow); inserted++; } catch { /* ignore duplicate errors */ }
     }
     return inserted;
   });
   return tx(rows);
 }
 
-export function queryReports({ start=null, end=null, agent=null, campaign=null, callType=null, ani=null, dnis=null, limit=100, offset=0 } = {}) {
+export function queryReports({ start=null, end=null, agent=null, campaign=null, callType=null, ani=null, dnis=null, limit=100, offset=0, sort='desc' } = {}) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const s = norm(start);
@@ -1183,14 +1274,16 @@ export function queryReports({ start=null, end=null, agent=null, campaign=null, 
     const ct = norm(callType);
     const an = norm(ani);
     const dn = norm(dnis);
-    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, campaign=${c}, callType=${ct}, ani=${an}, dnis=${dn}, limit=${limit}, offset=${offset}`);
-    const rows = statements.queryReports.all(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn, limit, offset);
+    const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, campaign=${c}, callType=${ct}, ani=${an}, dnis=${dn}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
+    const stmt = sortDir === 'asc' ? statements.queryReportsAsc : statements.queryReportsDesc;
+    const rows = stmt.all(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn, limit, offset);
     const { total } = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn);
     console.log(`[QUERY REPORTS] Results: returned ${rows.length} rows, total=${total}`);
     if (rows.length > 0) {
       console.log(`[QUERY REPORTS] First row timestamp: ${rows[0].timestamp}, Last row timestamp: ${rows[rows.length-1].timestamp}`);
     }
-    return { rows, total };
+    return { rows, total, sort: sortDir };
   } catch (e) {
     console.error('Failed to query reports', e);
     return { rows: [], total: 0 };
@@ -1212,6 +1305,110 @@ export function getDistinctCampaigns() {
 }
 export function getDistinctCallTypes() {
   try { return db.prepare(`SELECT DISTINCT call_type FROM reporting WHERE call_type IS NOT NULL AND call_type <> '' ORDER BY call_type`).all().map(r=>r.call_type); } catch { return []; }
+}
+
+export function rewriteReportTimestamps({ batchSize = 5000, runAll = true, includeIso = false, dryRun = false } = {}) {
+  const selectLegacyStmt = db.prepare(`
+    SELECT rowid AS rid, call_id, timestamp FROM reporting
+    WHERE rowid > ? AND timestamp IS NOT NULL AND timestamp NOT GLOB '${ISO_TIMESTAMP_GLOB}'
+    ORDER BY rowid ASC
+    LIMIT ?
+  `);
+  const selectAllStmt = db.prepare(`
+    SELECT rowid AS rid, call_id, timestamp FROM reporting
+    WHERE rowid > ? AND timestamp IS NOT NULL
+    ORDER BY rowid ASC
+    LIMIT ?
+  `);
+  const selectStmt = includeIso ? selectAllStmt : selectLegacyStmt;
+  const updateStmt = dryRun ? null : db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
+
+  let processed = 0;
+  let updated = 0;
+  let errors = 0;
+  let batches = 0;
+  let lastRowId = 0;
+  const conversions = [];
+
+  while (true) {
+    const rows = selectStmt.all(lastRowId, batchSize);
+    if (!rows.length) break;
+    batches++;
+    processed += rows.length;
+
+    const updates = [];
+    for (const row of rows) {
+      try {
+        const normalized = normalizeReportTimestamp(row.timestamp);
+        if (!normalized) {
+          errors++;
+          if (REPORT_TIME_DEBUG && errors <= 5) {
+            console.warn(`[REPORT_TIME] Failed to normalize call_id=${row.call_id} timestamp="${row.timestamp}"`);
+          }
+          continue;
+        }
+        if (normalized !== row.timestamp) {
+          updates.push({ callId: row.call_id, from: row.timestamp, to: normalized });
+        }
+      } catch (e) {
+        errors++;
+        if (REPORT_TIME_DEBUG && errors <= 5) {
+          console.warn(`[REPORT_TIME] Exception normalizing call_id=${row.call_id}: ${e.message}`);
+        }
+      }
+    }
+
+    if (!dryRun && updates.length) {
+      db.transaction((items) => {
+        for (const item of items) {
+          updateStmt.run(item.to, item.callId);
+        }
+      })(updates);
+    }
+
+    if (updates.length) {
+      updated += updates.length;
+      const spaceRemaining = 5 - conversions.length;
+      if (spaceRemaining > 0) {
+        conversions.push(...updates.slice(0, spaceRemaining));
+      }
+    }
+
+    lastRowId = rows[rows.length - 1].rid;
+    if (!runAll || rows.length < batchSize) break;
+  }
+
+  const legacy = getLegacyReportTimestampStats(5);
+  return {
+    processed,
+    updated,
+    errors,
+    batches,
+    dryRun,
+    includeIso,
+    remainingLegacy: legacy.total,
+    remainingSamples: legacy.samples,
+    sampleConversions: conversions
+  };
+}
+
+export function getLegacyReportTimestampStats(limit = 10) {
+  try {
+    const totalRow = db.prepare(`
+      SELECT COUNT(*) as count FROM reporting
+      WHERE timestamp IS NOT NULL AND timestamp NOT GLOB '${ISO_TIMESTAMP_GLOB}'
+    `).get();
+    const samples = db.prepare(`
+      SELECT call_id, timestamp FROM reporting
+      WHERE timestamp IS NOT NULL AND timestamp NOT GLOB '${ISO_TIMESTAMP_GLOB}'
+      ORDER BY rowid DESC
+      LIMIT ?
+    `).all(limit);
+    return { total: totalRow?.count || 0, samples };
+  } catch (e) {
+    if (REPORT_TIME_DEBUG) console.warn('[REPORT_TIME] Legacy timestamp stats failed:', e.message);
+    return { total: 0, samples: [], error: e.message };
+  }
 }
 
 export { db, statements };

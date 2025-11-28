@@ -20,7 +20,7 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport } from './database.js';
+import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
 
@@ -308,154 +308,32 @@ app.post('/api/reports/ingest', requireAuth, ensureSession, requireAdmin, async 
   }
 });
 
-// Endpoint to fix timezone on existing reporting data (admin only, one-time migration)
+// Endpoint to convert legacy report timestamps to canonical UTC ISO format
 app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
-    const dayjs = (await import('dayjs')).default;
-    const utc = (await import('dayjs/plugin/utc.js')).default;
-    const timezone = (await import('dayjs/plugin/timezone.js')).default;
-    dayjs.extend(utc);
-    dayjs.extend(timezone);
-    
-    const sourceTimezone = req.body.sourceTimezone || process.env.FIVE9_TIMEZONE || 'America/New_York';
-    const batchSize = parseInt(req.body.batchSize || '10000', 10);
-    const runAll = req.body.runAll !== false; // default true
-    const deleteInvalidYears = req.body.deleteInvalidYears !== false; // default true
-    
-    console.log(`[TIMEZONE FIX] Starting migration from ${sourceTimezone} to UTC, batch size: ${batchSize}, runAll: ${runAll}, deleteInvalidYears: ${deleteInvalidYears}`);
-    
-    const { db } = await import('./database.js');
-    
-    let totalUpdated = 0;
-    let totalProcessed = 0;
-    let totalErrors = 0;
-    let totalDeleted = 0;
-    let batchCount = 0;
-    
-    // First, delete records with invalid years (2026 or beyond)
-    if (deleteInvalidYears) {
-      try {
-        const currentYear = new Date().getFullYear();
-        const futureYear = currentYear + 1;
-        const deleteResult = db.prepare(`DELETE FROM reporting WHERE timestamp LIKE '${futureYear}%' OR timestamp LIKE '${futureYear + 1}%' OR timestamp LIKE '${futureYear + 2}%'`).run();
-        totalDeleted = deleteResult.changes || 0;
-        console.log(`[TIMEZONE FIX] Deleted ${totalDeleted} rows with invalid future years (${futureYear}+)`);
-      } catch (e) {
-        console.error('[TIMEZONE FIX] Error deleting invalid years:', e.message);
-      }
+    const batchSize = parseInt(req.body?.batchSize || '5000', 10);
+    const runAll = req.body?.runAll !== false;
+    const includeIso = req.body?.includeIso === true;
+    const dryRun = req.body?.dryRun === true;
+
+    console.log(`[TIMESTAMP FIX] Starting rewrite batchSize=${batchSize} runAll=${runAll} includeIso=${includeIso} dryRun=${dryRun}`);
+    const result = rewriteReportTimestamps({ batchSize, runAll, includeIso, dryRun });
+    const legacy = getLegacyReportTimestampStats(10);
+
+    console.log(`[TIMESTAMP FIX] Complete: processed=${result.processed} updated=${result.updated} errors=${result.errors} batches=${result.batches} remaining=${result.remainingLegacy}`);
+    if (result.sampleConversions?.length) {
+      result.sampleConversions.forEach((sample, idx) => {
+        console.log(`   [TIMESTAMP FIX] Sample ${idx + 1}: "${sample.from}" -> "${sample.to}" (call_id=${sample.callId})`);
+      });
     }
-    
-    const updateStmt = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
-    
-    do {
-      batchCount++;
-      // Get rows that look like they haven't been converted yet (no 'T' or 'Z' in timestamp, or specific patterns)
-      // Or just process all rows - the update will only happen if timestamp changes
-      const rows = db.prepare(`SELECT call_id, timestamp FROM reporting WHERE timestamp IS NOT NULL ORDER BY datetime(timestamp) DESC LIMIT ? OFFSET ?`).all(batchSize, totalProcessed);
-      
-      if (rows.length === 0) {
-        console.log(`[TIMEZONE FIX] No more rows to process`);
-        break;
-      }
-      
-      console.log(`[TIMEZONE FIX] Batch ${batchCount}: Processing ${rows.length} rows (offset ${totalProcessed})`);
-      
-      let batchUpdated = 0;
-      let batchErrors = 0;
-      
-      for (const row of rows) {
-        try {
-          const rawTs = row.timestamp;
-          if (!rawTs) {
-            batchErrors++;
-            continue;
-          }
-          
-          // Skip if already in UTC ISO format (ends with Z)
-          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(rawTs)) {
-            // Already in correct UTC ISO format, skip
-            continue;
-          }
-          
-          // Try to parse with explicit format hints
-          let parsed = null;
-          const formats = [
-            'YYYY-MM-DD HH:mm:ss',
-            'M/D/YYYY HH:mm:ss',
-            'M/D/YYYY h:mm:ss A',
-            'MM/DD/YYYY HH:mm:ss',
-            'MM/DD/YYYY hh:mm:ss A',
-          ];
-          
-          for (const fmt of formats) {
-            const attempt = dayjs.tz(rawTs, fmt, sourceTimezone);
-            if (attempt.isValid() && attempt.year() >= 2020 && attempt.year() <= new Date().getFullYear() + 1) {
-              parsed = attempt;
-              break;
-            }
-          }
-          
-          // Fallback: try timezone-aware parsing without format
-          if (!parsed) {
-            parsed = dayjs.tz(rawTs, sourceTimezone);
-          }
-          
-          if (parsed && parsed.isValid()) {
-            const utcIso = parsed.utc().toISOString();
-            // Only update if actually different
-            if (utcIso !== rawTs) {
-              updateStmt.run(utcIso, row.call_id);
-              batchUpdated++;
-              if (totalUpdated < 5) {
-                console.log(`[TIMEZONE FIX] ${row.call_id}: "${rawTs}" -> "${utcIso}"`);
-              }
-            }
-          } else {
-            batchErrors++;
-            if (batchErrors <= 3) {
-              console.warn(`[TIMEZONE FIX] Could not parse: "${rawTs}"`);
-            }
-          }
-        } catch (e) {
-          batchErrors++;
-          if (batchErrors <= 3) {
-            console.error(`[TIMEZONE FIX] Error processing row:`, e.message);
-          }
-        }
-      }
-      
-      totalProcessed += rows.length;
-      totalUpdated += batchUpdated;
-      totalErrors += batchErrors;
-      
-      console.log(`[TIMEZONE FIX] Batch ${batchCount} complete: ${batchUpdated} updated, ${batchErrors} errors. Total so far: ${totalUpdated}/${totalProcessed}`);
-      
-      if (!runAll) {
-        // Single batch mode
-        break;
-      }
-      
-      // Continue if there might be more rows
-      if (rows.length < batchSize) {
-        console.log(`[TIMEZONE FIX] Last batch was smaller than batch size, done`);
-        break;
-      }
-      
-    } while (runAll);
-    
-    console.log(`[TIMEZONE FIX] Complete: ${totalUpdated} rows updated out of ${totalProcessed} processed, ${totalErrors} errors, ${totalDeleted} deleted`);
-    
-    res.json({ 
-      success: true, 
-      processed: totalProcessed, 
-      updated: totalUpdated,
-      deleted: totalDeleted,
-      errors: totalErrors,
-      batches: batchCount,
-      message: `Deleted ${totalDeleted} invalid records. Converted ${totalUpdated} timestamps from ${sourceTimezone} to UTC across ${batchCount} batch(es)`
+
+    res.json({
+      success: true,
+      ...result,
+      legacyStats: legacy
     });
   } catch (e) {
-    console.error('[TIMEZONE FIX] Error:', e);
+    console.error('[TIMESTAMP FIX] Error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -463,7 +341,7 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0, timezone: userTimezone } = req.query;
+    let { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
@@ -477,23 +355,8 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     
     console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", campaign="${campaign}", callType="${callType}", ani="${ani}", dnis="${dnis}", limit=${limit}, offset=${offset}`);
     
-    // Convert Five9 format to SQLite ISO format
-    // "Thu, 23 Oct 2025 12:47:37" -> "2025-10-23 12:47:37"
-    const five9ToISO = (dateStr) => {
-      if (!dateStr) return null;
-      try {
-        // Use dayjs to parse Five9 format and convert to ISO
-        const parsed = dayjs(dateStr, 'ddd, DD MMM YYYY HH:mm:ss');
-        if (!parsed.isValid()) return null;
-        return parsed.format('YYYY-MM-DD HH:mm:ss');
-      } catch (e) {
-        console.warn('[five9ToISO] Failed to parse:', dateStr, e.message);
-        return null;
-      }
-    };
-    
-    const startFormatted = five9ToISO(start);
-    const endFormatted = five9ToISO(end);
+    const startFormatted = normalizeReportTimestamp(start);
+    const endFormatted = normalizeReportTimestamp(end);
     
     if (startFormatted || endFormatted) {
       console.log(`[API /api/reports] Formatted for SQLite: start="${startFormatted}", end="${endFormatted}"`);
@@ -514,7 +377,31 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       console.warn('[API /api/reports] Debug query failed:', debugErr.message);
     }
     
-    const result = queryReports({ start: startFormatted, end: endFormatted, agent, campaign, callType, ani, dnis, limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 });
+    const appliedStart = startFormatted || null;
+    const appliedEnd = endFormatted || null;
+    const appliedLimit = Math.min(parseInt(limit,10)||100,500);
+    const appliedOffset = parseInt(offset,10)||0;
+
+    const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const result = queryReports({ start: appliedStart, end: appliedEnd, agent, campaign, callType, ani, dnis, limit: appliedLimit, offset: appliedOffset, sort: sortDir });
+    const returnedRange = result.rows && result.rows.length ? (
+      sortDir === 'asc'
+        ? { min: result.rows[0].timestamp || null, max: result.rows[result.rows.length - 1].timestamp || null }
+        : { max: result.rows[0].timestamp || null, min: result.rows[result.rows.length - 1].timestamp || null }
+    ) : { max: null, min: null };
+    console.log(`[API /api/reports] Applied range: start="${appliedStart}" end="${appliedEnd}" limit=${appliedLimit} offset=${appliedOffset} sort=${sortDir}`);
+    console.log(`[API /api/reports] Returned range: min="${returnedRange.min}" max="${returnedRange.max}" total=${result.total}`);
+
+    let legacyStats = null;
+    if (/^true$/i.test(process.env.REPORT_TIME_DEBUG || '')) {
+      legacyStats = getLegacyReportTimestampStats(5);
+      console.log(`[API /api/reports] Legacy timestamp rows remaining=${legacyStats.total}`);
+      if (legacyStats.total && legacyStats.samples?.length) {
+        legacyStats.samples.forEach((sample, idx) => {
+          console.log(`   [legacy ${idx + 1}] call_id=${sample.call_id} timestamp="${sample.timestamp}"`);
+        });
+      }
+    }
     try {
       logAuditEvent(
         req.user.id,
@@ -535,15 +422,20 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
             ani: ani || null,
             dnis: dnis || null
           },
-          pagination: { limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 },
+          pagination: { limit: appliedLimit, offset: appliedOffset, sort: sortDir },
           returned: result.rows ? result.rows.length : 0,
-          total: result.total || 0
+          total: result.total || 0,
+          appliedRange: { start: appliedStart, end: appliedEnd },
+          returnedRange,
+          legacyTotal: legacyStats ? legacyStats.total : undefined
         }
       );
     } catch (e) {
       console.warn('REPORT_VIEW audit log failed:', e.message);
     }
-    res.json({ success: true, ...result });
+    const responsePayload = { success: true, ...result, sort: sortDir, appliedRange: { start: appliedStart, end: appliedEnd }, returnedRange };
+    if (legacyStats) responsePayload.legacyStats = legacyStats;
+    res.json(responsePayload);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -42,6 +42,7 @@ export default function ReportsPage(){
   const [startDate,setStartDate]=useState(null);
   const [endDate,setEndDate]=useState(null);
   const [page,setPage]=useState(1); const [pageSize,setPageSize]=useState(50); const [total,setTotal]=useState(0);
+  const [sortOrder,setSortOrder]=useState('desc');
   const [initialized,setInitialized]=useState(false);
   const isAdmin = user?.publicMetadata?.role === 'admin';
 
@@ -51,23 +52,22 @@ export default function ReportsPage(){
       const token = await getToken();
       const params = new URLSearchParams();
       
-      // Five9 stores data in Pacific time, so convert user's local time to Pacific
-      const FIVE9_TZ = 'America/Los_Angeles';
+      const FIVE9_TZ = process.env.REACT_APP_FIVE9_TIMEZONE || 'America/Los_Angeles';
       const userTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
       
-      // Convert date pickers from user's timezone to Pacific time in Five9 format
+      // Convert date pickers from user's timezone to Five9's timezone before querying
+      const formatUtc = (value) => dayjs(value).utc().format('YYYY-MM-DDTHH:mm:ss[Z]');
       if (startDate) {
-        // Convert the same moment in time to Pacific timezone
-        const pacificTime = dayjs(startDate).tz(FIVE9_TZ);
-        const formatted = pacificTime.format('ddd, DD MMM YYYY HH:mm:ss');
-        params.append('start', formatted);
-        console.log(`Start: ${dayjs(startDate).format('YYYY-MM-DD HH:mm:ss')} (local) -> ${formatted} (Pacific)`);
+        const startUtc = formatUtc(startDate);
+        params.append('start', startUtc);
+        const five9Display = dayjs(startDate).tz(FIVE9_TZ).format('ddd, DD MMM YYYY HH:mm:ss');
+        console.log(`Start: ${dayjs(startDate).format('YYYY-MM-DD HH:mm:ss')} (local) -> ${five9Display} (${FIVE9_TZ}) -> ${startUtc} (UTC)`);
       }
       if (endDate) {
-        const pacificTime = dayjs(endDate).tz(FIVE9_TZ);
-        const formatted = pacificTime.format('ddd, DD MMM YYYY HH:mm:ss');
-        params.append('end', formatted);
-        console.log(`End: ${dayjs(endDate).format('YYYY-MM-DD HH:mm:ss')} (local) -> ${formatted} (Pacific)`);
+        const endUtc = formatUtc(endDate);
+        params.append('end', endUtc);
+        const five9Display = dayjs(endDate).tz(FIVE9_TZ).format('ddd, DD MMM YYYY HH:mm:ss');
+        console.log(`End: ${dayjs(endDate).format('YYYY-MM-DD HH:mm:ss')} (local) -> ${five9Display} (${FIVE9_TZ}) -> ${endUtc} (UTC)`);
       }
       if (userTz) params.append('timezone', userTz);
       if (agent && agent !== 'undefined') params.append('agent', agent);
@@ -76,6 +76,7 @@ export default function ReportsPage(){
       if (callType && callType !== 'undefined') params.append('callType', callType);
       if (ani && ani !== 'undefined') params.append('ani', ani);
       if (dnis && dnis !== 'undefined') params.append('dnis', dnis);
+      params.append('sort', sortOrder);
       params.append('limit', pageSize);
       params.append('offset', (page - 1) * pageSize);
       const res = await fetch(`/api/reports?${params.toString()}`, { headers: { Authorization: `Bearer ${token}` }});
@@ -83,10 +84,16 @@ export default function ReportsPage(){
       if (!res.ok) throw new Error(json.error || 'Failed');
       setRows(json.rows || []);
       setTotal(json.total || 0);
+      if (json.returnedRange) {
+        console.log('[Reports] Returned range:', json.returnedRange, 'Sort:', json.sort);
+      }
+      if (json.legacyStats) {
+        console.log('[Reports] Legacy timestamp rows remaining:', json.legacyStats.total, json.legacyStats.samples);
+      }
     } catch (e) {
       setError(e.message);
     } finally { setLoading(false); }
-  }, [getToken, agent, campaign, callType, ani, dnis, startDate, endDate, page, pageSize]);
+  }, [getToken, agent, campaign, callType, ani, dnis, startDate, endDate, page, pageSize, sortOrder]);
 
   const ingest = async () => {
     if(!isAdmin) return;
@@ -101,18 +108,18 @@ export default function ReportsPage(){
 
   const fixTimezones = async () => {
     if(!isAdmin) return;
-    if(!window.confirm('This will:\n1. Delete records with invalid future years (2026+)\n2. Convert remaining timestamps from Five9 timezone to UTC\n\nThis may take a minute for large datasets. Continue?')) return;
+    if(!window.confirm('This will:\n1. Scan all stored report timestamps\n2. Rewrite legacy values (e.g. "Tue, 25 Nov 2025 20:44:49") into canonical UTC ISO format\n\nThis may take a minute for large datasets. Continue?')) return;
     setLoading(true); setError(null);
     try {
       const token=await getToken();
       const res = await fetch('/api/reports/fix-timezones', { 
         method:'POST', 
         headers:{ 'Content-Type':'application/json', Authorization:`Bearer ${token}` },
-        body: JSON.stringify({ batchSize: 10000, runAll: true, deleteInvalidYears: true })
+        body: JSON.stringify({ batchSize: 10000, runAll: true })
       });
       const json = await res.json(); 
-      if(!res.ok) throw new Error(json.error||'Timezone fix failed');
-      alert(`Success!\n\nDeleted: ${json.deleted} invalid records\nConverted: ${json.updated} timestamps to UTC\nProcessed: ${json.processed} rows across ${json.batches} batch(es)\nErrors: ${json.errors}`);
+      if(!res.ok) throw new Error(json.error||'Timestamp normalization failed');
+      alert(`Timestamp normalization complete!\n\nProcessed: ${json.processed}\nUpdated: ${json.updated}\nErrors: ${json.errors}\nBatches: ${json.batches}\nRemaining legacy rows: ${json.remainingLegacy}`);
       await fetchReports();
     } catch(e){ setError(e.message); } finally { setLoading(false); }
   };
@@ -145,7 +152,7 @@ export default function ReportsPage(){
   // Reset page to 1 when filters change to avoid empty result pages
   useEffect(() => {
     setPage(1);
-  }, [agent, campaign, callType, ani, dnis, startDate, endDate]);
+  }, [agent, campaign, callType, ani, dnis, startDate, endDate, sortOrder, pageSize]);
 
 
   function applyPreset(p){
@@ -218,6 +225,13 @@ export default function ReportsPage(){
         </FormControl>
         <TextField label="ANI" value={ani} onChange={e=>setAni(e.target.value)} size="small" />
         <TextField label="DNIS" value={dnis} onChange={e=>setDnis(e.target.value)} size="small" />
+        <FormControl size="small" sx={{ minWidth:150 }}>
+          <InputLabel id="sort-order-label">Sort</InputLabel>
+          <Select labelId="sort-order-label" value={sortOrder} label="Sort" onChange={(e)=>setSortOrder(e.target.value)}>
+            <MenuItem value="desc">Newest First</MenuItem>
+            <MenuItem value="asc">Oldest First</MenuItem>
+          </Select>
+        </FormControl>
         <Button variant="contained" onClick={()=>{ setPage(1); fetchReports(); }} disabled={loading}>Apply</Button>
         <Button variant="text" onClick={()=>{ setAgent(''); setCampaign(''); setCallType(''); setAni(''); setDnis(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('lastHour')} disabled={loading}>Last Hour</Button>
@@ -278,8 +292,16 @@ export default function ReportsPage(){
       </Table>
       </TableContainer>
     </Paper>
-    <Box sx={{ display:'flex', justifyContent:'space-between', alignItems:'center', mt:2 }}>
-      <Pagination count={Math.ceil(total/pageSize)||1} page={page} onChange={(e,v)=>setPage(v)} size="small" />
+    <Box sx={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:1, mt:2 }}>
+      <Stack direction="row" spacing={1} alignItems="center">
+        <Pagination count={Math.ceil(total/pageSize)||1} page={page} onChange={(e,v)=>setPage(v)} size="small" />
+        <FormControl size="small" sx={{ minWidth:120 }}>
+          <InputLabel id="page-size-label">Rows / page</InputLabel>
+          <Select labelId="page-size-label" value={pageSize} label="Rows / page" onChange={(e)=>setPageSize(Number(e.target.value))}>
+            {[25,50,100,250,500].map(opt => <MenuItem key={opt} value={opt}>{opt}</MenuItem>)}
+          </Select>
+        </FormControl>
+      </Stack>
       <Typography variant="caption">{total} rows</Typography>
     </Box>
   </Container>;
