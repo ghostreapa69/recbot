@@ -314,9 +314,12 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
     if (/^-?\d+$/.test(trimmed)) return parseInt(trimmed, 10) || 0;
     const parts = trimmed.split(':').map(p => p.trim());
     if (parts.length !== 3) return 0;
-    const [hh, mm, ss] = parts.map(p => parseInt(p, 10));
-    if ([hh, mm, ss].some(n => Number.isNaN(n))) return 0;
-    return ((hh * 3600) + (mm * 60) + ss) * 1000;
+    const hours = Number(parts[0]);
+    const minutes = Number(parts[1]);
+    const seconds = Number(parts[2]);
+    if ([hours, minutes, seconds].some(n => Number.isNaN(n))) return 0;
+    const totalSeconds = (hours * 3600) + (minutes * 60) + seconds;
+    return Math.max(0, Math.round(totalSeconds * 1000));
   }
 
   const rows = [];

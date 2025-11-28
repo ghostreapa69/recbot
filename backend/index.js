@@ -20,7 +20,7 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps } from './database.js';
+import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
 
@@ -221,6 +221,136 @@ function normalizeFilterToUtc(value, preferredTz = REPORT_FILTER_FALLBACK_TIMEZO
   return null;
 }
 
+function parseDurationMsFlexible(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+  }
+  const str = String(value).trim();
+  if (!str) return null;
+  if (/ms$/i.test(str)) {
+    const numeric = Number(str.replace(/ms$/i, '').trim());
+    return Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : null;
+  }
+  if (/^-?\d+(?:\.\d+)?$/.test(str)) {
+    const seconds = Number(str);
+    return Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1000)) : null;
+  }
+  if (str.includes(':')) {
+    const parts = str.split(':');
+    if (parts.length === 3) {
+      const [hhRaw, mmRaw, ssRaw] = parts;
+      const hours = Number(hhRaw);
+      const minutes = Number(mmRaw);
+      const seconds = Number(ssRaw);
+      if ([hours, minutes, seconds].some(n => Number.isNaN(n))) return null;
+      const totalSeconds = (hours * 3600) + (minutes * 60) + seconds;
+      return Math.max(0, Math.round(totalSeconds * 1000));
+    }
+  }
+  return null;
+}
+
+function parseIntegerFlexible(value) {
+  if (value === null || value === undefined) return null;
+  const str = typeof value === 'string' ? value.trim() : String(value).trim();
+  if (!str) return null;
+  const num = Number(str);
+  return Number.isFinite(num) ? Math.round(num) : null;
+}
+
+const REPORT_DURATION_FIELD_MAP = {
+  call_time: ['CALL_TIME', 'CALLTIME'],
+  bill_time_rounded: ['BILL_TIME_(ROUNDED)', 'BILL_TIME_ROUNDED'],
+  ivr_time: ['IVR_TIME'],
+  queue_wait_time: ['QUEUE_WAIT_TIME'],
+  ring_time: ['RING_TIME'],
+  talk_time: ['TALK_TIME'],
+  hold_time: ['HOLD_TIME'],
+  park_time: ['PARK_TIME'],
+  after_call_work_time: ['AFTER_CALL_WORK_TIME']
+};
+
+const REPORT_COST_KEYS = ['COST'];
+
+const REPORT_INTEGER_FIELD_MAP = {
+  transfers: ['TRANSFERS'],
+  conferences: ['CONFERENCES'],
+  holds: ['HOLDS'],
+  abandoned: ['ABANDONED']
+};
+
+function hydrateReportRow(row) {
+  if (!row) return row;
+  let rawPayload = row.raw_json_parsed && typeof row.raw_json_parsed === 'object' ? row.raw_json_parsed : null;
+  if (!rawPayload && typeof row.raw_json === 'string') {
+    try {
+      rawPayload = JSON.parse(row.raw_json);
+    } catch {
+      rawPayload = null;
+    }
+  }
+  if (!rawPayload) return row;
+
+  const hydrated = { ...row };
+
+  for (const [field, rawKeys] of Object.entries(REPORT_DURATION_FIELD_MAP)) {
+    const current = Number(hydrated[field]);
+    const needsHydration = !Number.isFinite(current) || current < 0 || current === 0;
+    if (!needsHydration) continue;
+    const rawValue = rawKeys.map(k => rawPayload[k]).find(v => v !== undefined && v !== null && v !== '');
+    const parsed = parseDurationMsFlexible(rawValue);
+    if (parsed !== null && parsed > 0) {
+      hydrated[field] = parsed;
+    }
+  }
+
+  // Cost may need precision but already stored as float. Refresh if zero but raw has value.
+  if (Number(hydrated.cost) === 0 || !Number.isFinite(Number(hydrated.cost))) {
+    const rawCost = REPORT_COST_KEYS.map(k => rawPayload[k]).find(v => v !== undefined && v !== null && v !== '');
+    if (rawCost !== undefined) {
+      const parsedCost = Number(rawCost);
+      if (Number.isFinite(parsedCost)) hydrated.cost = parsedCost;
+    }
+  }
+
+  for (const [field, rawKeys] of Object.entries(REPORT_INTEGER_FIELD_MAP)) {
+    const current = Number(hydrated[field]);
+    const rawValue = rawKeys.map(k => rawPayload[k]).find(v => v !== undefined && v !== null && v !== '');
+    const parsed = parseIntegerFlexible(rawValue);
+    if (parsed === null) continue;
+    if (!Number.isFinite(current) || (current === 0 && parsed > 0)) {
+      hydrated[field] = parsed;
+    }
+  }
+
+  return hydrated;
+}
+
+function hydrateReportRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return rows;
+  const hydrated = rows.map(hydrateReportRow);
+
+  try {
+    const callIds = Array.from(new Set(hydrated.map(row => (row && row.call_id ? String(row.call_id) : null)).filter(Boolean)));
+    if (callIds.length) {
+      const availabilityMap = getCallIdsWithRecordings(callIds);
+      if (availabilityMap && typeof availabilityMap === 'object') {
+        for (const row of hydrated) {
+          if (!row || !row.call_id) continue;
+          if (availabilityMap[row.call_id]) {
+            row.hasRecording = true;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[REPORT] Failed to hydrate recording availability:', err.message);
+  }
+
+  return hydrated;
+}
+
 // ----------------------------------------------
 // FFmpeg concurrency + configuration
 // ----------------------------------------------
@@ -345,7 +475,7 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
+    let { start, end, agent, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
@@ -354,10 +484,30 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     agent = cleanParam(agent);
     campaign = cleanParam(campaign);
     callType = cleanParam(callType);
-    ani = cleanParam(ani);
-    dnis = cleanParam(dnis);
+    phone = cleanParam(phone);
+    callId = cleanParam(callId);
+    customerName = cleanParam(customerName);
+    afterCallWork = cleanParam(afterCallWork);
+    transfers = cleanParam(transfers);
+    conferences = cleanParam(conferences);
+    abandoned = cleanParam(abandoned);
+
+    if (typeof phone === 'string') phone = phone.trim();
+    if (typeof callId === 'string') callId = callId.trim();
+    if (typeof customerName === 'string') customerName = customerName.trim();
+    if (typeof afterCallWork === 'string') afterCallWork = afterCallWork.trim();
+    if (typeof transfers === 'string') transfers = transfers.trim();
+    if (typeof conferences === 'string') conferences = conferences.trim();
+    if (typeof abandoned === 'string') abandoned = abandoned.trim();
+    if (phone === '') phone = null;
+    if (callId === '') callId = null;
+    if (customerName === '') customerName = null;
+    if (afterCallWork === '') afterCallWork = null;
+    if (transfers === '') transfers = null;
+    if (conferences === '') conferences = null;
+    if (abandoned === '') abandoned = null;
     
-    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", campaign="${campaign}", callType="${callType}", ani="${ani}", dnis="${dnis}", limit=${limit}, offset=${offset}`);
+    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
     
     const startFormatted = normalizeReportTimestamp(start);
     const endFormatted = normalizeReportTimestamp(end);
@@ -386,13 +536,45 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     const appliedLimit = Math.min(parseInt(limit,10)||100,500);
     const appliedOffset = parseInt(offset,10)||0;
 
+    const parseInteger = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number.parseInt(value, 10);
+      return Number.isNaN(num) ? null : num;
+    };
+    const parseBinary = (value) => {
+      const num = parseInteger(value);
+      return (num === 0 || num === 1) ? num : null;
+    };
+
+    const afterCallWorkValue = parseInteger(afterCallWork);
+    const transfersValue = parseBinary(transfers);
+    const conferencesValue = parseBinary(conferences);
+    const abandonedValue = parseBinary(abandoned);
+
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
-    const result = queryReports({ start: appliedStart, end: appliedEnd, agent, campaign, callType, ani, dnis, limit: appliedLimit, offset: appliedOffset, sort: sortDir });
-    const returnedRange = result.rows && result.rows.length ? (
-      sortDir === 'asc'
-        ? { min: result.rows[0].timestamp || null, max: result.rows[result.rows.length - 1].timestamp || null }
-        : { max: result.rows[0].timestamp || null, min: result.rows[result.rows.length - 1].timestamp || null }
-    ) : { max: null, min: null };
+    const result = queryReports({
+      start: appliedStart,
+      end: appliedEnd,
+      agent,
+      campaign,
+      callType,
+      phone,
+      callId,
+      customerName,
+      afterCallWork: afterCallWorkValue,
+      transfers: transfersValue,
+      conferences: conferencesValue,
+      abandoned: abandonedValue,
+      limit: appliedLimit,
+      offset: appliedOffset,
+      sort: sortDir
+    });
+      const hydratedRows = hydrateReportRows(result.rows);
+      const returnedRange = hydratedRows && hydratedRows.length ? (
+        sortDir === 'asc'
+          ? { min: hydratedRows[0].timestamp || null, max: hydratedRows[hydratedRows.length - 1].timestamp || null }
+          : { max: hydratedRows[0].timestamp || null, min: hydratedRows[hydratedRows.length - 1].timestamp || null }
+      ) : { max: null, min: null };
     console.log(`[API /api/reports] Applied range: start="${appliedStart}" end="${appliedEnd}" limit=${appliedLimit} offset=${appliedOffset} sort=${sortDir}`);
     console.log(`[API /api/reports] Returned range: min="${returnedRange.min}" max="${returnedRange.max}" total=${result.total}`);
 
@@ -423,11 +605,10 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
             agent: agent || null,
             campaign: campaign || null,
             callType: callType || null,
-            ani: ani || null,
-            dnis: dnis || null
+            phone: phone || null
           },
           pagination: { limit: appliedLimit, offset: appliedOffset, sort: sortDir },
-          returned: result.rows ? result.rows.length : 0,
+                    returned: hydratedRows ? hydratedRows.length : 0,
           total: result.total || 0,
           appliedRange: { start: appliedStart, end: appliedEnd },
           returnedRange,
@@ -440,6 +621,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       const responsePayload = {
         success: true,
         ...result,
+        rows: hydratedRows,
         sort: sortDir,
         appliedRange: { start: appliedStart, end: appliedEnd },
         returnedRange

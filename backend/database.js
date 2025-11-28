@@ -16,6 +16,14 @@ const REPORT_TIMESTAMP_FORMAT = 'YYYY-MM-DDTHH:mm:ss[Z]';
 const REPORT_TIME_DEBUG = /^true$/i.test(process.env.REPORT_TIME_DEBUG || '');
 export const ISO_TIMESTAMP_GLOB = '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z';
 
+function parsePositiveInt(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const AUDIT_EXPORT_MAX_ROWS = parsePositiveInt(process.env.AUDIT_EXPORT_MAX_ROWS, 10000);
+const USER_USAGE_EXPORT_MAX_ROWS = parsePositiveInt(process.env.USER_USAGE_EXPORT_MAX_ROWS, 5000);
+
 export function normalizeReportTimestamp(raw) {
   if (raw === null || raw === undefined) return null;
   const trimmed = typeof raw === 'string' ? raw.trim() : String(raw).trim();
@@ -355,10 +363,10 @@ const statements = {
       AND (? IS NULL OR call_date <= ?)
       AND (? IS NULL OR phone LIKE '%' || ? || '%')
       AND (? IS NULL OR email LIKE '%' || ? || '%')
-      AND (? IS NULL OR duration_ms >= ? * 1000)
-      AND (? IS NULL OR call_time >= ?)
-  AND (? IS NULL OR call_time <= ?)
-  AND (? IS NULL OR call_id LIKE '%' || ? || '%')
+        AND (? IS NULL OR duration_ms >= ? * 1000)
+        AND (? IS NULL OR call_time >= ?)
+        AND (? IS NULL OR call_time <= ?)
+        AND (? IS NULL OR call_id LIKE '%' || ? || '%')
     ORDER BY 
       CASE WHEN ? = 'date' AND ? = 'asc' THEN call_date END ASC,
       CASE WHEN ? = 'date' AND ? = 'desc' THEN call_date END DESC,
@@ -385,10 +393,10 @@ const statements = {
       AND (? IS NULL OR call_date <= ?)
       AND (? IS NULL OR phone LIKE '%' || ? || '%')
       AND (? IS NULL OR email LIKE '%' || ? || '%')
-      AND (? IS NULL OR duration_ms >= ? * 1000)
-      AND (? IS NULL OR call_time >= ?)
-  AND (? IS NULL OR call_time <= ?)
-  AND (? IS NULL OR call_id LIKE '%' || ? || '%')
+        AND (? IS NULL OR duration_ms >= ? * 1000)
+        AND (? IS NULL OR call_time >= ?)
+        AND (? IS NULL OR call_time <= ?)
+        AND (? IS NULL OR call_id LIKE '%' || ? || '%')
   `),
   
   // Check if file exists
@@ -521,43 +529,135 @@ const statements = {
     GROUP BY user_id, user_email
     ORDER BY user_email
     LIMIT ?
+  `),
+
+  userUsageReport: db.prepare(`
+    WITH filtered_audit AS (
+      SELECT
+        user_id,
+        user_email,
+        action_type,
+        action_timestamp
+      FROM audit_logs
+      WHERE 1=1
+        AND (? IS NULL OR DATE(action_timestamp) >= ?)
+        AND (? IS NULL OR DATE(action_timestamp) <= ?)
+    ),
+    audit_counts AS (
+      SELECT
+        user_id,
+        COALESCE(MAX(user_email), '') AS user_email,
+        COUNT(*) AS total_actions,
+        SUM(CASE WHEN action_type = 'LOGIN' THEN 1 ELSE 0 END) AS login_count,
+        SUM(CASE WHEN action_type = 'LOGOUT' THEN 1 ELSE 0 END) AS logout_count,
+        SUM(CASE WHEN action_type = 'PLAY_FILE' THEN 1 ELSE 0 END) AS play_count,
+        SUM(CASE WHEN action_type = 'DOWNLOAD_FILE' THEN 1 ELSE 0 END) AS download_count,
+        SUM(CASE WHEN action_type = 'VIEW_FILES' THEN 1 ELSE 0 END) AS view_count,
+        SUM(CASE WHEN action_type = 'REPORT_VIEW' THEN 1 ELSE 0 END) AS report_view_count,
+        SUM(CASE WHEN action_type = 'REPORT_DOWNLOAD' THEN 1 ELSE 0 END) AS report_download_count,
+        MAX(action_timestamp) AS last_action_at
+      FROM filtered_audit
+      GROUP BY user_id
+    ),
+    filtered_sessions AS (
+      SELECT
+        user_id,
+        user_email,
+        COALESCE(session_duration_ms, 0) AS session_duration_ms
+      FROM user_sessions
+      WHERE 1=1
+        AND (? IS NULL OR DATE(login_time) >= ?)
+        AND (? IS NULL OR DATE(login_time) <= ?)
+    ),
+    session_totals AS (
+      SELECT
+        user_id,
+        COALESCE(MAX(user_email), '') AS user_email,
+        SUM(session_duration_ms) AS total_session_ms
+      FROM filtered_sessions
+      GROUP BY user_id
+    ),
+    combined_users AS (
+      SELECT user_id FROM audit_counts
+      UNION
+      SELECT user_id FROM session_totals
+    )
+    SELECT
+      u.user_id AS user_id,
+      COALESCE(audit_counts.user_email, session_totals.user_email) AS user_email,
+      COALESCE(audit_counts.total_actions, 0) AS total_actions,
+      COALESCE(audit_counts.login_count, 0) AS login_count,
+      COALESCE(audit_counts.logout_count, 0) AS logout_count,
+      COALESCE(audit_counts.play_count, 0) AS play_count,
+      COALESCE(audit_counts.download_count, 0) AS download_count,
+      COALESCE(audit_counts.view_count, 0) AS view_count,
+      COALESCE(audit_counts.report_view_count, 0) AS report_view_count,
+      COALESCE(audit_counts.report_download_count, 0) AS report_download_count,
+      audit_counts.last_action_at AS last_action_at,
+      COALESCE(session_totals.total_session_ms, 0) AS total_session_ms
+    FROM combined_users u
+    LEFT JOIN audit_counts ON audit_counts.user_id = u.user_id
+    LEFT JOIN session_totals ON session_totals.user_id = u.user_id
+    ORDER BY LOWER(COALESCE(audit_counts.user_email, session_totals.user_email)), u.user_id
   `)
 };
 
-statements.userUsageReport = db.prepare(`
-  SELECT 
-    al.user_id AS user_id,
-    al.user_email AS user_email,
-    COUNT(*) AS total_actions,
-    SUM(al.action_type = 'LOGIN') AS login_count,
-    SUM(al.action_type = 'LOGOUT') AS logout_count,
-    SUM(al.action_type = 'PLAY_FILE') AS play_count,
-    SUM(al.action_type = 'DOWNLOAD_FILE') AS download_count,
-    SUM(al.action_type = 'VIEW_FILES') AS view_count,
-    SUM(al.action_type = 'REPORT_VIEW') AS report_view_count,
-    SUM(al.action_type = 'REPORT_DOWNLOAD') AS report_download_count,
-    MAX(al.action_timestamp) AS last_action_at,
-    COALESCE((
-      SELECT SUM(us.session_duration_ms)
-      FROM user_sessions us
-      WHERE us.user_id = al.user_id
-        AND (? IS NULL OR DATE(us.login_time) >= ?)
-        AND (? IS NULL OR DATE(us.login_time) <= ?)
-    ), 0) AS total_session_ms
-  FROM audit_logs al
-  WHERE (? IS NULL OR DATE(al.action_timestamp) >= ?)
-    AND (? IS NULL OR DATE(al.action_timestamp) <= ?)
-  GROUP BY al.user_id, al.user_email
-  ORDER BY total_actions DESC, al.user_email ASC
-`);
-
-const AUDIT_EXPORT_MAX_ROWS = parseInt(process.env.AUDIT_EXPORT_MAX_ROWS || '10000', 10);
-const USER_USAGE_EXPORT_MAX_ROWS = parseInt(process.env.USER_USAGE_EXPORT_MAX_ROWS || '5000', 10);
-
-// Reporting prepared statements
 statements.upsertReport = db.prepare(`
-  INSERT INTO reporting (call_id, timestamp, campaign, call_type, agent, agent_name, disposition, ani, customer_name, dnis, call_time, bill_time_rounded, cost, ivr_time, queue_wait_time, ring_time, talk_time, hold_time, park_time, after_call_work_time, transfers, conferences, holds, abandoned, recordings, raw_json)
-  VALUES (@call_id, @timestamp, @campaign, @call_type, @agent, @agent_name, @disposition, @ani, @customer_name, @dnis, @call_time, @bill_time_rounded, @cost, @ivr_time, @queue_wait_time, @ring_time, @talk_time, @hold_time, @park_time, @after_call_work_time, @transfers, @conferences, @holds, @abandoned, @recordings, @raw_json)
+  INSERT INTO reporting (
+    call_id,
+    timestamp,
+    campaign,
+    call_type,
+    agent,
+    agent_name,
+    disposition,
+    ani,
+    customer_name,
+    dnis,
+    call_time,
+    bill_time_rounded,
+    cost,
+    ivr_time,
+    queue_wait_time,
+    ring_time,
+    talk_time,
+    hold_time,
+    park_time,
+    after_call_work_time,
+    transfers,
+    conferences,
+    holds,
+    abandoned,
+    recordings,
+    raw_json
+  ) VALUES (
+    @call_id,
+    @timestamp,
+    @campaign,
+    @call_type,
+    @agent,
+    @agent_name,
+    @disposition,
+    @ani,
+    @customer_name,
+    @dnis,
+    @call_time,
+    @bill_time_rounded,
+    @cost,
+    @ivr_time,
+    @queue_wait_time,
+    @ring_time,
+    @talk_time,
+    @hold_time,
+    @park_time,
+    @after_call_work_time,
+    @transfers,
+    @conferences,
+    @holds,
+    @abandoned,
+    @recordings,
+    @raw_json
+  )
   ON CONFLICT(call_id) DO UPDATE SET
     timestamp=excluded.timestamp,
     campaign=excluded.campaign,
@@ -593,8 +693,13 @@ statements.queryReportsDesc = db.prepare(`
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
-    AND (? IS NULL OR ani LIKE '%' || ? || '%')
-    AND (? IS NULL OR dnis LIKE '%' || ? || '%')
+    AND (? IS NULL OR (ani LIKE '%' || ? || '%' OR dnis LIKE '%' || ? || '%'))
+    AND (? IS NULL OR call_id LIKE '%' || ? || '%')
+    AND (? IS NULL OR customer_name LIKE '%' || ? || '%')
+    AND (? IS NULL OR after_call_work_time >= ?)
+    AND (? IS NULL OR transfers = ?)
+    AND (? IS NULL OR conferences = ?)
+    AND (? IS NULL OR abandoned = ?)
   ORDER BY timestamp DESC
   LIMIT ? OFFSET ?;
 `);
@@ -606,8 +711,13 @@ statements.queryReportsAsc = db.prepare(`
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
-    AND (? IS NULL OR ani LIKE '%' || ? || '%')
-    AND (? IS NULL OR dnis LIKE '%' || ? || '%')
+    AND (? IS NULL OR (ani LIKE '%' || ? || '%' OR dnis LIKE '%' || ? || '%'))
+    AND (? IS NULL OR call_id LIKE '%' || ? || '%')
+    AND (? IS NULL OR customer_name LIKE '%' || ? || '%')
+    AND (? IS NULL OR after_call_work_time >= ?)
+    AND (? IS NULL OR transfers = ?)
+    AND (? IS NULL OR conferences = ?)
+    AND (? IS NULL OR abandoned = ?)
   ORDER BY timestamp ASC
   LIMIT ? OFFSET ?;
 `);
@@ -619,8 +729,13 @@ statements.countReports = db.prepare(`
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
-    AND (? IS NULL OR ani LIKE '%' || ? || '%')
-    AND (? IS NULL OR dnis LIKE '%' || ? || '%');
+    AND (? IS NULL OR (ani LIKE '%' || ? || '%' OR dnis LIKE '%' || ? || '%'))
+    AND (? IS NULL OR call_id LIKE '%' || ? || '%')
+    AND (? IS NULL OR customer_name LIKE '%' || ? || '%')
+    AND (? IS NULL OR after_call_work_time >= ?)
+    AND (? IS NULL OR transfers = ?)
+    AND (? IS NULL OR conferences = ?)
+    AND (? IS NULL OR abandoned = ?);
 `);
 
 // Test datetime filtering on startup to verify ISO timestamp handling
@@ -1029,6 +1144,43 @@ export function getAuditLogs(userId = null, actionType = null, startDate = null,
   }
 }
 
+export function getCallIdsWithRecordings(callIds = []) {
+  if (!Array.isArray(callIds) || !callIds.length) return {};
+  const seen = new Set();
+  const unique = [];
+  for (const id of callIds) {
+    if (!id) continue;
+    const key = String(id);
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(key);
+  }
+  if (!unique.length) return {};
+
+  const MAX_PARAMS = 999;
+  const result = {};
+
+  for (let i = 0; i < unique.length; i += MAX_PARAMS) {
+    const chunk = unique.slice(i, i + MAX_PARAMS);
+    if (!chunk.length) continue;
+    const placeholders = chunk.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT DISTINCT call_id FROM files WHERE call_id IN (${placeholders})`);
+    try {
+      const rows = stmt.all(...chunk);
+      for (const row of rows) {
+        if (row?.call_id) {
+          result[row.call_id] = true;
+        }
+      }
+    } catch (err) {
+      console.warn('[DB] getCallIdsWithRecordings query failed:', err.message);
+    }
+  }
+
+  return result;
+}
+
 export function exportAuditLogs(filters = {}, maxRows = AUDIT_EXPORT_MAX_ROWS) {
   const {
     userId = null,
@@ -1264,21 +1416,45 @@ export function bulkUpsertReports(rows = []) {
   return tx(rows);
 }
 
-export function queryReports({ start=null, end=null, agent=null, campaign=null, callType=null, ani=null, dnis=null, limit=100, offset=0, sort='desc' } = {}) {
+export function queryReports({ start=null, end=null, agent=null, campaign=null, callType=null, phone=null, callId=null, customerName=null, afterCallWork=null, transfers=null, conferences=null, abandoned=null, limit=100, offset=0, sort='desc' } = {}) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
+    const normLike = (v) => {
+      if (v === null || v === undefined) return null;
+      const str = String(v).trim();
+      return str === '' ? null : str;
+    };
+    const normDuration = (v) => {
+      if (v === null || v === undefined) return null;
+      const num = Number(v);
+      if (!Number.isFinite(num)) return null;
+      if (num < 0) return null;
+      return Math.floor(num);
+    };
+    const normBinary = (v) => {
+      if (v === null || v === undefined) return null;
+      const num = Number(v);
+      if (!Number.isFinite(num)) return null;
+      if (num === 0 || num === 1) return num;
+      return null;
+    };
     const s = norm(start);
     const e = norm(end);
     const a = norm(agent);
     const c = norm(campaign);
     const ct = norm(callType);
-    const an = norm(ani);
-    const dn = norm(dnis);
+    const phoneNorm = normLike(phone);
+    const ci = normLike(callId);
+    const cust = normLike(customerName);
+    const acw = normDuration(afterCallWork);
+    const tr = normBinary(transfers);
+    const conf = normBinary(conferences);
+    const ab = normBinary(abandoned);
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
-    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, campaign=${c}, callType=${ct}, ani=${an}, dnis=${dn}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
+    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
     const stmt = sortDir === 'asc' ? statements.queryReportsAsc : statements.queryReportsDesc;
-    const rows = stmt.all(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn, limit, offset);
-    const { total } = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, an, an, dn, dn);
+    const rows = stmt.all(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab, limit, offset);
+    const { total } = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab);
     console.log(`[QUERY REPORTS] Results: returned ${rows.length} rows, total=${total}`);
     if (rows.length > 0) {
       console.log(`[QUERY REPORTS] First row timestamp: ${rows[0].timestamp}, Last row timestamp: ${rows[rows.length-1].timestamp}`);

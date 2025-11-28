@@ -1,14 +1,38 @@
 import React, { useEffect, useState } from 'react';
 import { useUser, useAuth } from '@clerk/clerk-react';
-import { Container, Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Paper, Pagination, Stack, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer } from '@mui/material';
+import { Container, Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Paper, Pagination, Stack, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer, Link as MuiLink } from '@mui/material';
+import { Link as RouterLink } from 'react-router-dom';
 import { LocalizationProvider, DateTimePicker } from '@mui/x-date-pickers';
 import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
+import customParseFormat from 'dayjs/plugin/customParseFormat';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
+dayjs.extend(customParseFormat);
+
+const FIVE9_TZ = process.env.REACT_APP_FIVE9_TIMEZONE || 'America/Los_Angeles';
+const parsedRawJsonCache = new WeakMap();
+
+function getParsedRawJson(row) {
+  if (!row) return null;
+  if (row.raw_json_parsed && typeof row.raw_json_parsed === 'object') return row.raw_json_parsed;
+  if (parsedRawJsonCache.has(row)) return parsedRawJsonCache.get(row) || null;
+  if (!row.raw_json || typeof row.raw_json !== 'string') {
+    parsedRawJsonCache.set(row, null);
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(row.raw_json);
+    parsedRawJsonCache.set(row, parsed);
+    return parsed;
+  } catch {
+    parsedRawJsonCache.set(row, null);
+    return null;
+  }
+}
 
 function formatMs(ms){
   if(!ms) return '0s';
@@ -56,6 +80,105 @@ function renderCurrencyCell(value) {
   return `$${numeric.toFixed(2)}`;
 }
 
+function hasRecordingData(recordings) {
+  if (recordings === null || recordings === undefined) return false;
+  if (Array.isArray(recordings)) return recordings.length > 0;
+  const str = String(recordings).trim();
+  if (!str) return false;
+  const normalized = str.toLowerCase();
+  if (normalized === 'null' || normalized === 'undefined' || normalized === 'n/a') return false;
+  if (normalized === '[]' || normalized === '{}') return false;
+  return true;
+}
+
+function rowHasRecording(row) {
+  if (!row) return false;
+  if (row.hasRecording) return true;
+  if (hasRecordingData(row.recordings)) return true;
+  const parsed = getParsedRawJson(row);
+  if (parsed) {
+    const raw = parsed.RECORDINGS ?? parsed.recordings;
+    if (hasRecordingData(raw)) return true;
+  }
+  return false;
+}
+
+function extractTimestampForRow(row) {
+  if (!row) return null;
+  if (row.timestamp) {
+    const ts = dayjs(row.timestamp);
+    if (ts.isValid()) return ts;
+  }
+  if (row.raw_json) {
+    const parsed = getParsedRawJson(row);
+    if (parsed) {
+      const rawTs = parsed.TIMESTAMP ?? parsed.TIMESTAMP_ORIGINAL ?? null;
+      if (rawTs) {
+        const fromIso = dayjs(rawTs);
+        if (fromIso.isValid()) return fromIso;
+        const fromFive9 = dayjs.tz(rawTs, 'ddd, DD MMM YYYY HH:mm:ss', FIVE9_TZ);
+        if (fromFive9.isValid()) return fromFive9;
+      }
+    }
+  }
+  return null;
+}
+
+function buildRecordingLink(row) {
+  if (!rowHasRecording(row)) return null;
+  const callId = row.call_id ? String(row.call_id).trim() : '';
+  if (!callId) return null;
+  const timestamp = extractTimestampForRow(row);
+  if (!timestamp || !timestamp.isValid()) return null;
+  const zoned = timestamp.tz(FIVE9_TZ);
+  if (!zoned.isValid()) return null;
+  const dateParam = zoned.format('M_D_YYYY');
+  const params = new URLSearchParams();
+  params.set('dateStart', dateParam);
+  params.set('dateEnd', dateParam);
+  params.set('callId', callId);
+  return `/?${params.toString()}`;
+}
+
+function renderRecordingCell(value, row) {
+  const href = buildRecordingLink(row);
+  if (!href) return null;
+  return (
+    <MuiLink component={RouterLink} to={href} underline="hover">
+      Open
+    </MuiLink>
+  );
+}
+
+function parseDurationInput(value) {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const hhmmssMatch = trimmed.match(/^(-?)(\d{1,2}):(\d{2}):(\d{2})$/);
+  if (hhmmssMatch) {
+    const sign = hhmmssMatch[1] === '-' ? -1 : 1;
+    const hh = parseInt(hhmmssMatch[2], 10);
+    const mm = parseInt(hhmmssMatch[3], 10);
+    const ss = parseInt(hhmmssMatch[4], 10);
+    if ([hh, mm, ss].some(n => Number.isNaN(n))) return null;
+    const totalSeconds = ((hh * 3600) + (mm * 60) + ss) * sign;
+    return Math.round(totalSeconds * 1000);
+  }
+  const numericMatch = trimmed.match(/^-?\d+(?:\.\d+)?$/);
+  if (numericMatch) {
+    const seconds = Number(trimmed);
+    if (!Number.isFinite(seconds)) return null;
+    return Math.round(seconds * 1000);
+  }
+  const msMatch = trimmed.match(/^-?\d+(?:\.\d+)?\s*ms$/i);
+  if (msMatch) {
+    const msValue = Number(trimmed.replace(/ms$/i, '').trim());
+    if (!Number.isFinite(msValue)) return null;
+    return Math.round(msValue);
+  }
+  return null;
+}
+
 export default function ReportsPage(){
   const { user } = useUser();
   const { getToken } = useAuth();
@@ -65,8 +188,13 @@ export default function ReportsPage(){
   const [agent,setAgent]=useState('');
   const [campaign,setCampaign]=useState('');
   const [callType,setCallType]=useState('');
-  const [ani,setAni]=useState('');
-  const [dnis,setDnis]=useState('');
+  const [phoneNumber,setPhoneNumber]=useState('');
+  const [callId,setCallId]=useState('');
+  const [customerName,setCustomerName]=useState('');
+  const [afterCallWork,setAfterCallWork]=useState('');
+  const [transfersFilter,setTransfersFilter]=useState('');
+  const [conferencesFilter,setConferencesFilter]=useState('');
+  const [abandonedFilter,setAbandonedFilter]=useState('');
   const [campaigns,setCampaigns]=useState([]);
   const [callTypes,setCallTypes]=useState([]);
   const [startDate,setStartDate]=useState(null);
@@ -101,7 +229,7 @@ export default function ReportsPage(){
     { key:'holds', label:'Holds', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'abandoned', label:'Abandoned', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'cost', label:'Cost', render: renderCurrencyCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
-    { key:'recordings', label:'Recordings', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ maxWidth:260, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' } }
+    { key:'recordings', label:'Recordings', render: renderRecordingCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } }
   ]), []);
 
   const fetchReports = React.useCallback(async () => {
@@ -110,7 +238,6 @@ export default function ReportsPage(){
       const token = await getToken();
       const params = new URLSearchParams();
       
-      const FIVE9_TZ = process.env.REACT_APP_FIVE9_TIMEZONE || 'America/Los_Angeles';
       const userTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
       
       // Convert date pickers from user's timezone to Five9's timezone before querying
@@ -132,8 +259,29 @@ export default function ReportsPage(){
       if (campaign && campaign !== 'undefined') params.append('campaign', campaign);
       // Append remaining optional filters
       if (callType && callType !== 'undefined') params.append('callType', callType);
-      if (ani && ani !== 'undefined') params.append('ani', ani);
-      if (dnis && dnis !== 'undefined') params.append('dnis', dnis);
+      if (phoneNumber && phoneNumber !== 'undefined') {
+        const trimmedPhone = phoneNumber.trim();
+        if (trimmedPhone) params.append('phone', trimmedPhone);
+      }
+      if (callId && callId !== 'undefined') {
+        const trimmed = callId.trim();
+        if (trimmed) params.append('callId', trimmed);
+      }
+      if (customerName && customerName !== 'undefined') {
+        const trimmed = customerName.trim();
+        if (trimmed) params.append('customerName', trimmed);
+      }
+      if (afterCallWork && afterCallWork !== 'undefined') {
+        const parsed = parseDurationInput(afterCallWork);
+        if (parsed !== null) {
+          params.append('afterCallWork', String(parsed));
+        } else {
+          console.warn('[Reports] Ignoring After Call Work filter; expected minimum seconds or HH:MM:SS.');
+        }
+      }
+      if (transfersFilter !== '') params.append('transfers', transfersFilter);
+      if (conferencesFilter !== '') params.append('conferences', conferencesFilter);
+      if (abandonedFilter !== '') params.append('abandoned', abandonedFilter);
       params.append('sort', sortOrder);
       params.append('limit', pageSize);
       params.append('offset', (page - 1) * pageSize);
@@ -147,7 +295,7 @@ export default function ReportsPage(){
     } catch (e) {
       setError(e.message);
     } finally { setLoading(false); }
-  }, [getToken, agent, campaign, callType, ani, dnis, startDate, endDate, page, pageSize, sortOrder]);
+  }, [getToken, agent, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, page, pageSize, sortOrder]);
 
   const ingest = async () => {
     if(!isAdmin) return;
@@ -206,7 +354,7 @@ export default function ReportsPage(){
   // Reset page to 1 when filters change to avoid empty result pages
   useEffect(() => {
     setPage(1);
-  }, [agent, campaign, callType, ani, dnis, startDate, endDate, sortOrder, pageSize]);
+  }, [agent, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, sortOrder, pageSize]);
 
 
   function applyPreset(p){
@@ -277,8 +425,34 @@ export default function ReportsPage(){
             {callTypes.map(t=> <MenuItem key={t} value={t}>{t}</MenuItem>)}
           </Select>
         </FormControl>
-        <TextField label="ANI" value={ani} onChange={e=>setAni(e.target.value)} size="small" />
-        <TextField label="DNIS" value={dnis} onChange={e=>setDnis(e.target.value)} size="small" />
+        <TextField label="Phone Number" value={phoneNumber} onChange={e=>setPhoneNumber(e.target.value)} size="small" sx={{ minWidth:160 }} />
+          <TextField label="Call ID" value={callId} onChange={e=>setCallId(e.target.value)} size="small" />
+          <TextField label="Customer Name" value={customerName} onChange={e=>setCustomerName(e.target.value)} size="small" sx={{ minWidth:200 }} />
+          <TextField label="After Call Work (min)" value={afterCallWork} onChange={e=>setAfterCallWork(e.target.value)} size="small" sx={{ minWidth:190 }} placeholder="min seconds or HH:MM:SS" />
+          <FormControl size="small" sx={{ minWidth:150 }}>
+            <InputLabel id="transfers-filter-label">Transfers</InputLabel>
+            <Select labelId="transfers-filter-label" value={transfersFilter} label="Transfers" onChange={e=>setTransfersFilter(e.target.value)}>
+              <MenuItem value=""><em>All</em></MenuItem>
+              <MenuItem value="0">No (0)</MenuItem>
+              <MenuItem value="1">Yes (1)</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl size="small" sx={{ minWidth:150 }}>
+            <InputLabel id="conferences-filter-label">Conferences</InputLabel>
+            <Select labelId="conferences-filter-label" value={conferencesFilter} label="Conferences" onChange={e=>setConferencesFilter(e.target.value)}>
+              <MenuItem value=""><em>All</em></MenuItem>
+              <MenuItem value="0">No (0)</MenuItem>
+              <MenuItem value="1">Yes (1)</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl size="small" sx={{ minWidth:170 }}>
+            <InputLabel id="abandoned-filter-label">Abandoned</InputLabel>
+            <Select labelId="abandoned-filter-label" value={abandonedFilter} label="Abandoned" onChange={e=>setAbandonedFilter(e.target.value)}>
+              <MenuItem value=""><em>All</em></MenuItem>
+              <MenuItem value="0">Client (0)</MenuItem>
+              <MenuItem value="1">Agent (1)</MenuItem>
+            </Select>
+          </FormControl>
         <FormControl size="small" sx={{ minWidth:150 }}>
           <InputLabel id="sort-order-label">Sort</InputLabel>
           <Select labelId="sort-order-label" value={sortOrder} label="Sort" onChange={(e)=>setSortOrder(e.target.value)}>
@@ -287,7 +461,7 @@ export default function ReportsPage(){
           </Select>
         </FormControl>
         <Button variant="contained" onClick={()=>{ setPage(1); fetchReports(); }} disabled={loading}>Apply</Button>
-        <Button variant="text" onClick={()=>{ setAgent(''); setCampaign(''); setCallType(''); setAni(''); setDnis(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
+        <Button variant="text" onClick={()=>{ setAgent(''); setCampaign(''); setCallType(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('lastHour')} disabled={loading}>Last Hour</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('today')} disabled={loading}>Today</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>
@@ -301,7 +475,7 @@ export default function ReportsPage(){
     <Paper sx={{ p:0, position:'relative' }}>
       {loading && <Box sx={{ position:'absolute', inset:0, bgcolor:'rgba(0,0,0,0.05)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:2 }}><CircularProgress size={48}/></Box>}
       <TableContainer sx={{ maxHeight: '70vh', overflowX:'auto' }}>
-      <Table size="small" stickyHeader sx={{ tableLayout:'auto', minWidth:1600 }}>
+      <Table size="small" stickyHeader sx={{ tableLayout:'auto', minWidth:1800 }}>
         <TableHead>
           <TableRow>
             {columns.map(col => (
