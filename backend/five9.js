@@ -307,6 +307,18 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
   if (lines.length < 2) return { inserted:0, total:0 };
   const header = lines.shift().split(',').map(h=>h.trim().replace(/^"|"$/g,''));
 
+  function parseDurationToMs(value) {
+    if (!value) return 0;
+    const trimmed = value.trim();
+    if (!trimmed) return 0;
+    if (/^-?\d+$/.test(trimmed)) return parseInt(trimmed, 10) || 0;
+    const parts = trimmed.split(':').map(p => p.trim());
+    if (parts.length !== 3) return 0;
+    const [hh, mm, ss] = parts.map(p => parseInt(p, 10));
+    if ([hh, mm, ss].some(n => Number.isNaN(n))) return 0;
+    return ((hh * 3600) + (mm * 60) + ss) * 1000;
+  }
+
   const rows = [];
   const timestampSamples = [];
   for (const line of lines) {
@@ -333,16 +345,16 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
       ani: map['ANI'] || null,
       customer_name: map['CUSTOMER_NAME'] || null,
       dnis: map['DNIS'] || null,
-      call_time: parseInt(map['CALL_TIME']||'0',10)||0,
-      bill_time_rounded: parseInt(map['BILL_TIME_(ROUNDED)']||map['BILL_TIME_ROUNDED']||'0',10)||0,
+      call_time: parseDurationToMs(map['CALL_TIME']) || parseInt(map['CALL_TIME']||'0',10)||0,
+      bill_time_rounded: parseDurationToMs(map['BILL_TIME_(ROUNDED)'] || map['BILL_TIME_ROUNDED']) || parseInt(map['BILL_TIME_(ROUNDED)']||map['BILL_TIME_ROUNDED']||'0',10)||0,
       cost: parseFloat(map['COST']||'0')||0,
-      ivr_time: parseInt(map['IVR_TIME']||'0',10)||0,
-      queue_wait_time: parseInt(map['QUEUE_WAIT_TIME']||'0',10)||0,
-      ring_time: parseInt(map['RING_TIME']||'0',10)||0,
-      talk_time: parseInt(map['TALK_TIME']||'0',10)||0,
-      hold_time: parseInt(map['HOLD_TIME']||'0',10)||0,
-      park_time: parseInt(map['PARK_TIME']||'0',10)||0,
-      after_call_work_time: parseInt(map['AFTER_CALL_WORK_TIME']||'0',10)||0,
+      ivr_time: parseDurationToMs(map['IVR_TIME']) || parseInt(map['IVR_TIME']||'0',10)||0,
+      queue_wait_time: parseDurationToMs(map['QUEUE_WAIT_TIME']) || parseInt(map['QUEUE_WAIT_TIME']||'0',10)||0,
+      ring_time: parseDurationToMs(map['RING_TIME']) || parseInt(map['RING_TIME']||'0',10)||0,
+      talk_time: parseDurationToMs(map['TALK_TIME']) || parseInt(map['TALK_TIME']||'0',10)||0,
+      hold_time: parseDurationToMs(map['HOLD_TIME']) || parseInt(map['HOLD_TIME']||'0',10)||0,
+      park_time: parseDurationToMs(map['PARK_TIME']) || parseInt(map['PARK_TIME']||'0',10)||0,
+      after_call_work_time: parseDurationToMs(map['AFTER_CALL_WORK_TIME']) || parseInt(map['AFTER_CALL_WORK_TIME']||'0',10)||0,
       transfers: parseInt(map['TRANSFERS']||'0',10)||0,
       conferences: parseInt(map['CONFERENCES']||'0',10)||0,
       holds: parseInt(map['HOLDS']||'0',10)||0,

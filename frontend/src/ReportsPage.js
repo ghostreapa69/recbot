@@ -10,7 +10,14 @@ import timezone from 'dayjs/plugin/timezone';
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
-function formatMs(ms){ if(!ms) return '0s'; const s=Math.floor(ms/1000); const m=Math.floor(s/60); const rem=s%60; return `${m}m ${rem}s`; }
+function formatMs(ms){
+  if(!ms) return '0s';
+  const seconds = Math.floor(ms / 1000);
+  const hh = Math.floor(seconds / 3600).toString().padStart(2,'0');
+  const mm = Math.floor((seconds % 3600) / 60).toString().padStart(2,'0');
+  const ss = (seconds % 60).toString().padStart(2,'0');
+  return `${hh}:${mm}:${ss}`;
+}
 
 function formatTimestamp(ts) {
   if (!ts) return '-';
