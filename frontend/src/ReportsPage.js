@@ -33,6 +33,29 @@ function formatTimestamp(ts) {
   return ts; // Return as-is if parsing fails
 }
 
+function renderDefaultCell(value) {
+  if (value === null || value === undefined) return '-';
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed === '' ? '-' : trimmed;
+  }
+  return value;
+}
+
+function renderDurationCell(value) {
+  if (value === null || value === undefined) return '-';
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return formatMs(0);
+  return formatMs(numeric);
+}
+
+function renderCurrencyCell(value) {
+  if (value === null || value === undefined) return '-';
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return '-';
+  return `$${numeric.toFixed(2)}`;
+}
+
 export default function ReportsPage(){
   const { user } = useUser();
   const { getToken } = useAuth();
@@ -52,6 +75,34 @@ export default function ReportsPage(){
   const [sortOrder,setSortOrder]=useState('desc');
   const [initialized,setInitialized]=useState(false);
   const isAdmin = user?.publicMetadata?.role === 'admin';
+
+  const columns = React.useMemo(() => ([
+    { key:'call_id', label:'Call ID', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'timestamp', label:'Timestamp', render: formatTimestamp, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'campaign', label:'Campaign', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'call_type', label:'Call Type', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'agent', label:'Agent', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'agent_name', label:'Agent Name', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'customer_name', label:'Customer Name', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' } },
+    { key:'disposition', label:'Disposition', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' } },
+    { key:'ani', label:'ANI', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'dnis', label:'DNIS', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'talk_time', label:'Talk', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'hold_time', label:'Hold', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'queue_wait_time', label:'Queue Wait', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'ring_time', label:'Ring', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'ivr_time', label:'IVR', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'park_time', label:'Park', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'after_call_work_time', label:'After Call Work', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'call_time', label:'Call Time', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'bill_time_rounded', label:'Bill Rounded', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'transfers', label:'Transfers', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'conferences', label:'Conferences', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'holds', label:'Holds', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'abandoned', label:'Abandoned', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'cost', label:'Cost', render: renderCurrencyCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'recordings', label:'Recordings', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ maxWidth:260, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' } }
+  ]), []);
 
   const fetchReports = React.useCallback(async () => {
     setLoading(true); setError(null);
@@ -91,12 +142,8 @@ export default function ReportsPage(){
       if (!res.ok) throw new Error(json.error || 'Failed');
       setRows(json.rows || []);
       setTotal(json.total || 0);
-      if (json.returnedRange) {
-        console.log('[Reports] Returned range:', json.returnedRange, 'Sort:', json.sort);
-      }
-      if (json.legacyStats) {
-        console.log('[Reports] Legacy timestamp rows remaining:', json.legacyStats.total, json.legacyStats.samples);
-      }
+      if (json.returnedRange) console.log('[Reports] Returned range:', json.returnedRange, 'Sort:', json.sort);
+      if (json.legacyStats) console.log('[Reports] Legacy timestamp rows remaining:', json.legacyStats.total, json.legacyStats.samples);
     } catch (e) {
       setError(e.message);
     } finally { setLoading(false); }
@@ -254,47 +301,35 @@ export default function ReportsPage(){
     <Paper sx={{ p:0, position:'relative' }}>
       {loading && <Box sx={{ position:'absolute', inset:0, bgcolor:'rgba(0,0,0,0.05)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:2 }}><CircularProgress size={48}/></Box>}
       <TableContainer sx={{ maxHeight: '70vh', overflowX:'auto' }}>
-      <Table size="small" stickyHeader sx={{ tableLayout:'auto', minWidth:1100 }}>
+      <Table size="small" stickyHeader sx={{ tableLayout:'auto', minWidth:1600 }}>
         <TableHead>
           <TableRow>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Call ID</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Timestamp</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Campaign</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Call Type</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Agent</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Agent Name</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Disposition</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>ANI</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>DNIS</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Talk</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Hold</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Queue</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Transfers</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Conf</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Abandoned</TableCell>
-            <TableCell sx={{ whiteSpace:'nowrap' }}>Recordings</TableCell>
+            {columns.map(col => (
+              <TableCell key={col.key} sx={{ whiteSpace:'nowrap', ...(col.headerSx || {}) }}>
+                {col.label}
+              </TableCell>
+            ))}
           </TableRow>
         </TableHead>
         <TableBody>
-          {rows.map(r=> <TableRow key={r.call_id} hover>
-            <TableCell>{r.call_id}</TableCell>
-            <TableCell>{formatTimestamp(r.timestamp)}</TableCell>
-            <TableCell>{r.campaign}</TableCell>
-            <TableCell>{r.call_type}</TableCell>
-            <TableCell>{r.agent}</TableCell>
-            <TableCell>{r.agent_name}</TableCell>
-            <TableCell>{r.disposition}</TableCell>
-            <TableCell>{r.ani}</TableCell>
-            <TableCell>{r.dnis}</TableCell>
-            <TableCell>{formatMs(r.talk_time)}</TableCell>
-            <TableCell>{formatMs(r.hold_time)}</TableCell>
-            <TableCell>{formatMs(r.queue_wait_time)}</TableCell>
-            <TableCell>{r.transfers}</TableCell>
-            <TableCell>{r.conferences}</TableCell>
-            <TableCell>{r.abandoned}</TableCell>
-            <TableCell sx={{ maxWidth:180, whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden' }}>{r.recordings}</TableCell>
-          </TableRow>)}
-          {!rows.length && !loading && <TableRow><TableCell colSpan={16} align="center">No data</TableCell></TableRow>}
+          {rows.map((row, idx) => (
+            <TableRow key={row.call_id || row.timestamp || idx} hover>
+              {columns.map(col => {
+                const rawValue = row[col.key];
+                const content = col.render ? col.render(rawValue, row) : renderDefaultCell(rawValue);
+                return (
+                  <TableCell key={col.key} sx={col.cellSx}>
+                    {content}
+                  </TableCell>
+                );
+              })}
+            </TableRow>
+          ))}
+          {!rows.length && !loading && (
+            <TableRow>
+              <TableCell colSpan={columns.length} align="center">No data</TableCell>
+            </TableRow>
+          )}
         </TableBody>
       </Table>
       </TableContainer>
@@ -311,5 +346,6 @@ export default function ReportsPage(){
       </Stack>
       <Typography variant="caption">{total} rows</Typography>
     </Box>
+
   </Container>;
 }

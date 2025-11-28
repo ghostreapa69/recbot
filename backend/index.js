@@ -302,7 +302,11 @@ scheduleRecurringIngestion45();
 app.post('/api/reports/ingest', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const result = await fetchLastHourCallLog({ auditUser: req.user });
-    res.json({ success: true, ...result });
+      const responsePayload = {
+        success: true,
+        ...result
+      };
+      res.json(responsePayload);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -433,7 +437,13 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     } catch (e) {
       console.warn('REPORT_VIEW audit log failed:', e.message);
     }
-    const responsePayload = { success: true, ...result, sort: sortDir, appliedRange: { start: appliedStart, end: appliedEnd }, returnedRange };
+      const responsePayload = {
+        success: true,
+        ...result,
+        sort: sortDir,
+        appliedRange: { start: appliedStart, end: appliedEnd },
+        returnedRange
+      };
     if (legacyStats) responsePayload.legacyStats = legacyStats;
     res.json(responsePayload);
   } catch (e) {
