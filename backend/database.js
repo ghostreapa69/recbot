@@ -62,7 +62,8 @@ export function normalizeReportTimestamp(raw) {
     }
 
     // Five9 CSV export format "Tue, 25 Nov 2025 09:55:01" – interpret using configured timezone
-    const parsedFive9 = dayjs.tz(trimmed, 'ddd, DD MMM YYYY HH:mm:ss', REPORT_TIMEZONE);
+    // Allow single-digit days in the Five9 export (e.g., "Mon, 1 Dec ...") by using D instead of DD
+    const parsedFive9 = dayjs.tz(trimmed, 'ddd, D MMM YYYY HH:mm:ss', REPORT_TIMEZONE);
     const normalizedFive9 = formatUtc(parsedFive9);
     if (normalizedFive9) {
       if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Five9 parse raw="${trimmed}" tz=${REPORT_TIMEZONE} -> "${normalizedFive9}"`);
