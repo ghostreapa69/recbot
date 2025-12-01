@@ -22,6 +22,7 @@ function parsePositiveInt(value, fallback) {
 }
 
 const AUDIT_EXPORT_MAX_ROWS = parsePositiveInt(process.env.AUDIT_EXPORT_MAX_ROWS, 10000);
+const REPORT_EXPORT_MAX_ROWS = parsePositiveInt(process.env.REPORT_EXPORT_MAX_ROWS, 5000);
 const USER_USAGE_EXPORT_MAX_ROWS = parsePositiveInt(process.env.USER_USAGE_EXPORT_MAX_ROWS, 5000);
 
 export function normalizeReportTimestamp(raw) {
@@ -31,50 +32,57 @@ export function normalizeReportTimestamp(raw) {
 
   const formatUtc = (dt) => dt && dt.isValid() ? dt.utc().format(REPORT_TIMESTAMP_FORMAT) : null;
 
-  // Already ISO-style string (contains T) – normalize and force UTC with Z suffix
-  if (trimmed.includes('T')) {
-    const parsedIso = dayjs(trimmed);
-    const normalizedIso = formatUtc(parsedIso);
-    if (normalizedIso) {
-      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] ISO parse raw="${trimmed}" -> "${normalizedIso}"`);
-      return normalizedIso;
-    }
-  }
-
-  // Legacy space-separated format "YYYY-MM-DD HH:mm:ss" – assume UTC if no offset provided
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)) {
-    const parsedSpaceUtc = dayjs.utc(trimmed.replace(' ', 'T') + 'Z');
-    const normalizedSpaceUtc = formatUtc(parsedSpaceUtc);
-    if (normalizedSpaceUtc) {
-      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Space parse (assume UTC) raw="${trimmed}" -> "${normalizedSpaceUtc}"`);
-      return normalizedSpaceUtc;
+  try {
+    // Already ISO-style string (contains T) – normalize and force UTC with Z suffix
+    if (trimmed.includes('T')) {
+      const parsedIso = dayjs(trimmed);
+      const normalizedIso = formatUtc(parsedIso);
+      if (normalizedIso) {
+        if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] ISO parse raw="${trimmed}" -> "${normalizedIso}"`);
+        return normalizedIso;
+      }
     }
 
-    // Fallback: interpret naive timestamp using Five9 timezone for backwards compatibility
-    const parsedSpaceTz = dayjs.tz(trimmed, 'YYYY-MM-DD HH:mm:ss', REPORT_TIMEZONE);
-    const normalizedSpaceTz = formatUtc(parsedSpaceTz);
-    if (normalizedSpaceTz) {
-      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Space parse (tz fallback ${REPORT_TIMEZONE}) raw="${trimmed}" -> "${normalizedSpaceTz}"`);
-      return normalizedSpaceTz;
+    // Legacy space-separated format "YYYY-MM-DD HH:mm:ss" – assume UTC if no offset provided
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)) {
+      const parsedSpaceUtc = dayjs.utc(trimmed.replace(' ', 'T') + 'Z');
+      const normalizedSpaceUtc = formatUtc(parsedSpaceUtc);
+      if (normalizedSpaceUtc) {
+        if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Space parse (assume UTC) raw="${trimmed}" -> "${normalizedSpaceUtc}"`);
+        return normalizedSpaceUtc;
+      }
+
+      // Fallback: interpret naive timestamp using Five9 timezone for backwards compatibility
+      const parsedSpaceTz = dayjs.tz(trimmed, 'YYYY-MM-DD HH:mm:ss', REPORT_TIMEZONE);
+      const normalizedSpaceTz = formatUtc(parsedSpaceTz);
+      if (normalizedSpaceTz) {
+        if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Space parse (tz fallback ${REPORT_TIMEZONE}) raw="${trimmed}" -> "${normalizedSpaceTz}"`);
+        return normalizedSpaceTz;
+      }
     }
-  }
 
-  // Five9 CSV export format "Tue, 25 Nov 2025 09:55:01" – interpret using configured timezone
-  const parsedFive9 = dayjs.tz(trimmed, 'ddd, DD MMM YYYY HH:mm:ss', REPORT_TIMEZONE);
-  const normalizedFive9 = formatUtc(parsedFive9);
-  if (normalizedFive9) {
-    if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Five9 parse raw="${trimmed}" tz=${REPORT_TIMEZONE} -> "${normalizedFive9}"`);
-    return normalizedFive9;
-  }
+    // Five9 CSV export format "Tue, 25 Nov 2025 09:55:01" – interpret using configured timezone
+    const parsedFive9 = dayjs.tz(trimmed, 'ddd, DD MMM YYYY HH:mm:ss', REPORT_TIMEZONE);
+    const normalizedFive9 = formatUtc(parsedFive9);
+    if (normalizedFive9) {
+      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Five9 parse raw="${trimmed}" tz=${REPORT_TIMEZONE} -> "${normalizedFive9}"`);
+      return normalizedFive9;
+    }
 
-  // Fallback: let dayjs try its best; still coerce to UTC if valid
-  const fallback = formatUtc(dayjs(trimmed));
-  if (REPORT_TIME_DEBUG && fallback) {
-    console.log(`[REPORT_TIME] Fallback parse raw="${trimmed}" -> "${fallback}"`);
-  } else if (REPORT_TIME_DEBUG) {
-    console.log(`[REPORT_TIME] Failed parse raw="${trimmed}"`);
+    // Fallback: let dayjs try its best; still coerce to UTC if valid
+    const fallback = formatUtc(dayjs(trimmed));
+    if (REPORT_TIME_DEBUG && fallback) {
+      console.log(`[REPORT_TIME] Fallback parse raw="${trimmed}" -> "${fallback}"`);
+    } else if (REPORT_TIME_DEBUG) {
+      console.log(`[REPORT_TIME] Failed parse raw="${trimmed}"`);
+    }
+    return fallback || null;
+  } catch (err) {
+    if (REPORT_TIME_DEBUG) {
+      console.warn(`[REPORT_TIME] Exception normalizing raw="${trimmed}": ${err.message}`);
+    }
+    return null;
   }
-  return fallback || null;
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1414,6 +1422,62 @@ export function bulkUpsertReports(rows = []) {
     return inserted;
   });
   return tx(rows);
+}
+
+export function exportReports({ start=null, end=null, agent=null, campaign=null, callType=null, phone=null, callId=null, customerName=null, afterCallWork=null, transfers=null, conferences=null, abandoned=null, sort='desc' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
+  try {
+    const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
+    const normLike = (v) => {
+      if (v === null || v === undefined) return null;
+      const str = String(v).trim();
+      return str === '' ? null : str;
+    };
+    const normDuration = (v) => {
+      if (v === null || v === undefined) return null;
+      const num = Number(v);
+      if (!Number.isFinite(num)) return null;
+      if (num < 0) return null;
+      return Math.floor(num);
+    };
+    const normBinary = (v) => {
+      if (v === null || v === undefined) return null;
+      const num = Number(v);
+      if (!Number.isFinite(num)) return null;
+      if (num === 0 || num === 1) return num;
+      return null;
+    };
+
+    const s = norm(start);
+    const e = norm(end);
+    const a = norm(agent);
+    const c = norm(campaign);
+    const ct = norm(callType);
+    const phoneNorm = normLike(phone);
+    const ci = normLike(callId);
+    const cust = normLike(customerName);
+    const acw = normDuration(afterCallWork);
+    const tr = normBinary(transfers);
+    const conf = normBinary(conferences);
+    const ab = normBinary(abandoned);
+    const sortDir = sort === 'asc' ? 'asc' : 'desc';
+
+    const stmt = sortDir === 'asc' ? statements.queryReportsAsc : statements.queryReportsDesc;
+    const totalRow = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab);
+    const total = Number(totalRow?.total) || 0;
+    if (total > maxRows) {
+      return { rows: [], total, truncated: true, maxRows, sort: sortDir };
+    }
+
+    const fetchLimit = total > 0 ? Math.min(total, maxRows) : 0;
+    const rows = fetchLimit > 0
+      ? stmt.all(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab, fetchLimit, 0)
+      : [];
+
+    return { rows, total, truncated: false, maxRows, sort: sortDir };
+  } catch (e) {
+    console.error('Failed to export reports', e);
+    return { rows: [], total: 0, truncated: false, maxRows, sort: sort === 'asc' ? 'asc' : 'desc', error: e.message };
+  }
 }
 
 export function queryReports({ start=null, end=null, agent=null, campaign=null, callType=null, phone=null, callId=null, customerName=null, afterCallWork=null, transfers=null, conferences=null, abandoned=null, limit=100, offset=0, sort='desc' } = {}) {

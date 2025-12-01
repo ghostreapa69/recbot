@@ -20,8 +20,8 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
-import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
+import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
+import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -425,10 +425,10 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// Kick off 45-minute Five9 ingestion scheduler with immediate startup run
-scheduleRecurringIngestion45();
+// Kick off Five9 ingestion scheduler (interval configurable via env)
+scheduleRecurringIngestion();
 
-// Endpoint to manually trigger last hour report fetch (admin only)
+// Endpoint to manually trigger report ingestion for the configured window (admin only)
 app.post('/api/reports/ingest', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const result = await fetchLastHourCallLog({ auditUser: req.user });
@@ -630,6 +630,163 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     res.json(responsePayload);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    let { start, end, agent, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, sort } = req.query;
+
+    const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
+    start = cleanParam(start);
+    end = cleanParam(end);
+    agent = cleanParam(agent);
+    campaign = cleanParam(campaign);
+    callType = cleanParam(callType);
+    phone = cleanParam(phone);
+    callId = cleanParam(callId);
+    customerName = cleanParam(customerName);
+    afterCallWork = cleanParam(afterCallWork);
+    transfers = cleanParam(transfers);
+    conferences = cleanParam(conferences);
+    abandoned = cleanParam(abandoned);
+
+    if (typeof phone === 'string') phone = phone.trim();
+    if (typeof callId === 'string') callId = callId.trim();
+    if (typeof customerName === 'string') customerName = customerName.trim();
+    if (typeof afterCallWork === 'string') afterCallWork = afterCallWork.trim();
+    if (typeof transfers === 'string') transfers = transfers.trim();
+    if (typeof conferences === 'string') conferences = conferences.trim();
+    if (typeof abandoned === 'string') abandoned = abandoned.trim();
+    if (phone === '') phone = null;
+    if (callId === '') callId = null;
+    if (customerName === '') customerName = null;
+    if (afterCallWork === '') afterCallWork = null;
+    if (transfers === '') transfers = null;
+    if (conferences === '') conferences = null;
+    if (abandoned === '') abandoned = null;
+
+    const startFormatted = normalizeReportTimestamp(start);
+    const endFormatted = normalizeReportTimestamp(end);
+
+    const parseInteger = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number.parseInt(value, 10);
+      return Number.isNaN(num) ? null : num;
+    };
+    const parseBinary = (value) => {
+      const num = parseInteger(value);
+      return (num === 0 || num === 1) ? num : null;
+    };
+
+    const afterCallWorkValue = parseInteger(afterCallWork);
+    const transfersValue = parseBinary(transfers);
+    const conferencesValue = parseBinary(conferences);
+    const abandonedValue = parseBinary(abandoned);
+
+    const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const exportResult = exportReports({
+      start: startFormatted || null,
+      end: endFormatted || null,
+      agent,
+      campaign,
+      callType,
+      phone,
+      callId,
+      customerName,
+      afterCallWork: afterCallWorkValue,
+      transfers: transfersValue,
+      conferences: conferencesValue,
+      abandoned: abandonedValue,
+      sort: sortDir
+    });
+
+    if (exportResult.error) {
+      throw new Error(exportResult.error);
+    }
+
+    if (exportResult.truncated) {
+      return res.status(400).json({
+        error: `Too many matching report rows (${exportResult.total}). Narrow your filters to export fewer than ${exportResult.maxRows} rows.`,
+        total: exportResult.total,
+        maxRows: exportResult.maxRows
+      });
+    }
+
+    const hydratedRows = hydrateReportRows(exportResult.rows);
+    const nowIso = new Date().toISOString().replace(/[:]/g, '-');
+
+    const csv = buildCsv(hydratedRows, [
+      { key: 'call_id', header: 'call_id' },
+      { key: 'timestamp', header: 'timestamp' },
+      { key: 'campaign', header: 'campaign' },
+      { key: 'call_type', header: 'call_type' },
+      { key: 'agent', header: 'agent' },
+      { key: 'agent_name', header: 'agent_name' },
+      { key: 'customer_name', header: 'customer_name' },
+      { key: 'disposition', header: 'disposition' },
+      { key: 'ani', header: 'ani' },
+      { key: 'dnis', header: 'dnis' },
+      { key: 'talk_time', header: 'talk_time' },
+      { key: 'hold_time', header: 'hold_time' },
+      { key: 'queue_wait_time', header: 'queue_wait_time' },
+      { key: 'ring_time', header: 'ring_time' },
+      { key: 'ivr_time', header: 'ivr_time' },
+      { key: 'park_time', header: 'park_time' },
+      { key: 'after_call_work_time', header: 'after_call_work_time' },
+      { key: 'call_time', header: 'call_time' },
+      { key: 'bill_time_rounded', header: 'bill_time_rounded' },
+      { key: 'transfers', header: 'transfers' },
+      { key: 'conferences', header: 'conferences' },
+      { key: 'holds', header: 'holds' },
+      { key: 'abandoned', header: 'abandoned' },
+      { key: 'cost', header: 'cost' },
+      { key: 'recordings', header: 'recordings' },
+      { key: 'hasRecording', header: 'has_recording', accessor: (row) => row?.hasRecording ? '1' : '0' }
+    ]);
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_DOWNLOAD',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'five9_reports',
+          filters: {
+            start: start || null,
+            end: end || null,
+            agent: agent || null,
+            campaign: campaign || null,
+            callType: callType || null,
+            phone: phone || null,
+            callId: callId || null,
+            customerName: customerName || null,
+            afterCallWorkMin: afterCallWorkValue,
+            transfers: transfersValue,
+            conferences: conferencesValue,
+            abandoned: abandonedValue
+          },
+          exported: hydratedRows.length,
+          total: exportResult.total,
+          sort: sortDir
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_DOWNLOAD audit log failed:', auditErr.message);
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="five9-reports-${nowIso}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('Error exporting reports:', err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: err.message });
   }
 });
 

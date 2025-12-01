@@ -202,6 +202,7 @@ export default function ReportsPage(){
   const [page,setPage]=useState(1); const [pageSize,setPageSize]=useState(50); const [total,setTotal]=useState(0);
   const [sortOrder,setSortOrder]=useState('desc');
   const [initialized,setInitialized]=useState(false);
+  const [reportExporting,setReportExporting]=useState(false);
   const isAdmin = user?.publicMetadata?.role === 'admin';
 
   const columns = React.useMemo(() => ([
@@ -325,6 +326,84 @@ export default function ReportsPage(){
       await fetchReports();
     } catch(e){ setError(e.message); } finally { setLoading(false); }
   };
+
+  const downloadReportsCsv = React.useCallback(async () => {
+    if (!isAdmin || reportExporting) return;
+    setReportExporting(true);
+    try {
+      const token = await getToken();
+      const params = new URLSearchParams();
+      const userTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+      const formatUtc = (value) => dayjs(value).utc().format('YYYY-MM-DDTHH:mm:ss[Z]');
+
+      if (startDate) {
+        params.append('start', formatUtc(startDate));
+      }
+      if (endDate) {
+        params.append('end', formatUtc(endDate));
+      }
+      if (userTz) params.append('timezone', userTz);
+      if (agent && agent !== 'undefined') params.append('agent', agent);
+      if (campaign && campaign !== 'undefined') params.append('campaign', campaign);
+      if (callType && callType !== 'undefined') params.append('callType', callType);
+      if (phoneNumber && phoneNumber !== 'undefined') {
+        const trimmedPhone = phoneNumber.trim();
+        if (trimmedPhone) params.append('phone', trimmedPhone);
+      }
+      if (callId && callId !== 'undefined') {
+        const trimmedCallId = callId.trim();
+        if (trimmedCallId) params.append('callId', trimmedCallId);
+      }
+      if (customerName && customerName !== 'undefined') {
+        const trimmedCustomer = customerName.trim();
+        if (trimmedCustomer) params.append('customerName', trimmedCustomer);
+      }
+      if (afterCallWork && afterCallWork !== 'undefined') {
+        const parsed = parseDurationInput(afterCallWork);
+        if (parsed !== null) {
+          params.append('afterCallWork', String(parsed));
+        } else {
+          console.warn('[Reports] Ignoring After Call Work export filter; expected minimum seconds or HH:MM:SS.');
+        }
+      }
+      if (transfersFilter !== '') params.append('transfers', transfersFilter);
+      if (conferencesFilter !== '') params.append('conferences', conferencesFilter);
+      if (abandonedFilter !== '') params.append('abandoned', abandonedFilter);
+      params.append('sort', sortOrder);
+
+      const qs = params.toString();
+      const response = await fetch(`/api/reports/export${qs ? `?${qs}` : ''}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!response.ok) {
+        let message = 'Failed to export reports';
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          try {
+            const data = await response.json();
+            if (data?.error) message = data.error;
+          } catch {/* ignore parsing errors */}
+        }
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `five9-reports-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Reports CSV export failed:', err);
+      alert(err.message || 'Failed to export reports');
+    } finally {
+      setReportExporting(false);
+    }
+  }, [isAdmin, reportExporting, getToken, startDate, endDate, agent, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, sortOrder]);
 
   useEffect(() => { 
     if (initialized) {
@@ -466,7 +545,8 @@ export default function ReportsPage(){
         <Button size="small" variant="outlined" onClick={()=>applyPreset('today')} disabled={loading}>Today</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('last24h')} disabled={loading}>Last 24h</Button>
-        {isAdmin && <Button variant="outlined" color="secondary" onClick={ingest} disabled={loading}>Ingest Last Hour</Button>}
+        {isAdmin && <Button variant="outlined" onClick={downloadReportsCsv} disabled={loading || reportExporting}>{reportExporting ? 'Exporting...' : 'Export CSV'}</Button>}
+        {isAdmin && <Button variant="outlined" color="secondary" onClick={ingest} disabled={loading}>Ingest Recent</Button>}
         {isAdmin && <Button variant="outlined" color="warning" onClick={fixTimezones} disabled={loading}>Fix Timezones</Button>}
       </Stack>
       {error && <Alert severity="error" sx={{ mt:2 }}>{error}</Alert>}

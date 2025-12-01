@@ -21,6 +21,16 @@ const FIVE9_VERSION = process.env.FIVE9_WSDL_VERSION || '9.5';
 const FIVE9_BASE = process.env.FIVE9_BASE || 'https://api.five9.com/wsadmin';
 // Timezone for Five9 report timestamps (defaults to America/New_York, adjust as needed)
 const FIVE9_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/New_York';
+const REPORT_TIME_DEBUG = /^true$/i.test(process.env.REPORT_TIME_DEBUG || '');
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const AUTO_INGEST_INTERVAL_MINUTES = parsePositiveInt(process.env.FIVE9_AUTO_INGEST_MINUTES, 45);
+const REPORT_LOOKBACK_PADDING_MINUTES = parsePositiveInt(process.env.FIVE9_LOOKBACK_PADDING_MINUTES ?? 5, 5);
+const MIN_REPORT_WINDOW_MINUTES = parsePositiveInt(process.env.FIVE9_MIN_REPORT_WINDOW_MINUTES ?? 15, 15);
 
 if (!FIVE9_USERNAME || !FIVE9_PASSWORD) {
   console.warn('⚠️  Five9 credentials not set. Reporting ingestion disabled.');
@@ -110,8 +120,14 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
   // Use Five9's timezone for the report request window
   // Get current time in Five9's timezone
   const now = dayjs.tz(dayjs(), FIVE9_TIMEZONE);
+  const intervalMinutes = AUTO_INGEST_INTERVAL_MINUTES;
+  const rawWindowMinutes = intervalMinutes + REPORT_LOOKBACK_PADDING_MINUTES;
+  const windowMinutes = Math.max(rawWindowMinutes, MIN_REPORT_WINDOW_MINUTES);
+  if (windowMinutes !== rawWindowMinutes) {
+    console.log(`🛡️  [Five9] Expanding report window from ${rawWindowMinutes} to minimum ${windowMinutes} minutes`);
+  }
   const end = now;
-  const start = now.subtract(1, 'hour');
+  const start = now.subtract(windowMinutes, 'minute');
   
   // Format for Five9 API: ISO 8601 with timezone offset
   function fmt(dt) {
@@ -123,6 +139,7 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
 
   console.log('🕘 [Five9] Requesting report for window (Five9 timezone:', FIVE9_TIMEZONE + ')');
   console.log('   Current UTC:', dayjs.utc().format('YYYY-MM-DD HH:mm:ss'));
+  console.log('   Interval minutes:', intervalMinutes, 'Padding minutes:', REPORT_LOOKBACK_PADDING_MINUTES, 'Window minutes (raw/applied):', rawWindowMinutes, '/', windowMinutes);
   console.log('   Start (Five9 local):', start.format('YYYY-MM-DD HH:mm:ss'));
   console.log('   End (Five9 local):', end.format('YYYY-MM-DD HH:mm:ss'));
   console.log('   Start (ISO with offset):', startStr);
@@ -324,47 +341,53 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
 
   const rows = [];
   const timestampSamples = [];
-  for (const line of lines) {
-    const cols = line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(c=>c.trim().replace(/^"|"$/g,''));
-    // Basic mapping by header names (normalize to uppercase without spaces for matching)
-    const map = {}; header.forEach((h,i)=>{ map[h.toUpperCase().replace(/\s+/g,'_')] = cols[i]; });
-    const callId = map['CALL_ID'] || map['CALLID'] || null;
-    if (!callId) continue;
-    
-    const rawTimestamp = map['TIMESTAMP'] || null;
-    const timestamp = normalizeReportTimestamp(rawTimestamp) || rawTimestamp;
-    if (timestampSamples.length < 3) {
-      timestampSamples.push({ raw: rawTimestamp, normalized: timestamp });
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
+    try {
+      const cols = line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(c=>c.trim().replace(/^"|"$/g,''));
+      // Basic mapping by header names (normalize to uppercase without spaces for matching)
+      const map = {}; header.forEach((h,i)=>{ map[h.toUpperCase().replace(/\s+/g,'_')] = cols[i]; });
+      const callId = map['CALL_ID'] || map['CALLID'] || null;
+      if (!callId) continue;
+
+      const rawTimestamp = map['TIMESTAMP'] || null;
+      const timestamp = normalizeReportTimestamp(rawTimestamp) || rawTimestamp;
+      if (timestampSamples.length < 3) {
+        timestampSamples.push({ raw: rawTimestamp, normalized: timestamp });
+      }
+
+      rows.push({
+        call_id: callId,
+        timestamp: timestamp,
+        campaign: map['CAMPAIGN'] || null,
+        call_type: map['CALL_TYPE'] || null,
+        agent: map['AGENT'] || null,
+        agent_name: map['AGENT_NAME'] || null,
+        disposition: map['DISPOSITION'] || null,
+        ani: map['ANI'] || null,
+        customer_name: map['CUSTOMER_NAME'] || null,
+        dnis: map['DNIS'] || null,
+        call_time: parseDurationToMs(map['CALL_TIME']) || parseInt(map['CALL_TIME']||'0',10)||0,
+        bill_time_rounded: parseDurationToMs(map['BILL_TIME_(ROUNDED)'] || map['BILL_TIME_ROUNDED']) || parseInt(map['BILL_TIME_(ROUNDED)']||map['BILL_TIME_ROUNDED']||'0',10)||0,
+        cost: parseFloat(map['COST']||'0')||0,
+        ivr_time: parseDurationToMs(map['IVR_TIME']) || parseInt(map['IVR_TIME']||'0',10)||0,
+        queue_wait_time: parseDurationToMs(map['QUEUE_WAIT_TIME']) || parseInt(map['QUEUE_WAIT_TIME']||'0',10)||0,
+        ring_time: parseDurationToMs(map['RING_TIME']) || parseInt(map['RING_TIME']||'0',10)||0,
+        talk_time: parseDurationToMs(map['TALK_TIME']) || parseInt(map['TALK_TIME']||'0',10)||0,
+        hold_time: parseDurationToMs(map['HOLD_TIME']) || parseInt(map['HOLD_TIME']||'0',10)||0,
+        park_time: parseDurationToMs(map['PARK_TIME']) || parseInt(map['PARK_TIME']||'0',10)||0,
+        after_call_work_time: parseDurationToMs(map['AFTER_CALL_WORK_TIME']) || parseInt(map['AFTER_CALL_WORK_TIME']||'0',10)||0,
+        transfers: parseInt(map['TRANSFERS']||'0',10)||0,
+        conferences: parseInt(map['CONFERENCES']||'0',10)||0,
+        holds: parseInt(map['HOLDS']||'0',10)||0,
+        abandoned: parseInt(map['ABANDONED']||'0',10)||0,
+        recordings: map['RECORDINGS'] || null,
+        raw_json: JSON.stringify({ ...map, TIMESTAMP_ORIGINAL: rawTimestamp })
+      });
+    } catch (err) {
+      console.error('[Five9] Failed to parse CSV line', { lineIndex, lineSnippet: line.slice(0,200), error: err.message });
+      if (REPORT_TIME_DEBUG) console.error(err);
     }
-    
-    rows.push({
-      call_id: callId,
-      timestamp: timestamp,
-      campaign: map['CAMPAIGN'] || null,
-      call_type: map['CALL_TYPE'] || null,
-      agent: map['AGENT'] || null,
-      agent_name: map['AGENT_NAME'] || null,
-      disposition: map['DISPOSITION'] || null,
-      ani: map['ANI'] || null,
-      customer_name: map['CUSTOMER_NAME'] || null,
-      dnis: map['DNIS'] || null,
-      call_time: parseDurationToMs(map['CALL_TIME']) || parseInt(map['CALL_TIME']||'0',10)||0,
-      bill_time_rounded: parseDurationToMs(map['BILL_TIME_(ROUNDED)'] || map['BILL_TIME_ROUNDED']) || parseInt(map['BILL_TIME_(ROUNDED)']||map['BILL_TIME_ROUNDED']||'0',10)||0,
-      cost: parseFloat(map['COST']||'0')||0,
-      ivr_time: parseDurationToMs(map['IVR_TIME']) || parseInt(map['IVR_TIME']||'0',10)||0,
-      queue_wait_time: parseDurationToMs(map['QUEUE_WAIT_TIME']) || parseInt(map['QUEUE_WAIT_TIME']||'0',10)||0,
-      ring_time: parseDurationToMs(map['RING_TIME']) || parseInt(map['RING_TIME']||'0',10)||0,
-      talk_time: parseDurationToMs(map['TALK_TIME']) || parseInt(map['TALK_TIME']||'0',10)||0,
-      hold_time: parseDurationToMs(map['HOLD_TIME']) || parseInt(map['HOLD_TIME']||'0',10)||0,
-      park_time: parseDurationToMs(map['PARK_TIME']) || parseInt(map['PARK_TIME']||'0',10)||0,
-      after_call_work_time: parseDurationToMs(map['AFTER_CALL_WORK_TIME']) || parseInt(map['AFTER_CALL_WORK_TIME']||'0',10)||0,
-      transfers: parseInt(map['TRANSFERS']||'0',10)||0,
-      conferences: parseInt(map['CONFERENCES']||'0',10)||0,
-      holds: parseInt(map['HOLDS']||'0',10)||0,
-      abandoned: parseInt(map['ABANDONED']||'0',10)||0,
-      recordings: map['RECORDINGS'] || null,
-      raw_json: JSON.stringify({ ...map, TIMESTAMP_ORIGINAL: rawTimestamp })
-    });
   }
   
   const inserted = bulkUpsertReports(rows);
@@ -397,16 +420,17 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
 
 // Deprecated: kept for backward compatibility, now delegates to 45-minute scheduler
 export function scheduleHourlyIngestion() {
-  scheduleRecurringIngestion45();
+  scheduleRecurringIngestion();
 }
 
 let autoIngestionLock = false;
-export function scheduleRecurringIngestion45() {
+export function scheduleRecurringIngestion() {
   if (!FIVE9_USERNAME || !FIVE9_PASSWORD) {
     console.warn('⚠️  [Five9] Auto ingestion disabled (missing credentials)');
     return;
   }
-  const intervalMs = 45 * 60 * 1000; // 45 minutes
+  const intervalMinutes = AUTO_INGEST_INTERVAL_MINUTES;
+  const intervalMs = intervalMinutes * 60 * 1000;
   const run = () => {
     if (autoIngestionLock) {
       console.log('⏳ [Five9] Previous auto ingestion still running; skipping this interval');
@@ -414,19 +438,22 @@ export function scheduleRecurringIngestion45() {
     }
     autoIngestionLock = true;
     const started = Date.now();
-    console.log('🚀 [Five9] Auto ingestion (last hour window) starting');
+    console.log(`🚀 [Five9] Auto ingestion starting (interval ${intervalMinutes}m, window ${intervalMinutes + REPORT_LOOKBACK_PADDING_MINUTES}m)`);
     fetchLastHourCallLog().then(result => {
       const ms = Date.now() - started;
       console.log('✅ [Five9] Auto ingestion finished', { durationMs: ms, ...result });
     }).catch(err => {
       const ms = Date.now() - started;
       console.error('❌ [Five9] Auto ingestion failed', { durationMs: ms, error: err.message });
+      if (err && err.stack) {
+        console.error(err.stack);
+      }
     }).finally(() => { autoIngestionLock = false; });
   };
   // Immediate run at startup
   run();
   setInterval(run, intervalMs);
-  console.log('🗓️  [Five9] Scheduled recurring ingestion every 45 minutes');
+  console.log(`🗓️  [Five9] Scheduled recurring ingestion every ${intervalMinutes} minute(s)`);
 }
 
 // Raw invoke helper for debugging any Five9 SOAP action
