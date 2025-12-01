@@ -700,6 +700,7 @@ statements.queryReportsDesc = db.prepare(`
     AND (? IS NULL OR timestamp >= ?)
     AND (? IS NULL OR timestamp <= ?)
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
+    AND (? IS NULL OR agent_name LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
     AND (? IS NULL OR (ani LIKE '%' || ? || '%' OR dnis LIKE '%' || ? || '%'))
@@ -718,6 +719,7 @@ statements.queryReportsAsc = db.prepare(`
     AND (? IS NULL OR timestamp >= ?)
     AND (? IS NULL OR timestamp <= ?)
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
+    AND (? IS NULL OR agent_name LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
     AND (? IS NULL OR (ani LIKE '%' || ? || '%' OR dnis LIKE '%' || ? || '%'))
@@ -736,6 +738,7 @@ statements.countReports = db.prepare(`
     AND (? IS NULL OR timestamp >= ?)
     AND (? IS NULL OR timestamp <= ?)
     AND (? IS NULL OR agent LIKE '%' || ? || '%')
+    AND (? IS NULL OR agent_name LIKE '%' || ? || '%')
     AND (? IS NULL OR campaign = ?)
     AND (? IS NULL OR call_type = ?)
     AND (? IS NULL OR (ani LIKE '%' || ? || '%' OR dnis LIKE '%' || ? || '%'))
@@ -1425,7 +1428,7 @@ export function bulkUpsertReports(rows = []) {
   return tx(rows);
 }
 
-export function exportReports({ start=null, end=null, agent=null, campaign=null, callType=null, phone=null, callId=null, customerName=null, afterCallWork=null, transfers=null, conferences=null, abandoned=null, sort='desc' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
+export function exportReports({ start=null, end=null, agent=null, agentName=null, campaign=null, callType=null, phone=null, callId=null, customerName=null, afterCallWork=null, transfers=null, conferences=null, abandoned=null, sort='desc' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => {
@@ -1451,6 +1454,7 @@ export function exportReports({ start=null, end=null, agent=null, campaign=null,
     const s = norm(start);
     const e = norm(end);
     const a = norm(agent);
+    const aName = norm(agentName);
     const c = norm(campaign);
     const ct = norm(callType);
     const phoneNorm = normLike(phone);
@@ -1463,7 +1467,7 @@ export function exportReports({ start=null, end=null, agent=null, campaign=null,
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
 
     const stmt = sortDir === 'asc' ? statements.queryReportsAsc : statements.queryReportsDesc;
-    const totalRow = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab);
+    const totalRow = statements.countReports.get(s, s, e, e, a, a, aName, aName, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab);
     const total = Number(totalRow?.total) || 0;
     if (total > maxRows) {
       return { rows: [], total, truncated: true, maxRows, sort: sortDir };
@@ -1471,7 +1475,7 @@ export function exportReports({ start=null, end=null, agent=null, campaign=null,
 
     const fetchLimit = total > 0 ? Math.min(total, maxRows) : 0;
     const rows = fetchLimit > 0
-      ? stmt.all(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab, fetchLimit, 0)
+      ? stmt.all(s, s, e, e, a, a, aName, aName, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab, fetchLimit, 0)
       : [];
 
     return { rows, total, truncated: false, maxRows, sort: sortDir };
@@ -1481,7 +1485,7 @@ export function exportReports({ start=null, end=null, agent=null, campaign=null,
   }
 }
 
-export function queryReports({ start=null, end=null, agent=null, campaign=null, callType=null, phone=null, callId=null, customerName=null, afterCallWork=null, transfers=null, conferences=null, abandoned=null, limit=100, offset=0, sort='desc' } = {}) {
+export function queryReports({ start=null, end=null, agent=null, agentName=null, campaign=null, callType=null, phone=null, callId=null, customerName=null, afterCallWork=null, transfers=null, conferences=null, abandoned=null, limit=100, offset=0, sort='desc' } = {}) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => {
@@ -1506,6 +1510,7 @@ export function queryReports({ start=null, end=null, agent=null, campaign=null, 
     const s = norm(start);
     const e = norm(end);
     const a = norm(agent);
+    const aName = norm(agentName);
     const c = norm(campaign);
     const ct = norm(callType);
     const phoneNorm = normLike(phone);
@@ -1516,10 +1521,10 @@ export function queryReports({ start=null, end=null, agent=null, campaign=null, 
     const conf = normBinary(conferences);
     const ab = normBinary(abandoned);
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
-    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
+    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, agentName=${aName}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
     const stmt = sortDir === 'asc' ? statements.queryReportsAsc : statements.queryReportsDesc;
-    const rows = stmt.all(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab, limit, offset);
-    const { total } = statements.countReports.get(s, s, e, e, a, a, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab);
+    const rows = stmt.all(s, s, e, e, a, a, aName, aName, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab, limit, offset);
+    const { total } = statements.countReports.get(s, s, e, e, a, a, aName, aName, c, c, ct, ct, phoneNorm, phoneNorm, phoneNorm, ci, ci, cust, cust, acw, acw, tr, tr, conf, conf, ab, ab);
     console.log(`[QUERY REPORTS] Results: returned ${rows.length} rows, total=${total}`);
     if (rows.length > 0) {
       console.log(`[QUERY REPORTS] First row timestamp: ${rows[0].timestamp}, Last row timestamp: ${rows[rows.length-1].timestamp}`);

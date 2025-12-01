@@ -475,13 +475,15 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
     start = cleanParam(start);
     end = cleanParam(end);
     agent = cleanParam(agent);
+    agentName = cleanParam(agentName);
+    agentSearchType = cleanParam(agentSearchType);
     campaign = cleanParam(campaign);
     callType = cleanParam(callType);
     phone = cleanParam(phone);
@@ -496,6 +498,8 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     if (typeof callId === 'string') callId = callId.trim();
     if (typeof customerName === 'string') customerName = customerName.trim();
     if (typeof afterCallWork === 'string') afterCallWork = afterCallWork.trim();
+    if (typeof agentName === 'string') agentName = agentName.trim();
+    if (typeof agentSearchType === 'string') agentSearchType = agentSearchType.trim().toLowerCase();
     if (typeof transfers === 'string') transfers = transfers.trim();
     if (typeof conferences === 'string') conferences = conferences.trim();
     if (typeof abandoned === 'string') abandoned = abandoned.trim();
@@ -503,11 +507,24 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     if (callId === '') callId = null;
     if (customerName === '') customerName = null;
     if (afterCallWork === '') afterCallWork = null;
+    if (agentName === '') agentName = null;
+    if (agentSearchType === '') agentSearchType = null;
     if (transfers === '') transfers = null;
     if (conferences === '') conferences = null;
     if (abandoned === '') abandoned = null;
     
-    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
+    if (!agentName && agent && agentSearchType === 'name') {
+      agentName = agent;
+      agent = null;
+    } else if (!agent && agentName && agentSearchType === 'email') {
+      agent = agentName;
+      agentName = null;
+    } else if (agent && !agentName && !agentSearchType && !/@/.test(agent)) {
+      agentName = agent;
+      agent = null;
+    }
+
+    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", agentName="${agentName}", agentSearchType="${agentSearchType}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
     
     const startFormatted = normalizeReportTimestamp(start);
     const endFormatted = normalizeReportTimestamp(end);
@@ -556,6 +573,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       start: appliedStart,
       end: appliedEnd,
       agent,
+      agentName,
       campaign,
       callType,
       phone,
@@ -603,6 +621,8 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
             start: start || null,
             end: end || null,
             agent: agent || null,
+            agentName: agentName || null,
+            agentSearchType: agentSearchType || null,
             campaign: campaign || null,
             callType: callType || null,
             phone: phone || null
@@ -635,12 +655,14 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
 
 app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
-    let { start, end, agent, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, sort } = req.query;
 
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
     start = cleanParam(start);
     end = cleanParam(end);
     agent = cleanParam(agent);
+    agentName = cleanParam(agentName);
+    agentSearchType = cleanParam(agentSearchType);
     campaign = cleanParam(campaign);
     callType = cleanParam(callType);
     phone = cleanParam(phone);
@@ -654,6 +676,8 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     if (typeof phone === 'string') phone = phone.trim();
     if (typeof callId === 'string') callId = callId.trim();
     if (typeof customerName === 'string') customerName = customerName.trim();
+    if (typeof agentName === 'string') agentName = agentName.trim();
+    if (typeof agentSearchType === 'string') agentSearchType = agentSearchType.trim().toLowerCase();
     if (typeof afterCallWork === 'string') afterCallWork = afterCallWork.trim();
     if (typeof transfers === 'string') transfers = transfers.trim();
     if (typeof conferences === 'string') conferences = conferences.trim();
@@ -661,6 +685,18 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     if (phone === '') phone = null;
     if (callId === '') callId = null;
     if (customerName === '') customerName = null;
+    if (agentName === '') agentName = null;
+    if (agentSearchType === '') agentSearchType = null;
+        if (!agentName && agent && agentSearchType === 'name') {
+          agentName = agent;
+          agent = null;
+        } else if (!agent && agentName && agentSearchType === 'email') {
+          agent = agentName;
+          agentName = null;
+        } else if (agent && !agentName && !agentSearchType && !/@/.test(agent)) {
+          agentName = agent;
+          agent = null;
+        }
     if (afterCallWork === '') afterCallWork = null;
     if (transfers === '') transfers = null;
     if (conferences === '') conferences = null;
@@ -689,6 +725,7 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
       start: startFormatted || null,
       end: endFormatted || null,
       agent,
+      agentName,
       campaign,
       callType,
       phone,
@@ -761,6 +798,9 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
             start: start || null,
             end: end || null,
             agent: agent || null,
+            agentName: agentName || null,
+            agentSearchType: agentSearchType || null,
+            agentName: agentName || null,
             campaign: campaign || null,
             callType: callType || null,
             phone: phone || null,

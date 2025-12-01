@@ -185,7 +185,8 @@ export default function ReportsPage(){
   const [rows,setRows]=useState([]);
   const [loading,setLoading]=useState(false);
   const [error,setError]=useState(null);
-  const [agent,setAgent]=useState('');
+  const [agentInput, setAgentInput] = useState('');
+  const [agentFilter, setAgentFilter] = useState('');
   const [campaign,setCampaign]=useState('');
   const [callType,setCallType]=useState('');
   const [phoneNumber,setPhoneNumber]=useState('');
@@ -256,7 +257,17 @@ export default function ReportsPage(){
         console.log(`End: ${dayjs(endDate).format('YYYY-MM-DD HH:mm:ss')} (local) -> ${five9Display} (${FIVE9_TZ}) -> ${endUtc} (UTC)`);
       }
       if (userTz) params.append('timezone', userTz);
-      if (agent && agent !== 'undefined') params.append('agent', agent);
+      const trimmedAgent = agentFilter?.trim() || '';
+      if (trimmedAgent) {
+        const looksLikeEmail = /@/.test(trimmedAgent);
+        if (looksLikeEmail) {
+          params.append('agent', trimmedAgent);
+          params.append('agentSearchType', 'email');
+        } else {
+          params.append('agentName', trimmedAgent);
+          params.append('agentSearchType', 'name');
+        }
+      }
       if (campaign && campaign !== 'undefined') params.append('campaign', campaign);
       // Append remaining optional filters
       if (callType && callType !== 'undefined') params.append('callType', callType);
@@ -296,7 +307,7 @@ export default function ReportsPage(){
     } catch (e) {
       setError(e.message);
     } finally { setLoading(false); }
-  }, [getToken, agent, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, page, pageSize, sortOrder]);
+  }, [getToken, agentFilter, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, page, pageSize, sortOrder]);
 
   const ingest = async () => {
     if(!isAdmin) return;
@@ -343,7 +354,17 @@ export default function ReportsPage(){
         params.append('end', formatUtc(endDate));
       }
       if (userTz) params.append('timezone', userTz);
-      if (agent && agent !== 'undefined') params.append('agent', agent);
+      const trimmedAgent = agentFilter?.trim() || '';
+      if (trimmedAgent) {
+        const looksLikeEmail = /@/.test(trimmedAgent);
+        if (looksLikeEmail) {
+          params.append('agent', trimmedAgent);
+          params.append('agentSearchType', 'email');
+        } else {
+          params.append('agentName', trimmedAgent);
+          params.append('agentSearchType', 'name');
+        }
+      }
       if (campaign && campaign !== 'undefined') params.append('campaign', campaign);
       if (callType && callType !== 'undefined') params.append('callType', callType);
       if (phoneNumber && phoneNumber !== 'undefined') {
@@ -403,7 +424,7 @@ export default function ReportsPage(){
     } finally {
       setReportExporting(false);
     }
-  }, [isAdmin, reportExporting, getToken, startDate, endDate, agent, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, sortOrder]);
+  }, [isAdmin, reportExporting, getToken, startDate, endDate, agentFilter, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, sortOrder]);
 
   useEffect(() => { 
     if (initialized) {
@@ -424,6 +445,14 @@ export default function ReportsPage(){
     })();
   }, [getToken]);
 
+  // Debounce agent text input before applying the filter upstream
+  useEffect(() => {
+    const handle = setTimeout(() => {
+      setAgentFilter(prev => (prev === agentInput ? prev : agentInput));
+    }, 400);
+    return () => clearTimeout(handle);
+  }, [agentInput]);
+
   // Set default preset to 'lastHour' on mount
   useEffect(() => {
     applyPreset('lastHour');
@@ -433,7 +462,7 @@ export default function ReportsPage(){
   // Reset page to 1 when filters change to avoid empty result pages
   useEffect(() => {
     setPage(1);
-  }, [agent, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, sortOrder, pageSize]);
+  }, [agentFilter, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, sortOrder, pageSize]);
 
 
   function applyPreset(p){
@@ -489,7 +518,7 @@ export default function ReportsPage(){
             onChange={(newValue) => setEndDate(newValue)}
             slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
           />
-          <TextField label="Agent" value={agent} onChange={e=>setAgent(e.target.value)} size="small" />
+          <TextField label="Agent" value={agentInput} onChange={e=>setAgentInput(e.target.value)} size="small" />
         <FormControl size="small" sx={{ minWidth:160 }}>
           <InputLabel id="campaign-label">Campaign</InputLabel>
           <Select labelId="campaign-label" value={campaign} label="Campaign" onChange={e=>setCampaign(e.target.value)}>
@@ -539,8 +568,8 @@ export default function ReportsPage(){
             <MenuItem value="asc">Oldest First</MenuItem>
           </Select>
         </FormControl>
-        <Button variant="contained" onClick={()=>{ setPage(1); fetchReports(); }} disabled={loading}>Apply</Button>
-        <Button variant="text" onClick={()=>{ setAgent(''); setCampaign(''); setCallType(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
+        <Button variant="contained" onClick={()=>{ setAgentFilter(agentInput); setPage(1); }} disabled={loading}>Apply</Button>
+        <Button variant="text" onClick={()=>{ setAgentInput(''); setAgentFilter(''); setCampaign(''); setCallType(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('lastHour')} disabled={loading}>Last Hour</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('today')} disabled={loading}>Today</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>
