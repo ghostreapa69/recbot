@@ -797,8 +797,16 @@ export function parseFileMetadata(filePath) {
   const phoneMatch = filename.match(/^(\d+)/);
   const phone = phoneMatch ? phoneMatch[1] : '';
   
-  const emailMatch = filename.match(/by ([^@]+@[^ ]+)/);
-  const email = emailMatch ? emailMatch[1] : '';
+  let email = '';
+  const emailMatch = filename.match(/by ([^@\s]+@[^\s]+)/);
+  if (emailMatch) {
+    email = emailMatch[1];
+  } else {
+    const usernameMatch = filename.match(/by ([^\s]+)/);
+    if (usernameMatch) {
+      email = usernameMatch[1];
+    }
+  }
   
   const timeMatch = filename.match(/@ ([\d_]+ [AP]M)/);
   const timeStr = timeMatch ? timeMatch[1].replace(/_/g, ':') : '';
