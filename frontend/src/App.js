@@ -23,20 +23,82 @@ import ReportsPage from './ReportsPage';
 
 // Try build-time env var first, then runtime config
 const CLERK_PUBLISHABLE_KEY = process.env.REACT_APP_CLERK_PUBLISHABLE_KEY;
+const DEFAULT_ALLOWED_LOGIN_IDENTIFIERS = ['mtgpros.com'];
+
+function parseAllowedIdentifiers(value, fallbackList = DEFAULT_ALLOWED_LOGIN_IDENTIFIERS) {
+  const hasValue = typeof value === 'string' && value.trim().length > 0;
+  const base = hasValue
+    ? value
+    : (Array.isArray(fallbackList) && fallbackList.length ? fallbackList.join(',') : '');
+
+  if (!base) {
+    return { allowAll: false, entries: [] };
+  }
+
+  const tokens = base
+    .split(',')
+    .map(part => (typeof part === 'string' ? part.trim().toLowerCase() : ''))
+    .filter(Boolean);
+
+  const allowAll = tokens.includes('*');
+  const entries = allowAll ? tokens.filter(token => token !== '*') : tokens;
+
+  return {
+    allowAll,
+    entries: Array.from(new Set(entries))
+  };
+}
+
+function normalizeAllowedLoginConfig(source, fallbackList = DEFAULT_ALLOWED_LOGIN_IDENTIFIERS) {
+  if (typeof source === 'string' || source === undefined || source === null) {
+    return parseAllowedIdentifiers(source || '', fallbackList);
+  }
+
+  if (typeof source === 'object') {
+    const allowAll = Boolean(source.allowAll);
+    const rawEntries = Array.isArray(source.entries) ? source.entries : [];
+    const entries = rawEntries
+      .map(entry => (typeof entry === 'string' ? entry.trim().toLowerCase() : ''))
+      .filter(Boolean);
+    return {
+      allowAll,
+      entries: allowAll ? entries.filter(entry => entry !== '*') : Array.from(new Set(entries))
+    };
+  }
+
+  return parseAllowedIdentifiers('', fallbackList);
+}
+
+function matchesAllowedIdentifier(email, identifier) {
+  if (!email || !identifier) return false;
+  if (!identifier.includes('@')) {
+    return email.endsWith(`@${identifier}`);
+  }
+  if (identifier.startsWith('@') && identifier.indexOf('@', 1) === -1) {
+    return email.endsWith(identifier);
+  }
+  return email === identifier;
+}
+
+const ENV_ALLOWED_LOGIN_CONFIG = normalizeAllowedLoginConfig(process.env.REACT_APP_ALLOWED_LOGIN_IDENTIFIERS);
 
 // Domain validation component
-function DomainValidator({ children }) {
+function DomainValidator({ children, allowedLoginConfig }) {
   const { user, isLoaded } = useUser();
-  
+
   if (!isLoaded) {
     return <div>Loading...</div>;
   }
-  
+
+  const config = normalizeAllowedLoginConfig(allowedLoginConfig);
+  const allowedEntries = config.entries;
+  const allowAll = config.allowAll;
   const userEmail = user?.emailAddresses?.[0]?.emailAddress;
   const isEmailVerified = user?.emailAddresses?.[0]?.verification?.status === 'verified';
-  
-  // Check if user email is from allowed domain AND verified
-  if (!userEmail || !userEmail.endsWith('@mtgpros.com')) {
+  const normalizedEmail = userEmail ? userEmail.toLowerCase() : null;
+  const emailIsAllowed = allowAll || (normalizedEmail && allowedEntries.some(identifier => matchesAllowedIdentifier(normalizedEmail, identifier)));
+
+  if (!emailIsAllowed) {
     return (
       <Container maxWidth="md" sx={{ mt: 8 }}>
         <Paper sx={{ p: 4, textAlign: 'center' }}>
@@ -45,7 +107,7 @@ function DomainValidator({ children }) {
               Access Denied
             </Typography>
             <Typography variant="body1" paragraph>
-              Access to this application is restricted to users with <strong>@mtgpros.com</strong> email addresses only.
+              You are not allowed to access this application.
             </Typography>
             <Typography variant="body2" color="text.secondary">
               Your current email: <strong>{userEmail || 'No email found'}</strong>
@@ -61,8 +123,7 @@ function DomainValidator({ children }) {
       </Container>
     );
   }
-  
-  // Check if email is verified
+
   if (!isEmailVerified) {
     return (
       <Container maxWidth="md" sx={{ mt: 8 }}>
@@ -72,7 +133,7 @@ function DomainValidator({ children }) {
               Email Verification Required
             </Typography>
             <Typography variant="body1" paragraph>
-              Please verify your email address to access MTGPros Five9 Recordings.
+              Please verify your email address to access this application.
             </Typography>
             <Typography variant="body2" color="text.secondary">
               Your email: <strong>{userEmail}</strong> needs to be verified.
@@ -88,8 +149,8 @@ function DomainValidator({ children }) {
       </Container>
     );
   }
-  
-  // User has valid domain, render the app
+
+  // User has valid allowlist match and verified email, render the app
   return children;
 }
 
@@ -141,7 +202,7 @@ function Navigation({ darkMode, setDarkMode }) {
   );
 }
 
-function AppContent() {
+function AppContent({ allowedLoginConfig }) {
   const [darkMode, setDarkMode] = useState(localStorage.getItem('darkMode') === 'true');
 
   React.useEffect(() => {
@@ -158,7 +219,7 @@ function AppContent() {
       <LocalizationProvider dateAdapter={AdapterDayjs}>
         <Router>
           <SignedIn>
-            <DomainValidator>
+            <DomainValidator allowedLoginConfig={allowedLoginConfig}>
               <Navigation darkMode={darkMode} setDarkMode={setDarkMode} />
               <Routes>
                 <Route path="/" element={<FileViewer darkMode={darkMode} />} />
@@ -191,28 +252,60 @@ function ClerkConfigLoader() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // If we have a build-time key, use it immediately
+    let cancelled = false;
+
     if (CLERK_PUBLISHABLE_KEY) {
-      setConfig({ clerkPublishableKey: CLERK_PUBLISHABLE_KEY });
+      setConfig({
+        clerkPublishableKey: CLERK_PUBLISHABLE_KEY,
+        allowedLoginConfig: ENV_ALLOWED_LOGIN_CONFIG
+      });
       setLoading(false);
-      return;
     }
 
-    // Otherwise, fetch config from backend at runtime
     fetch('/api/config')
       .then(res => res.json())
       .then(data => {
+        if (cancelled) return;
+
         if (data.clerkPublishableKey) {
-          setConfig(data);
+          const serverAllowedConfig = data.allowedLoginConfig
+            ? normalizeAllowedLoginConfig(
+                data.allowedLoginConfig,
+                ENV_ALLOWED_LOGIN_CONFIG.entries.length ? ENV_ALLOWED_LOGIN_CONFIG.entries : DEFAULT_ALLOWED_LOGIN_IDENTIFIERS
+              )
+            : ENV_ALLOWED_LOGIN_CONFIG;
+
+          setConfig({
+            clerkPublishableKey: CLERK_PUBLISHABLE_KEY || data.clerkPublishableKey,
+            allowedLoginConfig: serverAllowedConfig
+          });
+
+          if (!CLERK_PUBLISHABLE_KEY) {
+            setLoading(false);
+          }
         } else {
-          setError('Clerk publishable key not configured on server');
+          if (!CLERK_PUBLISHABLE_KEY) {
+            setError('Clerk publishable key not configured on server');
+          }
         }
       })
       .catch(err => {
+        if (cancelled) return;
         console.error('Failed to load config:', err);
-        setError('Failed to load configuration');
+        if (!CLERK_PUBLISHABLE_KEY) {
+          setError('Failed to load configuration');
+        }
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (cancelled) return;
+        if (!CLERK_PUBLISHABLE_KEY) {
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   if (loading) {
@@ -248,7 +341,7 @@ function ClerkConfigLoader() {
 
   return (
     <ClerkProvider publishableKey={config.clerkPublishableKey}>
-      <AppContent />
+      <AppContent allowedLoginConfig={config.allowedLoginConfig} />
     </ClerkProvider>
   );
 }

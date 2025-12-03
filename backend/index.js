@@ -20,9 +20,9 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport } from './database.js';
-import { fetchLastHourCallLog, scheduleRecurringIngestion45 } from './five9.js';
-import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
+import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
+import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
+import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig } from './auth.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(isSameOrBefore);
@@ -92,6 +92,56 @@ const s3 = new S3Client({
   })
 });
 console.log(`[S3] Client initialized region=${process.env.AWS_REGION} maxSockets=${S3_MAX_SOCKETS} socketTimeoutMs=${S3_SOCKET_TIMEOUT_MS}`);
+const S3_FAILURE_UNHEALTHY_WINDOW_MS = parseInt(process.env.S3_FAILURE_UNHEALTHY_WINDOW_MS || '0', 10);
+const EXIT_ON_S3_FAILURE = /^true$/i.test(process.env.EXIT_ON_S3_FAILURE || '');
+let lastS3FetchFailureAt = null;
+let lastS3FetchFailureMessage = null;
+let lastS3FetchSuccessAt = Date.now();
+let s3FailureExitScheduled = false;
+
+function recordS3Failure(message) {
+  lastS3FetchFailureAt = Date.now();
+  lastS3FetchFailureMessage = message;
+
+  if (EXIT_ON_S3_FAILURE && !s3FailureExitScheduled) {
+    s3FailureExitScheduled = true;
+    setTimeout(() => {
+      console.error('🔁 [HEALTH] EXIT_ON_S3_FAILURE enabled; terminating process for container restart');
+      process.exit(70);
+    }, 500);
+  }
+}
+
+function recordS3Success() {
+  lastS3FetchSuccessAt = Date.now();
+  s3FailureExitScheduled = false;
+}
+
+app.get('/healthz', (req, res) => {
+  const now = Date.now();
+  const failureActive = lastS3FetchFailureAt && (!lastS3FetchSuccessAt || lastS3FetchSuccessAt < lastS3FetchFailureAt);
+  const failureAge = failureActive ? (now - lastS3FetchFailureAt) : null;
+  const degradeIndefinitely = S3_FAILURE_UNHEALTHY_WINDOW_MS <= 0;
+  const withinWindow = failureActive && (degradeIndefinitely || (failureAge !== null && failureAge <= S3_FAILURE_UNHEALTHY_WINDOW_MS));
+
+  if (failureActive && withinWindow) {
+    return res.status(503).json({
+      status: 'error',
+      reason: 'recent_s3_failure',
+      lastFailureAt: new Date(lastS3FetchFailureAt).toISOString(),
+      lastFailureMessage: lastS3FetchFailureMessage,
+      lastSuccessAt: lastS3FetchSuccessAt ? new Date(lastS3FetchSuccessAt).toISOString() : null,
+      failureAgeMs: failureAge
+    });
+  }
+
+  return res.json({
+    status: 'ok',
+    lastFailureAt: lastS3FetchFailureAt ? new Date(lastS3FetchFailureAt).toISOString() : null,
+    lastSuccessAt: lastS3FetchSuccessAt ? new Date(lastS3FetchSuccessAt).toISOString() : null,
+    failureAgeMs: failureAge
+  });
+});
 
 // Lightweight HEAD cache to reduce duplicate S3 HeadObject traffic (TTL 60s)
 const headCacheTTL = parseInt(process.env.S3_HEAD_CACHE_TTL_MS || '60000', 10);
@@ -171,6 +221,136 @@ function normalizeFilterToUtc(value, preferredTz = REPORT_FILTER_FALLBACK_TIMEZO
   return null;
 }
 
+function parseDurationMsFlexible(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+  }
+  const str = String(value).trim();
+  if (!str) return null;
+  if (/ms$/i.test(str)) {
+    const numeric = Number(str.replace(/ms$/i, '').trim());
+    return Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : null;
+  }
+  if (/^-?\d+(?:\.\d+)?$/.test(str)) {
+    const seconds = Number(str);
+    return Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1000)) : null;
+  }
+  if (str.includes(':')) {
+    const parts = str.split(':');
+    if (parts.length === 3) {
+      const [hhRaw, mmRaw, ssRaw] = parts;
+      const hours = Number(hhRaw);
+      const minutes = Number(mmRaw);
+      const seconds = Number(ssRaw);
+      if ([hours, minutes, seconds].some(n => Number.isNaN(n))) return null;
+      const totalSeconds = (hours * 3600) + (minutes * 60) + seconds;
+      return Math.max(0, Math.round(totalSeconds * 1000));
+    }
+  }
+  return null;
+}
+
+function parseIntegerFlexible(value) {
+  if (value === null || value === undefined) return null;
+  const str = typeof value === 'string' ? value.trim() : String(value).trim();
+  if (!str) return null;
+  const num = Number(str);
+  return Number.isFinite(num) ? Math.round(num) : null;
+}
+
+const REPORT_DURATION_FIELD_MAP = {
+  call_time: ['CALL_TIME', 'CALLTIME'],
+  bill_time_rounded: ['BILL_TIME_(ROUNDED)', 'BILL_TIME_ROUNDED'],
+  ivr_time: ['IVR_TIME'],
+  queue_wait_time: ['QUEUE_WAIT_TIME'],
+  ring_time: ['RING_TIME'],
+  talk_time: ['TALK_TIME'],
+  hold_time: ['HOLD_TIME'],
+  park_time: ['PARK_TIME'],
+  after_call_work_time: ['AFTER_CALL_WORK_TIME']
+};
+
+const REPORT_COST_KEYS = ['COST'];
+
+const REPORT_INTEGER_FIELD_MAP = {
+  transfers: ['TRANSFERS'],
+  conferences: ['CONFERENCES'],
+  holds: ['HOLDS'],
+  abandoned: ['ABANDONED']
+};
+
+function hydrateReportRow(row) {
+  if (!row) return row;
+  let rawPayload = row.raw_json_parsed && typeof row.raw_json_parsed === 'object' ? row.raw_json_parsed : null;
+  if (!rawPayload && typeof row.raw_json === 'string') {
+    try {
+      rawPayload = JSON.parse(row.raw_json);
+    } catch {
+      rawPayload = null;
+    }
+  }
+  if (!rawPayload) return row;
+
+  const hydrated = { ...row };
+
+  for (const [field, rawKeys] of Object.entries(REPORT_DURATION_FIELD_MAP)) {
+    const current = Number(hydrated[field]);
+    const needsHydration = !Number.isFinite(current) || current < 0 || current === 0;
+    if (!needsHydration) continue;
+    const rawValue = rawKeys.map(k => rawPayload[k]).find(v => v !== undefined && v !== null && v !== '');
+    const parsed = parseDurationMsFlexible(rawValue);
+    if (parsed !== null && parsed > 0) {
+      hydrated[field] = parsed;
+    }
+  }
+
+  // Cost may need precision but already stored as float. Refresh if zero but raw has value.
+  if (Number(hydrated.cost) === 0 || !Number.isFinite(Number(hydrated.cost))) {
+    const rawCost = REPORT_COST_KEYS.map(k => rawPayload[k]).find(v => v !== undefined && v !== null && v !== '');
+    if (rawCost !== undefined) {
+      const parsedCost = Number(rawCost);
+      if (Number.isFinite(parsedCost)) hydrated.cost = parsedCost;
+    }
+  }
+
+  for (const [field, rawKeys] of Object.entries(REPORT_INTEGER_FIELD_MAP)) {
+    const current = Number(hydrated[field]);
+    const rawValue = rawKeys.map(k => rawPayload[k]).find(v => v !== undefined && v !== null && v !== '');
+    const parsed = parseIntegerFlexible(rawValue);
+    if (parsed === null) continue;
+    if (!Number.isFinite(current) || (current === 0 && parsed > 0)) {
+      hydrated[field] = parsed;
+    }
+  }
+
+  return hydrated;
+}
+
+function hydrateReportRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return rows;
+  const hydrated = rows.map(hydrateReportRow);
+
+  try {
+    const callIds = Array.from(new Set(hydrated.map(row => (row && row.call_id ? String(row.call_id) : null)).filter(Boolean)));
+    if (callIds.length) {
+      const availabilityMap = getCallIdsWithRecordings(callIds);
+      if (availabilityMap && typeof availabilityMap === 'object') {
+        for (const row of hydrated) {
+          if (!row || !row.call_id) continue;
+          if (availabilityMap[row.call_id]) {
+            row.hasRecording = true;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[REPORT] Failed to hydrate recording availability:', err.message);
+  }
+
+  return hydrated;
+}
+
 // ----------------------------------------------
 // FFmpeg concurrency + configuration
 // ----------------------------------------------
@@ -245,167 +425,49 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// Kick off 45-minute Five9 ingestion scheduler with immediate startup run
-scheduleRecurringIngestion45();
+// Kick off Five9 ingestion scheduler (interval configurable via env)
+scheduleRecurringIngestion();
 
-// Endpoint to manually trigger last hour report fetch (admin only)
+// Endpoint to manually trigger report ingestion for the configured window (admin only)
 app.post('/api/reports/ingest', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const result = await fetchLastHourCallLog({ auditUser: req.user });
-    res.json({ success: true, ...result });
+      const responsePayload = {
+        success: true,
+        ...result
+      };
+      res.json(responsePayload);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Endpoint to fix timezone on existing reporting data (admin only, one-time migration)
+// Endpoint to convert legacy report timestamps to canonical UTC ISO format
 app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
-    const dayjs = (await import('dayjs')).default;
-    const utc = (await import('dayjs/plugin/utc.js')).default;
-    const timezone = (await import('dayjs/plugin/timezone.js')).default;
-    dayjs.extend(utc);
-    dayjs.extend(timezone);
-    
-    const sourceTimezone = req.body.sourceTimezone || process.env.FIVE9_TIMEZONE || 'America/New_York';
-    const batchSize = parseInt(req.body.batchSize || '10000', 10);
-    const runAll = req.body.runAll !== false; // default true
-    const deleteInvalidYears = req.body.deleteInvalidYears !== false; // default true
-    
-    console.log(`[TIMEZONE FIX] Starting migration from ${sourceTimezone} to UTC, batch size: ${batchSize}, runAll: ${runAll}, deleteInvalidYears: ${deleteInvalidYears}`);
-    
-    const { db } = await import('./database.js');
-    
-    let totalUpdated = 0;
-    let totalProcessed = 0;
-    let totalErrors = 0;
-    let totalDeleted = 0;
-    let batchCount = 0;
-    
-    // First, delete records with invalid years (2026 or beyond)
-    if (deleteInvalidYears) {
-      try {
-        const currentYear = new Date().getFullYear();
-        const futureYear = currentYear + 1;
-        const deleteResult = db.prepare(`DELETE FROM reporting WHERE timestamp LIKE '${futureYear}%' OR timestamp LIKE '${futureYear + 1}%' OR timestamp LIKE '${futureYear + 2}%'`).run();
-        totalDeleted = deleteResult.changes || 0;
-        console.log(`[TIMEZONE FIX] Deleted ${totalDeleted} rows with invalid future years (${futureYear}+)`);
-      } catch (e) {
-        console.error('[TIMEZONE FIX] Error deleting invalid years:', e.message);
-      }
+    const batchSize = parseInt(req.body?.batchSize || '5000', 10);
+    const runAll = req.body?.runAll !== false;
+    const includeIso = req.body?.includeIso === true;
+    const dryRun = req.body?.dryRun === true;
+
+    console.log(`[TIMESTAMP FIX] Starting rewrite batchSize=${batchSize} runAll=${runAll} includeIso=${includeIso} dryRun=${dryRun}`);
+    const result = rewriteReportTimestamps({ batchSize, runAll, includeIso, dryRun });
+    const legacy = getLegacyReportTimestampStats(10);
+
+    console.log(`[TIMESTAMP FIX] Complete: processed=${result.processed} updated=${result.updated} errors=${result.errors} batches=${result.batches} remaining=${result.remainingLegacy}`);
+    if (result.sampleConversions?.length) {
+      result.sampleConversions.forEach((sample, idx) => {
+        console.log(`   [TIMESTAMP FIX] Sample ${idx + 1}: "${sample.from}" -> "${sample.to}" (call_id=${sample.callId})`);
+      });
     }
-    
-    const updateStmt = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
-    
-    do {
-      batchCount++;
-      // Get rows that look like they haven't been converted yet (no 'T' or 'Z' in timestamp, or specific patterns)
-      // Or just process all rows - the update will only happen if timestamp changes
-      const rows = db.prepare(`SELECT call_id, timestamp FROM reporting WHERE timestamp IS NOT NULL ORDER BY datetime(timestamp) DESC LIMIT ? OFFSET ?`).all(batchSize, totalProcessed);
-      
-      if (rows.length === 0) {
-        console.log(`[TIMEZONE FIX] No more rows to process`);
-        break;
-      }
-      
-      console.log(`[TIMEZONE FIX] Batch ${batchCount}: Processing ${rows.length} rows (offset ${totalProcessed})`);
-      
-      let batchUpdated = 0;
-      let batchErrors = 0;
-      
-      for (const row of rows) {
-        try {
-          const rawTs = row.timestamp;
-          if (!rawTs) {
-            batchErrors++;
-            continue;
-          }
-          
-          // Skip if already in UTC ISO format (ends with Z)
-          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(rawTs)) {
-            // Already in correct UTC ISO format, skip
-            continue;
-          }
-          
-          // Try to parse with explicit format hints
-          let parsed = null;
-          const formats = [
-            'YYYY-MM-DD HH:mm:ss',
-            'M/D/YYYY HH:mm:ss',
-            'M/D/YYYY h:mm:ss A',
-            'MM/DD/YYYY HH:mm:ss',
-            'MM/DD/YYYY hh:mm:ss A',
-          ];
-          
-          for (const fmt of formats) {
-            const attempt = dayjs.tz(rawTs, fmt, sourceTimezone);
-            if (attempt.isValid() && attempt.year() >= 2020 && attempt.year() <= new Date().getFullYear() + 1) {
-              parsed = attempt;
-              break;
-            }
-          }
-          
-          // Fallback: try timezone-aware parsing without format
-          if (!parsed) {
-            parsed = dayjs.tz(rawTs, sourceTimezone);
-          }
-          
-          if (parsed && parsed.isValid()) {
-            const utcIso = parsed.utc().toISOString();
-            // Only update if actually different
-            if (utcIso !== rawTs) {
-              updateStmt.run(utcIso, row.call_id);
-              batchUpdated++;
-              if (totalUpdated < 5) {
-                console.log(`[TIMEZONE FIX] ${row.call_id}: "${rawTs}" -> "${utcIso}"`);
-              }
-            }
-          } else {
-            batchErrors++;
-            if (batchErrors <= 3) {
-              console.warn(`[TIMEZONE FIX] Could not parse: "${rawTs}"`);
-            }
-          }
-        } catch (e) {
-          batchErrors++;
-          if (batchErrors <= 3) {
-            console.error(`[TIMEZONE FIX] Error processing row:`, e.message);
-          }
-        }
-      }
-      
-      totalProcessed += rows.length;
-      totalUpdated += batchUpdated;
-      totalErrors += batchErrors;
-      
-      console.log(`[TIMEZONE FIX] Batch ${batchCount} complete: ${batchUpdated} updated, ${batchErrors} errors. Total so far: ${totalUpdated}/${totalProcessed}`);
-      
-      if (!runAll) {
-        // Single batch mode
-        break;
-      }
-      
-      // Continue if there might be more rows
-      if (rows.length < batchSize) {
-        console.log(`[TIMEZONE FIX] Last batch was smaller than batch size, done`);
-        break;
-      }
-      
-    } while (runAll);
-    
-    console.log(`[TIMEZONE FIX] Complete: ${totalUpdated} rows updated out of ${totalProcessed} processed, ${totalErrors} errors, ${totalDeleted} deleted`);
-    
-    res.json({ 
-      success: true, 
-      processed: totalProcessed, 
-      updated: totalUpdated,
-      deleted: totalDeleted,
-      errors: totalErrors,
-      batches: batchCount,
-      message: `Deleted ${totalDeleted} invalid records. Converted ${totalUpdated} timestamps from ${sourceTimezone} to UTC across ${batchCount} batch(es)`
+
+    res.json({
+      success: true,
+      ...result,
+      legacyStats: legacy
     });
   } catch (e) {
-    console.error('[TIMEZONE FIX] Error:', e);
+    console.error('[TIMESTAMP FIX] Error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -413,37 +475,59 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, campaign, callType, ani, dnis, limit = 100, offset = 0, timezone: userTimezone } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
     start = cleanParam(start);
     end = cleanParam(end);
     agent = cleanParam(agent);
+    agentName = cleanParam(agentName);
+    agentSearchType = cleanParam(agentSearchType);
     campaign = cleanParam(campaign);
     callType = cleanParam(callType);
-    ani = cleanParam(ani);
-    dnis = cleanParam(dnis);
+    phone = cleanParam(phone);
+    callId = cleanParam(callId);
+    customerName = cleanParam(customerName);
+    afterCallWork = cleanParam(afterCallWork);
+    transfers = cleanParam(transfers);
+    conferences = cleanParam(conferences);
+    abandoned = cleanParam(abandoned);
+
+    if (typeof phone === 'string') phone = phone.trim();
+    if (typeof callId === 'string') callId = callId.trim();
+    if (typeof customerName === 'string') customerName = customerName.trim();
+    if (typeof afterCallWork === 'string') afterCallWork = afterCallWork.trim();
+    if (typeof agentName === 'string') agentName = agentName.trim();
+    if (typeof agentSearchType === 'string') agentSearchType = agentSearchType.trim().toLowerCase();
+    if (typeof transfers === 'string') transfers = transfers.trim();
+    if (typeof conferences === 'string') conferences = conferences.trim();
+    if (typeof abandoned === 'string') abandoned = abandoned.trim();
+    if (phone === '') phone = null;
+    if (callId === '') callId = null;
+    if (customerName === '') customerName = null;
+    if (afterCallWork === '') afterCallWork = null;
+    if (agentName === '') agentName = null;
+    if (agentSearchType === '') agentSearchType = null;
+    if (transfers === '') transfers = null;
+    if (conferences === '') conferences = null;
+    if (abandoned === '') abandoned = null;
     
-    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", campaign="${campaign}", callType="${callType}", ani="${ani}", dnis="${dnis}", limit=${limit}, offset=${offset}`);
+    if (!agentName && agent && agentSearchType === 'name') {
+      agentName = agent;
+      agent = null;
+    } else if (!agent && agentName && agentSearchType === 'email') {
+      agent = agentName;
+      agentName = null;
+    } else if (agent && !agentName && !agentSearchType && !/@/.test(agent)) {
+      agentName = agent;
+      agent = null;
+    }
+
+    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", agentName="${agentName}", agentSearchType="${agentSearchType}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
     
-    // Convert Five9 format to SQLite ISO format
-    // "Thu, 23 Oct 2025 12:47:37" -> "2025-10-23 12:47:37"
-    const five9ToISO = (dateStr) => {
-      if (!dateStr) return null;
-      try {
-        // Use dayjs to parse Five9 format and convert to ISO
-        const parsed = dayjs(dateStr, 'ddd, DD MMM YYYY HH:mm:ss');
-        if (!parsed.isValid()) return null;
-        return parsed.format('YYYY-MM-DD HH:mm:ss');
-      } catch (e) {
-        console.warn('[five9ToISO] Failed to parse:', dateStr, e.message);
-        return null;
-      }
-    };
-    
-    const startFormatted = five9ToISO(start);
-    const endFormatted = five9ToISO(end);
+    const startFormatted = normalizeReportTimestamp(start);
+    const endFormatted = normalizeReportTimestamp(end);
     
     if (startFormatted || endFormatted) {
       console.log(`[API /api/reports] Formatted for SQLite: start="${startFormatted}", end="${endFormatted}"`);
@@ -464,7 +548,64 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       console.warn('[API /api/reports] Debug query failed:', debugErr.message);
     }
     
-    const result = queryReports({ start: startFormatted, end: endFormatted, agent, campaign, callType, ani, dnis, limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 });
+    const appliedStart = startFormatted || null;
+    const appliedEnd = endFormatted || null;
+    const appliedLimit = Math.min(parseInt(limit,10)||100,500);
+    const appliedOffset = parseInt(offset,10)||0;
+
+    const parseInteger = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number.parseInt(value, 10);
+      return Number.isNaN(num) ? null : num;
+    };
+    const parseBinary = (value) => {
+      const num = parseInteger(value);
+      return (num === 0 || num === 1) ? num : null;
+    };
+
+    const afterCallWorkValue = parseInteger(afterCallWork);
+    const transfersValue = parseBinary(transfers);
+    const conferencesValue = parseBinary(conferences);
+    const abandonedValue = parseBinary(abandoned);
+
+    const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const result = queryReports({
+      start: appliedStart,
+      end: appliedEnd,
+      agent,
+      agentName,
+      campaign,
+      callType,
+      phone,
+      callId,
+      customerName,
+      afterCallWork: afterCallWorkValue,
+      transfers: transfersValue,
+      conferences: conferencesValue,
+      abandoned: abandonedValue,
+      limit: appliedLimit,
+      offset: appliedOffset,
+      sort: sortDir
+    });
+      const hydratedRows = hydrateReportRows(result.rows);
+      const returnedRange = hydratedRows && hydratedRows.length ? (
+        sortDir === 'asc'
+          ? { min: hydratedRows[0].timestamp || null, max: hydratedRows[hydratedRows.length - 1].timestamp || null }
+          : { max: hydratedRows[0].timestamp || null, min: hydratedRows[hydratedRows.length - 1].timestamp || null }
+      ) : { max: null, min: null };
+    console.log(`[API /api/reports] Applied range: start="${appliedStart}" end="${appliedEnd}" limit=${appliedLimit} offset=${appliedOffset} sort=${sortDir}`);
+    console.log(`[API /api/reports] Returned range: min="${returnedRange.min}" max="${returnedRange.max}" total=${result.total}`);
+
+    let legacyStats = null;
+    if (/^true$/i.test(process.env.REPORT_TIME_DEBUG || '')) {
+      legacyStats = getLegacyReportTimestampStats(5);
+      console.log(`[API /api/reports] Legacy timestamp rows remaining=${legacyStats.total}`);
+      if (legacyStats.total && legacyStats.samples?.length) {
+        legacyStats.samples.forEach((sample, idx) => {
+          console.log(`   [legacy ${idx + 1}] call_id=${sample.call_id} timestamp="${sample.timestamp}"`);
+        });
+      }
+    }
     try {
       logAuditEvent(
         req.user.id,
@@ -480,22 +621,212 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
             start: start || null,
             end: end || null,
             agent: agent || null,
+            agentName: agentName || null,
+            agentSearchType: agentSearchType || null,
             campaign: campaign || null,
             callType: callType || null,
-            ani: ani || null,
-            dnis: dnis || null
+            phone: phone || null
           },
-          pagination: { limit: Math.min(parseInt(limit,10)||100,500), offset: parseInt(offset,10)||0 },
-          returned: result.rows ? result.rows.length : 0,
-          total: result.total || 0
+          pagination: { limit: appliedLimit, offset: appliedOffset, sort: sortDir },
+                    returned: hydratedRows ? hydratedRows.length : 0,
+          total: result.total || 0,
+          appliedRange: { start: appliedStart, end: appliedEnd },
+          returnedRange,
+          legacyTotal: legacyStats ? legacyStats.total : undefined
         }
       );
     } catch (e) {
       console.warn('REPORT_VIEW audit log failed:', e.message);
     }
-    res.json({ success: true, ...result });
+      const responsePayload = {
+        success: true,
+        ...result,
+        rows: hydratedRows,
+        sort: sortDir,
+        appliedRange: { start: appliedStart, end: appliedEnd },
+        returnedRange
+      };
+    if (legacyStats) responsePayload.legacyStats = legacyStats;
+    res.json(responsePayload);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, sort } = req.query;
+
+    const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
+    start = cleanParam(start);
+    end = cleanParam(end);
+    agent = cleanParam(agent);
+    agentName = cleanParam(agentName);
+    agentSearchType = cleanParam(agentSearchType);
+    campaign = cleanParam(campaign);
+    callType = cleanParam(callType);
+    phone = cleanParam(phone);
+    callId = cleanParam(callId);
+    customerName = cleanParam(customerName);
+    afterCallWork = cleanParam(afterCallWork);
+    transfers = cleanParam(transfers);
+    conferences = cleanParam(conferences);
+    abandoned = cleanParam(abandoned);
+
+    if (typeof phone === 'string') phone = phone.trim();
+    if (typeof callId === 'string') callId = callId.trim();
+    if (typeof customerName === 'string') customerName = customerName.trim();
+    if (typeof agentName === 'string') agentName = agentName.trim();
+    if (typeof agentSearchType === 'string') agentSearchType = agentSearchType.trim().toLowerCase();
+    if (typeof afterCallWork === 'string') afterCallWork = afterCallWork.trim();
+    if (typeof transfers === 'string') transfers = transfers.trim();
+    if (typeof conferences === 'string') conferences = conferences.trim();
+    if (typeof abandoned === 'string') abandoned = abandoned.trim();
+    if (phone === '') phone = null;
+    if (callId === '') callId = null;
+    if (customerName === '') customerName = null;
+    if (agentName === '') agentName = null;
+    if (agentSearchType === '') agentSearchType = null;
+        if (!agentName && agent && agentSearchType === 'name') {
+          agentName = agent;
+          agent = null;
+        } else if (!agent && agentName && agentSearchType === 'email') {
+          agent = agentName;
+          agentName = null;
+        } else if (agent && !agentName && !agentSearchType && !/@/.test(agent)) {
+          agentName = agent;
+          agent = null;
+        }
+    if (afterCallWork === '') afterCallWork = null;
+    if (transfers === '') transfers = null;
+    if (conferences === '') conferences = null;
+    if (abandoned === '') abandoned = null;
+
+    const startFormatted = normalizeReportTimestamp(start);
+    const endFormatted = normalizeReportTimestamp(end);
+
+    const parseInteger = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number.parseInt(value, 10);
+      return Number.isNaN(num) ? null : num;
+    };
+    const parseBinary = (value) => {
+      const num = parseInteger(value);
+      return (num === 0 || num === 1) ? num : null;
+    };
+
+    const afterCallWorkValue = parseInteger(afterCallWork);
+    const transfersValue = parseBinary(transfers);
+    const conferencesValue = parseBinary(conferences);
+    const abandonedValue = parseBinary(abandoned);
+
+    const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const exportResult = exportReports({
+      start: startFormatted || null,
+      end: endFormatted || null,
+      agent,
+      agentName,
+      campaign,
+      callType,
+      phone,
+      callId,
+      customerName,
+      afterCallWork: afterCallWorkValue,
+      transfers: transfersValue,
+      conferences: conferencesValue,
+      abandoned: abandonedValue,
+      sort: sortDir
+    });
+
+    if (exportResult.error) {
+      throw new Error(exportResult.error);
+    }
+
+    if (exportResult.truncated) {
+      return res.status(400).json({
+        error: `Too many matching report rows (${exportResult.total}). Narrow your filters to export fewer than ${exportResult.maxRows} rows.`,
+        total: exportResult.total,
+        maxRows: exportResult.maxRows
+      });
+    }
+
+    const hydratedRows = hydrateReportRows(exportResult.rows);
+    const nowIso = new Date().toISOString().replace(/[:]/g, '-');
+
+    const csv = buildCsv(hydratedRows, [
+      { key: 'call_id', header: 'call_id' },
+      { key: 'timestamp', header: 'timestamp' },
+      { key: 'campaign', header: 'campaign' },
+      { key: 'call_type', header: 'call_type' },
+      { key: 'agent', header: 'agent' },
+      { key: 'agent_name', header: 'agent_name' },
+      { key: 'customer_name', header: 'customer_name' },
+      { key: 'disposition', header: 'disposition' },
+      { key: 'ani', header: 'ani' },
+      { key: 'dnis', header: 'dnis' },
+      { key: 'talk_time', header: 'talk_time' },
+      { key: 'hold_time', header: 'hold_time' },
+      { key: 'queue_wait_time', header: 'queue_wait_time' },
+      { key: 'ring_time', header: 'ring_time' },
+      { key: 'ivr_time', header: 'ivr_time' },
+      { key: 'park_time', header: 'park_time' },
+      { key: 'after_call_work_time', header: 'after_call_work_time' },
+      { key: 'call_time', header: 'call_time' },
+      { key: 'bill_time_rounded', header: 'bill_time_rounded' },
+      { key: 'transfers', header: 'transfers' },
+      { key: 'conferences', header: 'conferences' },
+      { key: 'holds', header: 'holds' },
+      { key: 'abandoned', header: 'abandoned' },
+      { key: 'cost', header: 'cost' },
+      { key: 'recordings', header: 'recordings' },
+      { key: 'hasRecording', header: 'has_recording', accessor: (row) => row?.hasRecording ? '1' : '0' }
+    ]);
+
+    try {
+      logAuditEvent(
+        req.user.id,
+        req.user.email,
+        'REPORT_DOWNLOAD',
+        null,
+        null,
+        req.user.ipAddress,
+        req.user.userAgent,
+        req.currentSessionId || null,
+        {
+          report: 'five9_reports',
+          filters: {
+            start: start || null,
+            end: end || null,
+            agent: agent || null,
+            agentName: agentName || null,
+            agentSearchType: agentSearchType || null,
+            agentName: agentName || null,
+            campaign: campaign || null,
+            callType: callType || null,
+            phone: phone || null,
+            callId: callId || null,
+            customerName: customerName || null,
+            afterCallWorkMin: afterCallWorkValue,
+            transfers: transfersValue,
+            conferences: conferencesValue,
+            abandoned: abandonedValue
+          },
+          exported: hydratedRows.length,
+          total: exportResult.total,
+          sort: sortDir
+        }
+      );
+    } catch (auditErr) {
+      console.warn('REPORT_DOWNLOAD audit log failed:', auditErr.message);
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="five9-reports-${nowIso}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('Error exporting reports:', err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -538,7 +869,11 @@ app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, (req, 
 // Public endpoint to get client configuration
 app.get('/api/config', (req, res) => {
   res.json({
-    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY
+    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+    allowedLoginConfig: {
+      allowAll: allowedLoginConfig.allowAll,
+      entries: Array.isArray(allowedLoginConfig.entries) ? [...allowedLoginConfig.entries] : []
+    }
   });
 });
 
@@ -858,8 +1193,10 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
       clearTimeout(tHandle);
       const s3FetchTime = Date.now() - s3StartTime;
       console.log(`📦 [S3 FETCH][${requestId}] Retrieved file in ${s3FetchTime}ms size=${originalResponse.ContentLength || 'unknown'} timeoutMs=${timeoutMs}`);
+      recordS3Success();
     } catch (e) {
       console.error(`❌ [S3 FETCH FAIL][${requestId}] ${e.name||''} ${e.message}`);
+      recordS3Failure(`${e.name || 'Error'} ${e.message}`.trim());
       return res.status(404).json({ error: 'Original file not found', detail: e.message });
     }
 

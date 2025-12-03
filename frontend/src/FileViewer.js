@@ -29,6 +29,8 @@ import {
   Button,
   Alert,
   Slider,
+  ToggleButton,
+  ToggleButtonGroup,
 } from "@mui/material";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import PauseIcon from "@mui/icons-material/Pause";
@@ -72,6 +74,7 @@ function formatDuration(ms) {
 const DATE_PARAM_FORMATS = ['M_D_YYYY', 'M-D-YYYY', 'MM-DD-YYYY', 'YYYY-MM-DD', 'M/D/YYYY', 'MM/DD/YYYY'];
 const TIME_PARAM_FORMATS = ['h:mm A', 'hh:mm A', 'H:mm', 'HH:mm'];
 const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId']);
+const PLAYBACK_RATE_OPTIONS = [0.5, 1, 1.25, 1.5, 2];
 
 // Normalize phone filters so pasted formatting characters do not affect matching
 const stripPhoneFormatting = (input) => {
@@ -115,6 +118,7 @@ function FileViewer({ darkMode }) {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(0.5); // Default volume 50%
+  const [playbackRate, setPlaybackRate] = useState(1);
   const [waveformData, setWaveformData] = useState(null); // Audio waveform data
   const [isGeneratingWaveform, setIsGeneratingWaveform] = useState(false);
 
@@ -163,9 +167,9 @@ function FileViewer({ darkMode }) {
       ? emailValue
       : userEmail; // Only members are restricted to their own files
 
-  const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
-  const phoneValueRaw = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
-  const normalizedPhoneValue = stripPhoneFormatting(phoneValueRaw);
+    const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
+    const phoneValueRaw = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
+    const normalizedPhoneValue = stripPhoneFormatting(phoneValueRaw);
     const currentTimeMode = customTimeMode !== null ? customTimeMode : timeMode;
     const startTime = customTimePickerStart !== null ? customTimePickerStart : timePickerStart;
     const endTime = customTimePickerEnd !== null ? customTimePickerEnd : timePickerEnd;
@@ -665,8 +669,9 @@ function FileViewer({ darkMode }) {
         setWaveformData(null);
       });
 
-      // OPTIMIZATION 2: Set volume immediately
-      audio.volume = volume;
+  // OPTIMIZATION 2: Set volume and playback rate immediately
+  audio.volume = volume;
+  audio.playbackRate = playbackRate;
       
       // OPTIMIZATION 3: Start UI updates immediately (optimistic)
       setCurrentTrack(filename);
@@ -794,6 +799,16 @@ function FileViewer({ darkMode }) {
     setVolume(newVolume);
     if (playing) {
       playing.volume = newVolume;
+    }
+  };
+
+  const handlePlaybackRateChange = (_, newRate) => {
+    if (newRate == null) return;
+    const normalizedRate = Number(newRate);
+    if (!Number.isFinite(normalizedRate)) return;
+    setPlaybackRate(normalizedRate);
+    if (playing) {
+      playing.playbackRate = normalizedRate;
     }
   };
 
@@ -1159,23 +1174,41 @@ function FileViewer({ darkMode }) {
                   </IconButton>
                 </Box>
                 
-                <Box sx={{ display: 'flex', alignItems: 'center', minWidth: 120 }}>
-                  <VolumeUpIcon fontSize="small" sx={{ mr: 1, opacity: 0.7 }} />
-                  <Slider
-                    size="small"
-                    value={volume}
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    onChange={(_, newValue) => handleVolumeChange(newValue)}
-                    sx={{ 
-                      width: 80,
-                      '& .MuiSlider-thumb': {
-                        width: 12,
-                        height: 12,
-                      }
-                    }}
-                  />
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', minWidth: 120 }}>
+                    <VolumeUpIcon fontSize="small" sx={{ mr: 1, opacity: 0.7 }} />
+                    <Slider
+                      size="small"
+                      value={volume}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      onChange={(_, newValue) => handleVolumeChange(newValue)}
+                      sx={{ 
+                        width: 80,
+                        '& .MuiSlider-thumb': {
+                          width: 12,
+                          height: 12,
+                        }
+                      }}
+                    />
+                  </Box>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Typography variant="caption" sx={{ opacity: 0.7 }}>Speed</Typography>
+                    <ToggleButtonGroup
+                      size="small"
+                      value={playbackRate}
+                      exclusive
+                      onChange={handlePlaybackRateChange}
+                      aria-label="Playback speed"
+                    >
+                      {PLAYBACK_RATE_OPTIONS.map((rate) => (
+                        <ToggleButton key={rate} value={rate} aria-label={`playback-${rate}`} sx={{ px: 1.25 }}>
+                          {rate === 0.5 ? '.5x' : `${rate}x`}
+                        </ToggleButton>
+                      ))}
+                    </ToggleButtonGroup>
+                  </Box>
                 </Box>
               </Box>
               

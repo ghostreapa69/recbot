@@ -99,7 +99,9 @@ SFTP_PASS=your_sftp_password
 
 CLERK_PUBLISHABLE_KEY=your_clerk_publishable_key
 CLERK_SECRET_KEY=your_clerk_secret_key
-ALLOWED_EMAIL_DOMAIN=yourcompany.com
+# Comma-separated domains or exact email addresses (e.g. company.com,@partners.io,admin@vendor.com)
+ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com
+REACT_APP_ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com
 MAX_SESSION_HOURS=4
 MAX_INACTIVITY_MINUTES=30
 
@@ -210,7 +212,7 @@ Supports HTTP Range requests for audio seeking.
 ### Authentication Setup (Clerk)
 
 1. Create a Clerk application → obtain Publishable & Secret keys.
-2. Configure allowed email domain restriction (or enforce in middleware with ALLOWED_EMAIL_DOMAIN).
+2. Configure allowed email/domain allowlist (or enforce in middleware with ALLOWED_LOGIN_IDENTIFIERS).
 3. Add keys to environment (.env or container env vars).
 4. Deploy – frontend uses Clerk React SDK; backend validates JWT / session via Clerk middleware.
 
