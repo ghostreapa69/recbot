@@ -32,6 +32,10 @@ REACT_APP_CLERK_PUBLISHABLE_KEY=pk_test_your_actual_key_here
 
 # Backend Clerk Configuration  
 CLERK_SECRET_KEY=sk_test_your_actual_secret_key_here
+ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com,admin@partner.com
+
+# Frontend allowlist fallback (optional if backend provides runtime config)
+REACT_APP_ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com,admin@partner.com
 
 # Your existing AWS and other configs...
 STORAGE_TYPE=aws

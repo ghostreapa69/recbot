@@ -22,7 +22,7 @@ import http from 'http';
 import https from 'https';
 import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
-import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin } from './auth.js';
+import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig } from './auth.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(isSameOrBefore);
@@ -869,7 +869,11 @@ app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, (req, 
 // Public endpoint to get client configuration
 app.get('/api/config', (req, res) => {
   res.json({
-    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY
+    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+    allowedLoginConfig: {
+      allowAll: allowedLoginConfig.allowAll,
+      entries: Array.isArray(allowedLoginConfig.entries) ? [...allowedLoginConfig.entries] : []
+    }
   });
 });
 

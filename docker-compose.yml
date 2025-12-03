@@ -33,8 +33,9 @@ services:
       # --- Clerk Authentication ---
       - CLERK_PUBLISHABLE_KEY=pk_test_your_clerk_publishable_key_here
       - CLERK_SECRET_KEY=sk_test_your_clerk_secret_key_here
-      - ALLOWED_EMAIL_DOMAIN=mtgpros.com
+      - ALLOWED_LOGIN_IDENTIFIERS=mtgpros.com
       - REACT_APP_CLERK_PUBLISHABLE_KEY=pk_test_your_clerk_publishable_key_here
+      - REACT_APP_ALLOWED_LOGIN_IDENTIFIERS=mtgpros.com
 
       # --- Session & Security Controls ---
       - MAX_SESSION_HOURS=4

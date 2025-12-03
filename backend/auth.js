@@ -12,6 +12,68 @@ if (!process.env.CLERK_PUBLISHABLE_KEY) {
   process.exit(1);
 }
 
+const DEFAULT_ALLOWED_LOGIN_IDENTIFIERS = ['mtgpros.com'];
+
+function parseAllowedLoginIdentifiers(rawValue, fallbackList = DEFAULT_ALLOWED_LOGIN_IDENTIFIERS) {
+  const hasRawValue = typeof rawValue === 'string' && rawValue.trim().length > 0;
+  const baseValue = hasRawValue
+    ? rawValue
+    : (Array.isArray(fallbackList) && fallbackList.length ? fallbackList.join(',') : '');
+
+  if (!baseValue) {
+    return { allowAll: false, entries: [] };
+  }
+
+  const tokens = baseValue
+    .split(',')
+    .map(part => (typeof part === 'string' ? part.trim().toLowerCase() : ''))
+    .filter(Boolean);
+
+  const allowAll = tokens.includes('*');
+  const entries = allowAll ? tokens.filter(token => token !== '*') : tokens;
+
+  return { allowAll, entries: Array.from(new Set(entries)) };
+}
+
+const rawAllowedLoginValue = process.env.ALLOWED_LOGIN_IDENTIFIERS ?? process.env.ALLOWED_EMAIL_DOMAIN ?? '';
+const parsedAllowedLoginConfig = parseAllowedLoginIdentifiers(rawAllowedLoginValue);
+
+export const allowedLoginConfig = Object.freeze({
+  allowAll: parsedAllowedLoginConfig.allowAll,
+  entries: Object.freeze(parsedAllowedLoginConfig.entries)
+});
+
+if (!allowedLoginConfig.allowAll && allowedLoginConfig.entries.length === 0) {
+  console.warn('⚠️  [AUTH CONFIG] No allowed login identifiers configured; all sign-ins will be rejected.');
+}
+
+console.log(
+  `[AUTH CONFIG] Allowed login identifiers: ${
+    allowedLoginConfig.allowAll
+      ? '* (all verified emails permitted)'
+      : allowedLoginConfig.entries.join(', ') || '(none)'
+  }`
+);
+
+const matchesAllowedIdentifier = (email, identifier) => {
+  if (!email || !identifier) return false;
+  if (!identifier.includes('@')) {
+    return email.endsWith(`@${identifier}`);
+  }
+  if (identifier.startsWith('@') && identifier.indexOf('@', 1) === -1) {
+    return email.endsWith(identifier);
+  }
+  return email === identifier;
+};
+
+export const isEmailAllowed = (email) => {
+  if (!email) return false;
+  const normalized = email.toLowerCase();
+  if (allowedLoginConfig.allowAll) return true;
+  if (!allowedLoginConfig.entries.length) return false;
+  return allowedLoginConfig.entries.some(identifier => matchesAllowedIdentifier(normalized, identifier));
+};
+
 // Export the Clerk middleware for use in Express
 export const clerkAuth = clerkMiddleware({
   publishableKey: process.env.CLERK_PUBLISHABLE_KEY,
@@ -37,13 +99,13 @@ export const requireAuth = async (req, res, next) => {
     const primaryEmailAddress = user.emailAddresses?.find(email => email.id === user.primaryEmailAddressId);
     const userEmail = primaryEmailAddress?.emailAddress;
     const isEmailVerified = primaryEmailAddress?.verification?.status === 'verified';
-    
-    // DOMAIN RESTRICTION: Only allow @mtgpros.com domain
-    if (!userEmail || !userEmail.endsWith('@mtgpros.com')) {
-      console.log(`🚫 [DOMAIN ACCESS DENIED] User ${userEmail} attempted access - not @mtgpros.com domain`);
+
+    if (!isEmailAllowed(userEmail)) {
+      const attemptedEmail = userEmail || '<missing email>';
+      console.log(`🚫 [AUTH ACCESS DENIED] User ${attemptedEmail} attempted access - not on allowed login list`);
       return res.status(403).json({ 
         error: 'Access denied', 
-        message: 'Access is restricted to @mtgpros.com email addresses only' 
+        message: 'Your email address is not authorized to access this application.' 
       });
     }
     
@@ -56,7 +118,7 @@ export const requireAuth = async (req, res, next) => {
       });
     }
     
-    console.log(`✅ [DOMAIN ACCESS] User ${userEmail} granted access (@mtgpros.com domain, verified)`);
+    console.log(`✅ [AUTH ACCESS] User ${userEmail} granted access (allowlist match, verified)`);
 
     // Get client IP and user agent for audit logging
     const ipAddress = req.realClientIP || req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
