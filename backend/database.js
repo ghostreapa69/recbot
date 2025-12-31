@@ -31,6 +31,9 @@ export function normalizeReportTimestamp(raw) {
   if (!trimmed) return null;
 
   const formatUtc = (dt) => dt && dt.isValid() ? dt.utc().format(REPORT_TIMESTAMP_FORMAT) : null;
+  
+  // Debug logging
+  if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Parsing timestamp="${trimmed}" with REPORT_TIMEZONE="${REPORT_TIMEZONE}"`);
 
   try {
     // Already ISO-style string (contains T) – normalize and force UTC with Z suffix
@@ -63,15 +66,41 @@ export function normalizeReportTimestamp(raw) {
 
     // Five9 CSV export format "Tue, 25 Nov 2025 09:55:01" – interpret using configured timezone
     // Allow single-digit days in the Five9 export (e.g., "Mon, 1 Dec ...") by using D instead of DD
+    // CRITICAL: We must parse with customParseFormat AND timezone together
     const parsedFive9 = dayjs.tz(trimmed, 'ddd, D MMM YYYY HH:mm:ss', REPORT_TIMEZONE);
-    const normalizedFive9 = formatUtc(parsedFive9);
-    if (normalizedFive9) {
-      if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Five9 parse raw="${trimmed}" tz=${REPORT_TIMEZONE} -> "${normalizedFive9}"`);
-      return normalizedFive9;
+    if (REPORT_TIME_DEBUG) {
+      console.log(`[REPORT_TIME] Five9 format parse: isValid=${parsedFive9.isValid()}, value=${parsedFive9.format()}, utc=${parsedFive9.utc().format()}, offset=${parsedFive9.utcOffset()}`);
+    }
+    if (parsedFive9.isValid() && parsedFive9.year() > 2000) {
+      const normalizedFive9 = formatUtc(parsedFive9);
+      if (normalizedFive9) {
+        if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Five9 parse SUCCESS raw="${trimmed}" tz=${REPORT_TIMEZONE} -> "${normalizedFive9}"`);
+        return normalizedFive9;
+      }
+    } else if (REPORT_TIME_DEBUG) {
+      console.log(`[REPORT_TIME] Five9 parse FAILED for raw="${trimmed}" with format 'ddd, D MMM YYYY HH:mm:ss' and tz=${REPORT_TIMEZONE}`);
     }
 
-    // Fallback: let dayjs try its best; still coerce to UTC if valid
+    // Fallback: let dayjs try its best; BUT interpret as REPORT_TIMEZONE first, not UTC
+    const fallbackWithTz = dayjs.tz(trimmed, REPORT_TIMEZONE);
+    if (REPORT_TIME_DEBUG) {
+      console.log(`[REPORT_TIME] Fallback with tz: isValid=${fallbackWithTz.isValid()}, value=${fallbackWithTz.format()}, utc=${fallbackWithTz.utc().format()}`);
+    }
+    if (fallbackWithTz.isValid()) {
+      const normalized = formatUtc(fallbackWithTz);
+      if (normalized) {
+        if (REPORT_TIME_DEBUG) console.log(`[REPORT_TIME] Fallback with tz parse SUCCESS raw="${trimmed}" -> "${normalized}"`);
+        return normalized;
+      }
+    }
+    
+    // Last resort: let dayjs parse without timezone context
     const fallback = formatUtc(dayjs(trimmed));
+    if (REPORT_TIME_DEBUG && fallback) {
+      console.log(`[REPORT_TIME] Last resort parse raw="${trimmed}" -> "${fallback}" (WARNING: no timezone applied)`);
+    } else if (REPORT_TIME_DEBUG) {
+      console.log(`[REPORT_TIME] All parsing failed for raw="${trimmed}"`);
+    }
     if (REPORT_TIME_DEBUG && fallback) {
       console.log(`[REPORT_TIME] Fallback parse raw="${trimmed}" -> "${fallback}"`);
     } else if (REPORT_TIME_DEBUG) {
@@ -214,50 +243,6 @@ try {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_reporting_campaign ON reporting(campaign);`);
 } catch (e) {
   console.warn('⚠️  [MIGRATION] reporting index creation issue:', e.message);
-}
-
-// Migration: Normalize legacy Five9 timestamps to UTC ISO once on startup (batch processing)
-try {
-  const selectLegacy = db.prepare(`
-    SELECT call_id, timestamp FROM reporting
-    WHERE timestamp IS NOT NULL
-      AND timestamp NOT GLOB '${ISO_TIMESTAMP_GLOB}'
-    LIMIT ?
-  `);
-  const updateLegacy = db.prepare(`UPDATE reporting SET timestamp = ? WHERE call_id = ?`);
-  const batchSize = parseInt(process.env.REPORTING_TIMESTAMP_MIGRATION_BATCH || '1000', 10);
-
-  let totalConverted = 0;
-  while (true) {
-    const batch = selectLegacy.all(batchSize);
-    if (!batch.length) break;
-    const convertedThisBatch = db.transaction((rows) => {
-      let converted = 0;
-      for (const row of rows) {
-        const normalized = normalizeReportTimestamp(row.timestamp);
-        if (normalized && normalized !== row.timestamp) {
-          updateLegacy.run(normalized, row.call_id);
-          converted++;
-        }
-      }
-      return converted;
-    })(batch);
-    totalConverted += convertedThisBatch;
-    if (batch.length < batchSize) break;
-    if (!convertedThisBatch) break;
-  }
-  if (totalConverted) {
-    console.log(`🛠️  [MIGRATION] Normalized ${totalConverted} reporting timestamps to UTC ISO format`);
-  }
-  const remaining = getLegacyReportTimestampStats(5);
-  if (remaining.total > 0) {
-    console.warn(`⚠️  [MIGRATION] ${remaining.total} reporting rows still carry non-ISO timestamps (showing up to 5 samples).`);
-    remaining.samples.forEach((row, idx) => {
-      console.warn(`   [${idx + 1}] call_id=${row.call_id} timestamp="${row.timestamp}"`);
-    });
-  }
-} catch (e) {
-  console.warn('⚠️  [MIGRATION] reporting timestamp normalization issue:', e.message);
 }
 
 // Create audit logging tables

@@ -19,8 +19,8 @@ const FIVE9_PASSWORD = process.env.FIVE9_PASSWORD;
 // Default Five9 API version updated to 9.5 per specification
 const FIVE9_VERSION = process.env.FIVE9_WSDL_VERSION || '9.5';
 const FIVE9_BASE = process.env.FIVE9_BASE || 'https://api.five9.com/wsadmin';
-// Timezone for Five9 report timestamps (defaults to America/New_York, adjust as needed)
-const FIVE9_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/New_York';
+// Timezone for Five9 report timestamps (defaults to America/Los_Angeles, adjust as needed)
+const FIVE9_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
 const REPORT_TIME_DEBUG = /^true$/i.test(process.env.REPORT_TIME_DEBUG || '');
 
 function parsePositiveInt(value, fallback) {

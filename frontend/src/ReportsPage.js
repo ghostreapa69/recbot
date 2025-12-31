@@ -510,12 +510,14 @@ export default function ReportsPage(){
             label="Start Date/Time" 
             value={startDate} 
             onChange={(newValue) => setStartDate(newValue)}
+            ampm={false}
             slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
           />
           <DateTimePicker 
             label="End Date/Time" 
             value={endDate} 
             onChange={(newValue) => setEndDate(newValue)}
+            ampm={false}
             slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
           />
           <TextField label="Agent" value={agentInput} onChange={e=>setAgentInput(e.target.value)} size="small" />

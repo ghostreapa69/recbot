@@ -44,8 +44,10 @@ services:
 
       # --- Frontend Runtime Config (if SPA served separately) ---
       - REACT_APP_API_URL=https://your-domain-here/api
+      - FIVE9_TIMEZONE=America/Los_Angeles
       - REACT_APP_FIVE9_TIMEZONE=America/Los_Angeles
       - FIVE9_AUTO_INGEST_MINUTES=5
+      - REPORT_TIME_DEBUG=true
 
       # --- Optional / Feature Flags ---
       - ENABLE_SFTP=false
