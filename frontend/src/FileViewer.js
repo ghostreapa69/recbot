@@ -59,6 +59,7 @@ function normalizeFile(rec) {
     email: rec.email || '',
     time: rec.time || '',
     callId: rec.callId || '',
+    callDisposition: rec.callDisposition || '',
     durationMs: rec.durationMs || 0,
     size: rec.size || 0
   };
@@ -73,7 +74,7 @@ function formatDuration(ms) {
 
 const DATE_PARAM_FORMATS = ['M_D_YYYY', 'M-D-YYYY', 'MM-DD-YYYY', 'YYYY-MM-DD', 'M/D/YYYY', 'MM/DD/YYYY'];
 const TIME_PARAM_FORMATS = ['h:mm A', 'hh:mm A', 'H:mm', 'HH:mm'];
-const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId']);
+const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId', 'callDisposition']);
 const PLAYBACK_RATE_OPTIONS = [0.5, 1, 1.25, 1.5, 2];
 
 // Normalize phone filters so pasted formatting characters do not affect matching
@@ -134,6 +135,8 @@ function FileViewer({ darkMode }) {
   // Removed durationMode; durationMin now always interpreted as minutes
   const [timeMode, setTimeMode] = useState("range");
   const [callIdFilter, setCallIdFilter] = useState("");
+  const [dispositionFilter, setDispositionFilter] = useState("");
+  const [fileDispositions, setFileDispositions] = useState([]);
   const callIdDebounceRef = React.useRef(null);
   const applyingUrlParamsRef = React.useRef(false);
   const [error500, setError500] = useState(false);
@@ -151,7 +154,7 @@ function FileViewer({ darkMode }) {
   const userEmail = user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
 
   // Fetch files only when a date is selected or changed
-  const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null) => {
+  const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null, customDisposition = null) => {
     if (!start) return;
     setLoading(true);
     setError500(false);
@@ -193,6 +196,11 @@ function FileViewer({ darkMode }) {
       url += `&email=${encodeURIComponent(effectiveEmailFilter)}`;
     }
     
+    const dispositionValue = customDisposition !== null ? customDisposition : dispositionFilter;
+    if (dispositionValue) {
+      url += `&callDisposition=${encodeURIComponent(dispositionValue)}`;
+    }
+
     if (currentTimeMode === "range") {
       if (startTime) url += `&timeStart=${encodeURIComponent(dayjs(startTime).format("h:mm A"))}`;
       if (endTime) url += `&timeEnd=${encodeURIComponent(dayjs(endTime).format("h:mm A"))}`;
@@ -232,6 +240,21 @@ function FileViewer({ darkMode }) {
     const newOffset = reset ? 0 : currentOffset;
     fetchFiles(calendarDateStart, calendarDateEnd, newOffset);
   };
+
+  // Fetch file disposition values for the filter dropdown
+  useEffect(() => {
+    if (!isLoaded) return;
+    (async () => {
+      try {
+        const token = await getToken();
+        const res = await fetch('/api/wav-files/meta', { headers: { 'Authorization': `Bearer ${token}` } });
+        const json = await res.json();
+        setFileDispositions(json.dispositions || []);
+      } catch (e) {
+        console.warn('Failed to fetch file dispositions:', e.message);
+      }
+    })();
+  }, [isLoaded, getToken]);
 
   // Debounced fetch when callIdFilter changes (consistent auto behavior)
   useEffect(() => {
@@ -1332,6 +1355,25 @@ function FileViewer({ darkMode }) {
           </Grid>
         </Grid>
         <Grid container spacing={2} mb={2}>
+          <Grid item xs={12} md={3}>
+            <FormControl fullWidth size="small" sx={{ minWidth: 200 }}>
+              <InputLabel id="file-disposition-label">Disposition</InputLabel>
+              <Select
+                labelId="file-disposition-label"
+                value={dispositionFilter}
+                label="Disposition"
+                onChange={(e) => {
+                  setDispositionFilter(e.target.value);
+                  if (calendarDateStart) {
+                    fetchFiles(calendarDateStart, calendarDateEnd, 0, filesPerPage, null, null, null, null, null, null, null, null, null, e.target.value);
+                  }
+                }}
+              >
+                <MenuItem value=""><em>All</em></MenuItem>
+                {fileDispositions.map(d => <MenuItem key={d} value={d}>{d}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Grid>
           <Grid item xs={6} md={3}>
             <TimePicker
               label="Start Time"
@@ -1461,6 +1503,15 @@ function FileViewer({ darkMode }) {
                         Duration
                       </TableSortLabel>
                     </TableCell>
+                    <TableCell>
+                      <TableSortLabel
+                        active={sortColumn === 'callDisposition'}
+                        direction={sortColumn === 'callDisposition' ? sortDirection : 'asc'}
+                        onClick={() => handleSort('callDisposition')}
+                      >
+                        Disposition
+                      </TableSortLabel>
+                    </TableCell>
                     <TableCell align="center">Actions</TableCell>
                   </TableRow>
                 </TableHead>
@@ -1473,6 +1524,7 @@ function FileViewer({ darkMode }) {
                       <TableCell>{fileInfo.phone}</TableCell>
                       <TableCell>{fileInfo.email}</TableCell>
                       <TableCell>{formatDuration(fileInfo.durationMs)}</TableCell>
+                      <TableCell>{fileInfo.callDisposition || '-'}</TableCell>
                       <TableCell align="center">
                         <IconButton 
                           color="primary" 

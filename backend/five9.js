@@ -390,7 +390,7 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
     }
   }
   
-  const inserted = bulkUpsertReports(rows);
+  const inserted = await bulkUpsertReports(rows);
   console.log(`🗂️  [Five9] Upserted ${inserted}/${rows.length} rows into reporting`);
   
   // Log timestamp samples from Five9 (stored as-is)
@@ -407,7 +407,7 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
     }
   }
   if (auditUser) {
-    try { logAuditEvent(auditUser.id, auditUser.email, 'REPORT_INGEST', null, null, auditUser.ipAddress, auditUser.userAgent, null, { inserted, total: rows.length }); } catch {}
+    try { await logAuditEvent(auditUser.id, auditUser.email, 'REPORT_INGEST', null, null, auditUser.ipAddress, auditUser.userAgent, null, { inserted, total: rows.length }); } catch {}
   }
   // Attempt logout / session close (best-effort)
   try {

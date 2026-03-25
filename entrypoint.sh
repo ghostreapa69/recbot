@@ -57,8 +57,54 @@ if [ "$ENABLE_SFTP" = "true" ] && [ "$STORAGE_TYPE" = "b2" ] && [ -n "$SFTP_USER
   rclone serve sftp b2remote:$B2_BUCKET --addr :2222 --config /root/.config/rclone/rclone.conf --user $SFTP_USER --pass $SFTP_PASS &
 fi
 
-# Create database directory
-mkdir -p /root/db
+# Wait for PostgreSQL to be ready (if DB_HOST is set)
+if [ -n "$DB_HOST" ]; then
+  echo "Waiting for PostgreSQL at $DB_HOST:${DB_PORT:-5432}..."
+  MAX_RETRIES=30
+  RETRY_COUNT=0
+  until node -e "
+    const net = require('net');
+    const sock = new net.Socket();
+    sock.setTimeout(2000);
+    sock.on('connect', () => { sock.destroy(); process.exit(0); });
+    sock.on('timeout', () => { sock.destroy(); process.exit(1); });
+    sock.on('error', () => { process.exit(1); });
+    sock.connect(${DB_PORT:-5432}, '$DB_HOST');
+  " 2>/dev/null; do
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+      echo "❌ PostgreSQL not available after $MAX_RETRIES retries, giving up."
+      exit 1
+    fi
+    echo "⏳ PostgreSQL not ready yet (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+    sleep 2
+  done
+  echo "✅ PostgreSQL is ready!"
+fi
+
+# ── Auto-migrate SQLite → PostgreSQL if old .db file exists ──
+# Supports SQLITE_PATH env var or the legacy default /root/db/recbot.db
+SQLITE_FILE="${SQLITE_PATH:-/root/db/recbot.db}"
+if [ -f "$SQLITE_FILE" ]; then
+  echo "═══════════════════════════════════════════════════"
+  echo "  🔄 SQLite database detected at $SQLITE_FILE"
+  echo "  🔄 Running automatic migration to PostgreSQL..."
+  echo "═══════════════════════════════════════════════════"
+  cd /app/backend
+  if node scripts/migrate-sqlite-to-pg.mjs "$SQLITE_FILE"; then
+    # Migration succeeded — rename so it won't run again
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    BACKUP="${SQLITE_FILE}.migrated.${TIMESTAMP}"
+    mv "$SQLITE_FILE" "$BACKUP"
+    echo "✅ Migration complete. Old file renamed to $BACKUP"
+    echo "   (Delete it once you've verified everything works)"
+  else
+    echo "⚠️  Migration encountered errors (see above)."
+    echo "   The SQLite file was NOT renamed — migration will retry on next restart."
+    echo "   The app will still start with whatever data made it to PostgreSQL."
+  fi
+  echo ""
+fi
 
 # Start backend server
 cd /app/backend

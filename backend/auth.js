@@ -149,16 +149,16 @@ export const requireAuth = async (req, res, next) => {
     // Determine if there is an existing open session (logout_time NULL); if not, create one & log LOGIN
     let openSessionExists = false;
     try {
-      const recent = getUserSessions(user.id, null, null, 5, 0);
+      const recent = await getUserSessions(user.id, null, null, 5, 0);
       openSessionExists = recent.some(s => !s.logout_time);
     } catch (e) {
       console.warn('Could not determine open session state, proceeding to create new session:', e.message);
     }
     if (!openSessionExists) {
       const now = new Date();
-      const lastLogin = getLastLogin(user.id);
-      logUserSession(user.id, userEmail, ipAddress, userAgent);
-      logAuditEvent(user.id, userEmail, 'LOGIN', null, null, ipAddress, userAgent, null, {
+      const lastLogin = await getLastLogin(user.id);
+      await logUserSession(user.id, userEmail, ipAddress, userAgent);
+      await logAuditEvent(user.id, userEmail, 'LOGIN', null, null, ipAddress, userAgent, null, {
         lastLogin,
         loginTime: now.toISOString(),
         reason: 'new_session_no_open_session',

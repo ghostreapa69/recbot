@@ -19,7 +19,7 @@ COPY backend ./backend
 # Final image for running app and sshfs
 FROM node:20-slim
 
-# Install build tools, rclone, and other dependencies
+# Install rclone, build tools (for optional better-sqlite3 migration), and other dependencies
 RUN apt-get update && apt-get install -y \
     curl fuse3 ffmpeg s3fs \
     build-essential python3 \

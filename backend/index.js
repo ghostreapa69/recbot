@@ -20,7 +20,7 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
+import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
 import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig } from './auth.js';
 
@@ -327,25 +327,38 @@ function hydrateReportRow(row) {
   return hydrated;
 }
 
-function hydrateReportRows(rows) {
+async function hydrateReportRows(rows) {
   if (!Array.isArray(rows) || !rows.length) return rows;
   const hydrated = rows.map(hydrateReportRow);
 
-  try {
-    const callIds = Array.from(new Set(hydrated.map(row => (row && row.call_id ? String(row.call_id) : null)).filter(Boolean)));
-    if (callIds.length) {
-      const availabilityMap = getCallIdsWithRecordings(callIds);
-      if (availabilityMap && typeof availabilityMap === 'object') {
-        for (const row of hydrated) {
-          if (!row || !row.call_id) continue;
-          if (availabilityMap[row.call_id]) {
-            row.hasRecording = true;
+  // hasRecording is now computed via LEFT JOIN in the SQL query.
+  // If rows already have it, no extra query needed.
+  // Only fall back to the separate query if hasRecording is not present (e.g. export path).
+  const needsRecordingLookup = hydrated.length > 0 && hydrated[0].hasRecording === undefined;
+  if (needsRecordingLookup) {
+    try {
+      const callIds = Array.from(new Set(hydrated.map(row => (row && row.call_id ? String(row.call_id) : null)).filter(Boolean)));
+      if (callIds.length) {
+        const availabilityMap = await getCallIdsWithRecordings(callIds);
+        if (availabilityMap && typeof availabilityMap === 'object') {
+          for (const row of hydrated) {
+            if (!row || !row.call_id) continue;
+            if (availabilityMap[row.call_id]) {
+              row.hasRecording = true;
+            }
           }
         }
       }
+    } catch (err) {
+      console.warn('[REPORT] Failed to hydrate recording availability:', err.message);
     }
-  } catch (err) {
-    console.warn('[REPORT] Failed to hydrate recording availability:', err.message);
+  }
+
+  // Strip raw_json from response — it's large and only used for hydration above
+  for (const row of hydrated) {
+    delete row.raw_json;
+    delete row.raw_json_parsed;
+    delete row.recordings;
   }
 
   return hydrated;
@@ -383,14 +396,14 @@ function releaseFfmpegSlot() {
 const MAX_SESSION_HOURS = parseInt(process.env.MAX_SESSION_HOURS || '4');
 const MAX_INACTIVITY_MINUTES = parseInt(process.env.MAX_INACTIVITY_MINUTES || '30');
 // Run every 5 minutes to catch stale sessions
-setInterval(() => {
+setInterval(async () => {
   try {
-    const expired = expireStaleSessions(MAX_SESSION_HOURS, 200);
+    const expired = await expireStaleSessions(MAX_SESSION_HOURS, 200);
     if (Array.isArray(expired) && expired.length) {
       console.log(`⏰ [SESSION EXPIRY] Auto-logged out ${expired.length} session(s) > ${MAX_SESSION_HOURS}h`);
       for (const row of expired) {
         // Audit each auto logout
-        logAuditEvent(
+        await logAuditEvent(
           row.user_id,
           row.user_email,
           'LOGOUT',
@@ -403,11 +416,11 @@ setInterval(() => {
         );
       }
     }
-    const inactive = expireInactiveSessions(MAX_INACTIVITY_MINUTES, 300);
+    const inactive = await expireInactiveSessions(MAX_INACTIVITY_MINUTES, 300);
     if (Array.isArray(inactive) && inactive.length) {
       console.log(`💤 [INACTIVITY EXPIRY] Auto-logged out ${inactive.length} inactive session(s) > ${MAX_INACTIVITY_MINUTES}m`);
       for (const row of inactive) {
-        logAuditEvent(
+        await logAuditEvent(
           row.user_id,
           row.user_email,
           'LOGOUT',
@@ -451,8 +464,8 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
     const dryRun = req.body?.dryRun === true;
 
     console.log(`[TIMESTAMP FIX] Starting rewrite batchSize=${batchSize} runAll=${runAll} includeIso=${includeIso} dryRun=${dryRun}`);
-    const result = rewriteReportTimestamps({ batchSize, runAll, includeIso, dryRun });
-    const legacy = getLegacyReportTimestampStats(10);
+    const result = await rewriteReportTimestamps({ batchSize, runAll, includeIso, dryRun });
+    const legacy = await getLegacyReportTimestampStats(10);
 
     console.log(`[TIMESTAMP FIX] Complete: processed=${result.processed} updated=${result.updated} errors=${result.errors} batches=${result.batches} remaining=${result.remainingLegacy}`);
     if (result.sampleConversions?.length) {
@@ -475,7 +488,7 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
@@ -485,6 +498,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     agentName = cleanParam(agentName);
     agentSearchType = cleanParam(agentSearchType);
     campaign = cleanParam(campaign);
+    disposition = cleanParam(disposition);
     callType = cleanParam(callType);
     phone = cleanParam(phone);
     callId = cleanParam(callId);
@@ -533,21 +547,6 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       console.log(`[API /api/reports] Formatted for SQLite: start="${startFormatted}", end="${endFormatted}"`);
     }
     
-    // Debug: check what's actually in the database
-    try {
-      const { db } = await import('./database.js');
-      const dbSample = db.prepare('SELECT timestamp FROM reporting ORDER BY rowid DESC LIMIT 3').all();
-      console.log('[API /api/reports] Recent timestamps in DB:', dbSample.map(r => r.timestamp));
-      
-      // Test if datetime parsing works
-      if (startFormatted) {
-        const testParse = db.prepare(`SELECT datetime(?) as parsed`).get(startFormatted);
-        console.log('[API /api/reports] Datetime parse test:', startFormatted, '->', testParse.parsed);
-      }
-    } catch (debugErr) {
-      console.warn('[API /api/reports] Debug query failed:', debugErr.message);
-    }
-    
     const appliedStart = startFormatted || null;
     const appliedEnd = endFormatted || null;
     const appliedLimit = Math.min(parseInt(limit,10)||100,500);
@@ -569,13 +568,14 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     const abandonedValue = parseBinary(abandoned);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
-    const result = queryReports({
+    const result = await queryReports({
       start: appliedStart,
       end: appliedEnd,
       agent,
       agentName,
       campaign,
       callType,
+      disposition,
       phone,
       callId,
       customerName,
@@ -587,7 +587,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       offset: appliedOffset,
       sort: sortDir
     });
-      const hydratedRows = hydrateReportRows(result.rows);
+      const hydratedRows = await hydrateReportRows(result.rows);
       const returnedRange = hydratedRows && hydratedRows.length ? (
         sortDir === 'asc'
           ? { min: hydratedRows[0].timestamp || null, max: hydratedRows[hydratedRows.length - 1].timestamp || null }
@@ -598,7 +598,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
 
     let legacyStats = null;
     if (/^true$/i.test(process.env.REPORT_TIME_DEBUG || '')) {
-      legacyStats = getLegacyReportTimestampStats(5);
+      legacyStats = await getLegacyReportTimestampStats(5);
       console.log(`[API /api/reports] Legacy timestamp rows remaining=${legacyStats.total}`);
       if (legacyStats.total && legacyStats.samples?.length) {
         legacyStats.samples.forEach((sample, idx) => {
@@ -607,7 +607,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       }
     }
     try {
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'REPORT_VIEW',
@@ -655,7 +655,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
 
 app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, sort } = req.query;
 
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
     start = cleanParam(start);
@@ -664,6 +664,7 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     agentName = cleanParam(agentName);
     agentSearchType = cleanParam(agentSearchType);
     campaign = cleanParam(campaign);
+    disposition = cleanParam(disposition);
     callType = cleanParam(callType);
     phone = cleanParam(phone);
     callId = cleanParam(callId);
@@ -721,13 +722,14 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     const abandonedValue = parseBinary(abandoned);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
-    const exportResult = exportReports({
+    const exportResult = await exportReports({
       start: startFormatted || null,
       end: endFormatted || null,
       agent,
       agentName,
       campaign,
       callType,
+      disposition,
       phone,
       callId,
       customerName,
@@ -750,7 +752,7 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
       });
     }
 
-    const hydratedRows = hydrateReportRows(exportResult.rows);
+    const hydratedRows = await hydrateReportRows(exportResult.rows);
     const nowIso = new Date().toISOString().replace(/[:]/g, '-');
 
     const csv = buildCsv(hydratedRows, [
@@ -783,7 +785,7 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     ]);
 
     try {
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'REPORT_DOWNLOAD',
@@ -833,10 +835,13 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
 // Distinct meta for dropdowns
 app.get('/api/reports/meta', requireAuth, ensureSession, async (req, res) => {
   try {
-    const campaigns = getDistinctCampaigns();
-    const callTypes = getDistinctCallTypes();
+    const [campaigns, callTypes, dispositions] = await Promise.all([
+      getDistinctCampaigns(),
+      getDistinctCallTypes(),
+      getDistinctDispositions()
+    ]);
     try {
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'REPORT_META_VIEW',
@@ -845,21 +850,21 @@ app.get('/api/reports/meta', requireAuth, ensureSession, async (req, res) => {
         req.user.ipAddress,
         req.user.userAgent,
         req.currentSessionId || null,
-        { campaigns: campaigns.length, callTypes: callTypes.length }
+        { campaigns: campaigns.length, callTypes: callTypes.length, dispositions: dispositions.length }
       );
     } catch (e) {
       console.warn('REPORT_META_VIEW audit log failed:', e.message);
     }
-    res.json({ success:true, campaigns, callTypes });
+    res.json({ success:true, campaigns, callTypes, dispositions });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // Debug summary endpoint for reporting (admin only for safety)
-app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
-    const summary = getReportingSummary();
+    const summary = await getReportingSummary();
     res.json({ success:true, summary });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -888,7 +893,7 @@ async function ensureSession(req, res, next) {
     const now = Date.now();
     const maxHours = parseInt(process.env.MAX_SESSION_HOURS || '4');
     const maxMs = maxHours * 3600 * 1000;
-    const openSession = getUserSessions(req.user.id, null, null, 3, 0).find(s => !s.logout_time);
+    const openSession = (await getUserSessions(req.user.id, null, null, 3, 0)).find(s => !s.logout_time);
     if (openSession) {
       const started = new Date(openSession.login_time).getTime();
       const ageMs = now - started;
@@ -906,8 +911,8 @@ async function ensureSession(req, res, next) {
         if (idleExceeded) {
           try {
             // Hard logout path
-            logUserLogout(req.user.id);
-            logAuditEvent(
+            await logUserLogout(req.user.id);
+            await logAuditEvent(
               req.user.id,
               req.user.email,
               'LOGOUT',
@@ -925,8 +930,8 @@ async function ensureSession(req, res, next) {
         } else {
           // Silent rotation path
             try {
-              logUserLogout(req.user.id);
-              logAuditEvent(
+              await logUserLogout(req.user.id);
+              await logAuditEvent(
                 req.user.id,
                 req.user.email,
                 'LOGOUT',
@@ -937,8 +942,8 @@ async function ensureSession(req, res, next) {
                 openSession.id,
                 { reason: 'auto_expire_rotate', maxHours, idleMinutes, maxIdleMinutes: MAX_ACTIVE_WINDOW_MIN, login_time: openSession.login_time }
               );
-              const newSessionId = logUserSession(req.user.id, req.user.email, req.user.ipAddress, req.user.userAgent);
-              logAuditEvent(
+              const newSessionId = await logUserSession(req.user.id, req.user.email, req.user.ipAddress, req.user.userAgent);
+              await logAuditEvent(
                 req.user.id,
                 req.user.email,
                 'LOGIN',
@@ -957,11 +962,11 @@ async function ensureSession(req, res, next) {
         }
       }
   // Touch activity timestamp for active session
-  touchUserSession(req.user.id);
+  await touchUserSession(req.user.id);
   req.currentSessionId = openSession.id;
     } else {
-      const sessionId = logUserSession(req.user.id, req.user.email, req.user.ipAddress, req.user.userAgent);
-      logAuditEvent(
+      const sessionId = await logUserSession(req.user.id, req.user.email, req.user.ipAddress, req.user.userAgent);
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'LOGIN',
@@ -980,10 +985,10 @@ async function ensureSession(req, res, next) {
   next();
 }
 
-app.post('/api/logout', requireAuth, ensureSession, (req, res) => {
+app.post('/api/logout', requireAuth, ensureSession, async (req, res) => {
   try {
     // Log the logout event
-    logAuditEvent(
+    await logAuditEvent(
       req.user.id, 
       req.user.email, 
       'LOGOUT', 
@@ -996,7 +1001,7 @@ app.post('/api/logout', requireAuth, ensureSession, (req, res) => {
     );
     
     // Update the user session to mark logout time
-    logUserLogout(req.user.id);
+    await logUserLogout(req.user.id);
     
     res.json({ success: true, message: 'Logout recorded' });
   } catch (error) {
@@ -1173,7 +1178,7 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
         req.user.userAgent,
         req.currentSessionId || null,
         { cacheHit: cacheInfo, userRole: req.user.role, callId: meta.callId || meta.call_id || null, durationMs: meta.durationMs || meta.duration_ms || meta.durationMs }
-      );
+      ).catch(e => console.error('⚠️ [AUDIT PLAY] Consolidated log failed:', e));
     } catch (e) {
       console.error('⚠️ [AUDIT PLAY] Consolidated log failed:', e);
     }
@@ -1562,7 +1567,7 @@ app.get('/api/download/*', requireAuth, ensureSession, requireManagerOrAdmin, as
     try {
       // Attempt to parse metadata for richer audit details
       const meta = parseFileMetadata(filename) || {};
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'DOWNLOAD_FILE',
@@ -1630,7 +1635,7 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
     // All authenticated users can view all files
     console.log(`📄 [VIEW_FILES] User ${req.user.email} viewing file list`);
     try {
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'VIEW_FILES',
@@ -1658,7 +1663,7 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
     // Note: Download protection is handled at the audio streaming level
 
     // Use database query for ultra-fast results
-    const result = queryFiles({
+    const result = await queryFiles({
       dateStart,
       dateEnd,
       phone: phone?.trim() || null,
@@ -1667,6 +1672,7 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
       timeStart,
       timeEnd,
       callId: req.query.callId ? req.query.callId.trim() : null,
+      callDisposition: req.query.callDisposition?.trim() || null,
       sortColumn,
       sortDirection,
       limit: parseInt(limit) || 25,
@@ -1681,6 +1687,7 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
         date: f.call_date,
         time: f.call_time,
         callId: f.call_id,
+        callDisposition: f.call_disposition,
         durationMs: f.duration_ms,
         size: f.file_size
       })),
@@ -1693,6 +1700,17 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
   } catch (err) {
     console.error('Error in /api/wav-files:', err);
     res.status(500).json({ files: [], totalCount: 0, offset: 0, limit: 25, hasMore: false });
+  }
+});
+
+// Meta endpoint for file filter dropdowns
+app.get('/api/wav-files/meta', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const dispositions = await getDistinctFileDispositions();
+    res.json({ success: true, dispositions });
+  } catch (err) {
+    console.error('Error in /api/wav-files/meta:', err);
+    res.json({ success: false, dispositions: [] });
   }
 });
 
@@ -1721,7 +1739,7 @@ app.post('/api/sync-database', requireAuth, ensureSession, requireAdmin, async (
         
         const dayFiles = await listWavFilesFromS3(BUCKET_NAME, dayPrefix);
         if (dayFiles.length > 0) {
-          const batchIndexed = indexFiles(dayFiles);
+          const batchIndexed = await indexFiles(dayFiles);
           indexedCount += batchIndexed;
           console.log(`Indexed ${batchIndexed}/${dayFiles.length} files for ${current.format("M_D_YYYY")}`);
         }
@@ -1738,7 +1756,7 @@ app.post('/api/sync-database', requireAuth, ensureSession, requireAdmin, async (
       const batchSize = 1000;
       for (let i = 0; i < allFiles.length; i += batchSize) {
         const batch = allFiles.slice(i, i + batchSize);
-        const batchIndexed = indexFiles(batch);
+        const batchIndexed = await indexFiles(batch);
         indexedCount += batchIndexed;
         
         console.log(`Batch ${Math.floor(i/batchSize) + 1}: Indexed ${batchIndexed}/${batch.length} files (Total: ${indexedCount}/${allFiles.length})`);
@@ -1753,7 +1771,7 @@ app.post('/api/sync-database', requireAuth, ensureSession, requireAdmin, async (
     const endTime = Date.now();
     const duration = (endTime - startTime) / 1000;
     
-    const stats = getDatabaseStats();
+    const stats = await getDatabaseStats();
     
     res.json({
       success: true,
@@ -1769,9 +1787,9 @@ app.post('/api/sync-database', requireAuth, ensureSession, requireAdmin, async (
 });
 
 // Database statistics endpoint
-app.get('/api/database-stats', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.get('/api/database-stats', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
-    const stats = getDatabaseStats();
+    const stats = await getDatabaseStats();
     res.json(stats);
   } catch (err) {
     console.error('Error getting database stats:', err);
@@ -1780,7 +1798,7 @@ app.get('/api/database-stats', requireAuth, ensureSession, requireAdmin, (req, r
 });
 
 // Audit logs endpoint - admin only
-app.get('/api/audit-logs', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.get('/api/audit-logs', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const {
       userId,
@@ -1792,7 +1810,7 @@ app.get('/api/audit-logs', requireAuth, ensureSession, requireAdmin, (req, res) 
       offset = 0
     } = req.query;
 
-    const { rows: auditLogs, total } = getAuditLogs(
+    const { rows: auditLogs, total } = await getAuditLogs(
       userId || null,
       actionType || null,
       startDate || null,
@@ -1827,7 +1845,7 @@ app.get('/api/audit-logs/export', requireAuth, ensureSession, requireAdmin, asyn
       callId
     } = req.query;
 
-    const exportResult = exportAuditLogs({
+    const exportResult = await exportAuditLogs({
       userId: userId || null,
       actionType: actionType || null,
       startDate: startDate || null,
@@ -1863,7 +1881,7 @@ app.get('/api/audit-logs/export', requireAuth, ensureSession, requireAdmin, asyn
     ]);
 
     try {
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'REPORT_DOWNLOAD',
@@ -1893,11 +1911,11 @@ app.get('/api/audit-logs/export', requireAuth, ensureSession, requireAdmin, asyn
 });
 
 // Maintenance endpoint to backfill missing audit log call_ids from additional_data JSON
-app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const { batchSize } = req.body || {};
-    const result = backfillAuditLogCallIds(batchSize || 500);
-    logAuditEvent(req.auth.userId, req.auth.user?.primaryEmailAddress?.emailAddress || '', 'MAINTENANCE', null, null, getClientIp(req), req.headers['user-agent'] || '', req.sessionId, { task: 'backfill_audit_call_ids', ...result });
+    const result = await backfillAuditLogCallIds(batchSize || 500);
+    await logAuditEvent(req.auth.userId, req.auth.user?.primaryEmailAddress?.emailAddress || '', 'MAINTENANCE', null, null, getClientIp(req), req.headers['user-agent'] || '', req.sessionId, { task: 'backfill_audit_call_ids', ...result });
     res.json({ success: true, ...result });
   } catch (e) {
     console.error('Error backfilling audit call_ids:', e);
@@ -1905,10 +1923,10 @@ app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin
   }
 });
 
-app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
-    const rows = getUserUsageReport(startDate || null, endDate || null);
+    const rows = await getUserUsageReport(startDate || null, endDate || null);
 
     const payloadRows = rows.map(row => ({
       userId: row.user_id,
@@ -1948,7 +1966,7 @@ app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, (
     });
 
     try {
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'REPORT_VIEW',
@@ -1974,10 +1992,10 @@ app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, (
   }
 });
 
-app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
-    const exportResult = exportUserUsageReport(startDate || null, endDate || null);
+    const exportResult = await exportUserUsageReport(startDate || null, endDate || null);
 
     if (exportResult.truncated) {
       return res.status(400).json({
@@ -2008,7 +2026,7 @@ app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireA
     ]);
 
     try {
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'REPORT_DOWNLOAD',
@@ -2038,7 +2056,7 @@ app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireA
 });
 
 // User sessions endpoint - admin only
-app.get('/api/user-sessions', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.get('/api/user-sessions', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const {
       userId,
@@ -2048,7 +2066,7 @@ app.get('/api/user-sessions', requireAuth, ensureSession, requireAdmin, (req, re
       offset = 0
     } = req.query;
 
-    const sessions = getUserSessions(
+    const sessions = await getUserSessions(
       userId || null,
       startDate || null,
       endDate || null,
@@ -2071,17 +2089,17 @@ app.get('/api/user-sessions', requireAuth, ensureSession, requireAdmin, (req, re
 });
 
 // Session repair & backfill endpoint - admin only
-app.post('/api/repair-sessions', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.post('/api/repair-sessions', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const { simulate = false, keepLatestOpen = true, maxHours = 4, includeBackfill = true } = req.body || {};
-    const repairPreview = repairOpenSessions({ keepLatestOpen });
+    const repairPreview = await repairOpenSessions({ keepLatestOpen });
     let backfillResult = { closed: 0, details: [] };
     if (includeBackfill) {
-      backfillResult = backfillExpiredOpenSessions(maxHours);
+      backfillResult = await backfillExpiredOpenSessions(maxHours);
     }
     if (!simulate) {
       // Log maintenance audit event summarizing actions (no specific file)
-      logAuditEvent(
+      await logAuditEvent(
         req.user.id,
         req.user.email,
         'MAINTENANCE',
@@ -2118,11 +2136,11 @@ app.post('/api/repair-sessions', requireAuth, ensureSession, requireAdmin, (req,
 });
 
 // File metadata backfill (duration/callId) - admin only
-app.post('/api/backfill-files', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.post('/api/backfill-files', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const { batchSize = 500 } = req.body || {};
-    const result = backfillFileMetadata(Math.min(parseInt(batchSize) || 500, 5000));
-    logAuditEvent(
+    const result = await backfillFileMetadata(Math.min(parseInt(batchSize) || 500, 5000));
+    await logAuditEvent(
       req.user.id,
       req.user.email,
       'MAINTENANCE',
@@ -2141,10 +2159,10 @@ app.post('/api/backfill-files', requireAuth, ensureSession, requireAdmin, (req, 
 });
 
 // Autocomplete distinct users (admin only)
-app.get('/api/audit-users', requireAuth, ensureSession, requireAdmin, (req, res) => {
+app.get('/api/audit-users', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
     const { q, limit = 20 } = req.query;
-    const users = getDistinctUsers(q || null, Math.min(parseInt(limit) || 20, 100));
+    const users = await getDistinctUsers(q || null, Math.min(parseInt(limit) || 20, 100));
     res.json({ users });
   } catch (err) {
     console.error('Error getting distinct users:', err);
@@ -2174,7 +2192,7 @@ async function syncCurrentDay() {
     const dayFiles = await listWavFilesFromS3(BUCKET_NAME, dayPrefix);
     
     if (dayFiles.length > 0) {
-      const indexedCount = indexFiles(dayFiles);
+      const indexedCount = await indexFiles(dayFiles);
       console.log(`✅ [AUTO-SYNC] Indexed ${indexedCount}/${dayFiles.length} files for ${today}`);
     } else {
       console.log(`📁 [AUTO-SYNC] No files found for ${today}`);
@@ -2184,18 +2202,24 @@ async function syncCurrentDay() {
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`Backend listening on port ${PORT}`);
-  
-  // Start automatic current day sync every 5 minutes
-  console.log(`🕒 [AUTO-SYNC] Starting automatic current day sync (every 5 minutes)`);
-  
-  // Run initial sync after 30 seconds (give server time to fully start)
-  setTimeout(() => {
-    console.log(`🚀 [AUTO-SYNC] Running initial current day sync...`);
-    syncCurrentDay();
-  }, 30000);
-  
-  // Then run every 5 minutes
-  setInterval(syncCurrentDay, 5 * 60 * 1000); // 5 minutes in milliseconds
+// Initialize PostgreSQL database and start server
+initializeDatabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Backend listening on port ${PORT}`);
+    
+    // Start automatic current day sync every 5 minutes
+    console.log(`🕒 [AUTO-SYNC] Starting automatic current day sync (every 5 minutes)`);
+    
+    // Run initial sync after 30 seconds (give server time to fully start)
+    setTimeout(() => {
+      console.log(`🚀 [AUTO-SYNC] Running initial current day sync...`);
+      syncCurrentDay();
+    }, 30000);
+    
+    // Then run every 5 minutes
+    setInterval(syncCurrentDay, 5 * 60 * 1000); // 5 minutes in milliseconds
+  });
+}).catch(err => {
+  console.error('❌ Failed to initialize database:', err);
+  process.exit(1);
 });
