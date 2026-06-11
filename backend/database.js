@@ -1213,7 +1213,7 @@ function buildReportWhereClause(params, { start, end, agent, agentName, campaign
   return conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 }
 
-export async function queryReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, limit = 100, offset = 0, sort = 'desc' } = {}) {
+export async function queryReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, limit = 100, offset = 0, sort = 'desc' } = {}) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => { if (v === null || v === undefined) return null; const str = String(v).trim(); return str === '' ? null : str; };
@@ -1224,6 +1224,7 @@ export async function queryReports({ start = null, end = null, agent = null, age
     const c = norm(campaign), ct = norm(callType), disp = norm(disposition);
     const phoneNorm = normLike(phone), ci = normLike(callId), cust = normLike(customerName);
     const acw = normDuration(afterCallWork), tr = normBinary(transfers), conf = normBinary(conferences), ab = normBinary(abandoned);
+    const hr = normBinary(hasRecording);
     const sortDir = sort === 'asc' ? 'ASC' : 'DESC';
 
     console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, agentName=${aName}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
@@ -1255,12 +1256,28 @@ export async function queryReports({ start = null, end = null, agent = null, age
       r.abandoned, r.created_at,
       CASE WHEN f.call_id IS NOT NULL THEN true ELSE false END AS "hasRecording"`;
 
+    // hasRecording filter: applied after the LEFT JOIN
+    let hasRecordingJoinCondition = '';
+    if (hr === 1) {
+      hasRecordingJoinCondition = joinWhereClause ? ' AND f.call_id IS NOT NULL' : ' WHERE f.call_id IS NOT NULL';
+    } else if (hr === 0) {
+      hasRecordingJoinCondition = joinWhereClause ? ' AND f.call_id IS NULL' : ' WHERE f.call_id IS NULL';
+    }
+
     const dataQuery = `SELECT ${reportCols}
       FROM reporting r
       LEFT JOIN (SELECT DISTINCT call_id FROM files WHERE call_id IS NOT NULL) f ON f.call_id = r.call_id
-      ${joinWhereClause}
+      ${joinWhereClause}${hasRecordingJoinCondition}
       ORDER BY r.timestamp ${sortDir} LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
-    const countQuery = `SELECT COUNT(*) as total FROM reporting ${countWhereClause}`;
+
+    // Count query: use EXISTS/NOT EXISTS for hasRecording filter
+    let countHasRecording = '';
+    if (hr === 1) {
+      countHasRecording = (countWhereClause ? ' AND ' : ' WHERE ') + 'EXISTS (SELECT 1 FROM files WHERE files.call_id = reporting.call_id)';
+    } else if (hr === 0) {
+      countHasRecording = (countWhereClause ? ' AND ' : ' WHERE ') + 'NOT EXISTS (SELECT 1 FROM files WHERE files.call_id = reporting.call_id)';
+    }
+    const countQuery = `SELECT COUNT(*) as total FROM reporting ${countWhereClause}${countHasRecording}`;
 
     const [dataResult, countResult] = await Promise.all([
       pool.query(dataQuery, dataParams),
@@ -1276,7 +1293,7 @@ export async function queryReports({ start = null, end = null, agent = null, age
   }
 }
 
-export async function exportReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, sort = 'desc' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
+export async function exportReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, sort = 'desc' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => { if (v === null || v === undefined) return null; const str = String(v).trim(); return str === '' ? null : str; };
@@ -1286,6 +1303,7 @@ export async function exportReports({ start = null, end = null, agent = null, ag
     const s = norm(start), e = norm(end), a = norm(agent), aName = norm(agentName);
     const c = norm(campaign), ct = norm(callType), disp = norm(disposition);
     const phoneNorm = normLike(phone), ci = normLike(callId), cust = normLike(customerName);
+    const hr = normBinary(hasRecording);
     const acw = normDuration(afterCallWork), tr = normBinary(transfers), conf = normBinary(conferences), ab = normBinary(abandoned);
     const sortDir = sort === 'asc' ? 'ASC' : 'DESC';
 
@@ -1296,7 +1314,13 @@ export async function exportReports({ start = null, end = null, agent = null, ag
       afterCallWork: acw, transfers: tr, conferences: conf, abandoned: ab
     });
 
-    const countResult = await pool.query(`SELECT COUNT(*) as total FROM reporting ${whereClause}`, params);
+    let countHasRecording = '';
+    if (hr === 1) {
+      countHasRecording = (whereClause ? ' AND ' : ' WHERE ') + 'EXISTS (SELECT 1 FROM files WHERE files.call_id = reporting.call_id)';
+    } else if (hr === 0) {
+      countHasRecording = (whereClause ? ' AND ' : ' WHERE ') + 'NOT EXISTS (SELECT 1 FROM files WHERE files.call_id = reporting.call_id)';
+    }
+    const countResult = await pool.query(`SELECT COUNT(*) as total FROM reporting ${whereClause}${countHasRecording}`, params);
     const total = parseInt(countResult.rows[0].total, 10);
 
     if (total > maxRows) {
@@ -1304,7 +1328,7 @@ export async function exportReports({ start = null, end = null, agent = null, ag
     }
 
     const dataResult = await pool.query(
-      `SELECT * FROM reporting ${whereClause} ORDER BY timestamp ${sortDir}`,
+      `SELECT * FROM reporting ${whereClause}${countHasRecording} ORDER BY timestamp ${sortDir}`,
       params
     );
 

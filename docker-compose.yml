@@ -78,9 +78,6 @@ services:
       - REPORT_TIME_DEBUG=true
 
       # --- Optional / Feature Flags ---
-      - ENABLE_SFTP=false
-      #- SFTP_USER=root
-      #- SFTP_PASS=your_sftp_password_here
       #- EXTRA_LOGGING=true
       #- LOG_LEVEL=info
 
@@ -96,20 +93,15 @@ services:
     restart: unless-stopped
     networks:
       - recbot
-    cap_add:
-      - SYS_ADMIN  # Required for FUSE
-    devices:
-      - /dev/fuse
-    security_opt:
-      - apparmor:unconfined  # Required for FUSE on some systems
     volumes:
+      # S3 bucket mounted via rclone Docker volume plugin (no FUSE needed)
+      - wav_data:/data/wav
       # Mount the old SQLite volume for automatic migration on first boot.
       # The migration runs once and renames the .db file so it won't repeat.
       # After migration is confirmed, you can remove this volume mount.
       - recbot-legacy-db:/root/db
     # Uncomment to persist logs or mount local folders if needed
     # volumes (additional):
-    #   - ./local_wav:/data/wav
     #   - ./logs:/var/log
 volumes:
   recbot-pgdata:
@@ -120,6 +112,16 @@ volumes:
     #   external:
     #     name: recbot_recbot
     driver: local
+  wav_data:
+    # rclone Docker volume plugin — install on each Swarm node with:
+    #   docker plugin install rclone/docker-volume-rclone:amd64 args="-v" --alias rclone --grant-all-permissions
+    # Then run: rclone config  (create a remote named "myS3" pointing to your S3 bucket)
+    driver: rclone
+    driver_opts:
+      remote: "myS3:your-bucket-name"
+      allow_other: "true"
+      vfs_cache_mode: "full"
+      poll_interval: "0"
 networks:
   recbot:
     driver: bridge

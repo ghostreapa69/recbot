@@ -16,16 +16,13 @@ RUN cd frontend && npm install --legacy-peer-deps && npx react-scripts build
 # Copy backend source
 COPY backend ./backend
 
-# Final image for running app and sshfs
+# Final production image
 FROM node:20-slim
 
-# Install rclone, build tools (for optional better-sqlite3 migration), and other dependencies
+# Install build tools (for optional better-sqlite3 migration) and other dependencies
 RUN apt-get update && apt-get install -y \
-    curl fuse3 ffmpeg s3fs \
+    curl ffmpeg \
     build-essential python3 \
-    && curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb \
-    && dpkg -i rclone-current-linux-amd64.deb \
-    && rm rclone-current-linux-amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

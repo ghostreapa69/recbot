@@ -488,7 +488,7 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, hasRecording, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
@@ -499,6 +499,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     agentSearchType = cleanParam(agentSearchType);
     campaign = cleanParam(campaign);
     disposition = cleanParam(disposition);
+    hasRecording = cleanParam(hasRecording);
     callType = cleanParam(callType);
     phone = cleanParam(phone);
     callId = cleanParam(callId);
@@ -566,6 +567,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     const transfersValue = parseBinary(transfers);
     const conferencesValue = parseBinary(conferences);
     const abandonedValue = parseBinary(abandoned);
+    const hasRecordingValue = parseBinary(hasRecording);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
     const result = await queryReports({
@@ -583,6 +585,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       transfers: transfersValue,
       conferences: conferencesValue,
       abandoned: abandonedValue,
+      hasRecording: hasRecordingValue,
       limit: appliedLimit,
       offset: appliedOffset,
       sort: sortDir
@@ -655,7 +658,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
 
 app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, hasRecording, sort } = req.query;
 
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
     start = cleanParam(start);
@@ -665,6 +668,7 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     agentSearchType = cleanParam(agentSearchType);
     campaign = cleanParam(campaign);
     disposition = cleanParam(disposition);
+    hasRecording = cleanParam(hasRecording);
     callType = cleanParam(callType);
     phone = cleanParam(phone);
     callId = cleanParam(callId);
@@ -720,6 +724,7 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     const transfersValue = parseBinary(transfers);
     const conferencesValue = parseBinary(conferences);
     const abandonedValue = parseBinary(abandoned);
+    const hasRecordingValue = parseBinary(hasRecording);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
     const exportResult = await exportReports({
@@ -737,6 +742,7 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
       transfers: transfersValue,
       conferences: conferencesValue,
       abandoned: abandonedValue,
+      hasRecording: hasRecordingValue,
       sort: sortDir
     });
 
