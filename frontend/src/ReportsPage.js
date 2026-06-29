@@ -189,6 +189,7 @@ export default function ReportsPage(){
   const [agentFilter, setAgentFilter] = useState('');
   const [campaign,setCampaign]=useState('');
   const [callType,setCallType]=useState('');
+  const [disposition,setDisposition]=useState('');
   const [phoneNumber,setPhoneNumber]=useState('');
   const [callId,setCallId]=useState('');
   const [customerName,setCustomerName]=useState('');
@@ -196,8 +197,10 @@ export default function ReportsPage(){
   const [transfersFilter,setTransfersFilter]=useState('');
   const [conferencesFilter,setConferencesFilter]=useState('');
   const [abandonedFilter,setAbandonedFilter]=useState('');
+  const [hasRecordingFilter,setHasRecordingFilter]=useState('');
   const [campaigns,setCampaigns]=useState([]);
   const [callTypes,setCallTypes]=useState([]);
+  const [dispositions,setDispositions]=useState([]);
   const [startDate,setStartDate]=useState(null);
   const [endDate,setEndDate]=useState(null);
   const [page,setPage]=useState(1); const [pageSize,setPageSize]=useState(50); const [total,setTotal]=useState(0);
@@ -271,6 +274,7 @@ export default function ReportsPage(){
       if (campaign && campaign !== 'undefined') params.append('campaign', campaign);
       // Append remaining optional filters
       if (callType && callType !== 'undefined') params.append('callType', callType);
+      if (disposition && disposition !== 'undefined') params.append('disposition', disposition);
       if (phoneNumber && phoneNumber !== 'undefined') {
         const trimmedPhone = phoneNumber.trim();
         if (trimmedPhone) params.append('phone', trimmedPhone);
@@ -294,6 +298,7 @@ export default function ReportsPage(){
       if (transfersFilter !== '') params.append('transfers', transfersFilter);
       if (conferencesFilter !== '') params.append('conferences', conferencesFilter);
       if (abandonedFilter !== '') params.append('abandoned', abandonedFilter);
+      if (hasRecordingFilter !== '') params.append('hasRecording', hasRecordingFilter);
       params.append('sort', sortOrder);
       params.append('limit', pageSize);
       params.append('offset', (page - 1) * pageSize);
@@ -307,7 +312,7 @@ export default function ReportsPage(){
     } catch (e) {
       setError(e.message);
     } finally { setLoading(false); }
-  }, [getToken, agentFilter, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, page, pageSize, sortOrder]);
+  }, [getToken, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, startDate, endDate, page, pageSize, sortOrder]);
 
   const ingest = async () => {
     if(!isAdmin) return;
@@ -367,6 +372,7 @@ export default function ReportsPage(){
       }
       if (campaign && campaign !== 'undefined') params.append('campaign', campaign);
       if (callType && callType !== 'undefined') params.append('callType', callType);
+      if (disposition && disposition !== 'undefined') params.append('disposition', disposition);
       if (phoneNumber && phoneNumber !== 'undefined') {
         const trimmedPhone = phoneNumber.trim();
         if (trimmedPhone) params.append('phone', trimmedPhone);
@@ -390,6 +396,7 @@ export default function ReportsPage(){
       if (transfersFilter !== '') params.append('transfers', transfersFilter);
       if (conferencesFilter !== '') params.append('conferences', conferencesFilter);
       if (abandonedFilter !== '') params.append('abandoned', abandonedFilter);
+      if (hasRecordingFilter !== '') params.append('hasRecording', hasRecordingFilter);
       params.append('sort', sortOrder);
 
       const qs = params.toString();
@@ -424,7 +431,7 @@ export default function ReportsPage(){
     } finally {
       setReportExporting(false);
     }
-  }, [isAdmin, reportExporting, getToken, startDate, endDate, agentFilter, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, sortOrder]);
+  }, [isAdmin, reportExporting, getToken, startDate, endDate, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, sortOrder]);
 
   useEffect(() => { 
     if (initialized) {
@@ -440,6 +447,7 @@ export default function ReportsPage(){
         if (json.success) {
           setCampaigns(json.campaigns || []);
           setCallTypes(json.callTypes || []);
+          setDispositions(json.dispositions || []);
         }
       } catch {/* ignore meta errors */}
     })();
@@ -462,7 +470,7 @@ export default function ReportsPage(){
   // Reset page to 1 when filters change to avoid empty result pages
   useEffect(() => {
     setPage(1);
-  }, [agentFilter, campaign, callType, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, startDate, endDate, sortOrder, pageSize]);
+  }, [agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, startDate, endDate, sortOrder, pageSize]);
 
 
   function applyPreset(p){
@@ -510,12 +518,14 @@ export default function ReportsPage(){
             label="Start Date/Time" 
             value={startDate} 
             onChange={(newValue) => setStartDate(newValue)}
+            ampm={false}
             slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
           />
           <DateTimePicker 
             label="End Date/Time" 
             value={endDate} 
             onChange={(newValue) => setEndDate(newValue)}
+            ampm={false}
             slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
           />
           <TextField label="Agent" value={agentInput} onChange={e=>setAgentInput(e.target.value)} size="small" />
@@ -531,6 +541,13 @@ export default function ReportsPage(){
           <Select labelId="calltype-label" value={callType} label="Call Type" onChange={e=>setCallType(e.target.value)}>
             <MenuItem value=""><em>All</em></MenuItem>
             {callTypes.map(t=> <MenuItem key={t} value={t}>{t}</MenuItem>)}
+          </Select>
+        </FormControl>
+        <FormControl size="small" sx={{ minWidth:180 }}>
+          <InputLabel id="disposition-label">Disposition</InputLabel>
+          <Select labelId="disposition-label" value={disposition} label="Disposition" onChange={e=>setDisposition(e.target.value)}>
+            <MenuItem value=""><em>All</em></MenuItem>
+            {dispositions.map(d=> <MenuItem key={d} value={d}>{d}</MenuItem>)}
           </Select>
         </FormControl>
         <TextField label="Phone Number" value={phoneNumber} onChange={e=>setPhoneNumber(e.target.value)} size="small" sx={{ minWidth:160 }} />
@@ -561,6 +578,14 @@ export default function ReportsPage(){
               <MenuItem value="1">Agent (1)</MenuItem>
             </Select>
           </FormControl>
+          <FormControl size="small" sx={{ minWidth:180 }}>
+            <InputLabel id="has-recording-filter-label">Has Recording</InputLabel>
+            <Select labelId="has-recording-filter-label" value={hasRecordingFilter} label="Has Recording" onChange={e=>setHasRecordingFilter(e.target.value)}>
+              <MenuItem value=""><em>All</em></MenuItem>
+              <MenuItem value="1">Yes</MenuItem>
+              <MenuItem value="0">No</MenuItem>
+            </Select>
+          </FormControl>
         <FormControl size="small" sx={{ minWidth:150 }}>
           <InputLabel id="sort-order-label">Sort</InputLabel>
           <Select labelId="sort-order-label" value={sortOrder} label="Sort" onChange={(e)=>setSortOrder(e.target.value)}>
@@ -569,7 +594,7 @@ export default function ReportsPage(){
           </Select>
         </FormControl>
         <Button variant="contained" onClick={()=>{ setAgentFilter(agentInput); setPage(1); }} disabled={loading}>Apply</Button>
-        <Button variant="text" onClick={()=>{ setAgentInput(''); setAgentFilter(''); setCampaign(''); setCallType(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
+        <Button variant="text" onClick={()=>{ setAgentInput(''); setAgentFilter(''); setCampaign(''); setCallType(''); setDisposition(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); setHasRecordingFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('lastHour')} disabled={loading}>Last Hour</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('today')} disabled={loading}>Today</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>

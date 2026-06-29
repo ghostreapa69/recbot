@@ -173,15 +173,17 @@ recordings/
 **Primary Filename Formats**:
 
 1. Legacy: `{phone} by {email} @ {H_MM_SS AM|PM}_{duration_ms}.wav`
-2. New (with callId): `{phone} by {email} @ {H_MM_SS AM|PM}_{duration_ms}_{callId}.wav`
+2. With callId: `{phone} by {email} @ {H_MM_SS AM|PM}_{duration_ms}_{callId}.wav`
+3. With callId + disposition: `{phone} by {Agent Name} @ {H_MM_SS AM|PM}_{duration_ms}_{callId}_{dispositionName}.wav`
 
 Parsed Fields:
 - phone
-- email
+- email / agent name
 - call_date (derived from folder)
 - call_time (normalized HH:MM:SS 24h)
 - duration_ms
 - call_id (optional legacy absence)
+- call_disposition (optional, new format only)
 
 Backfill routines populate missing `call_id` and `duration_ms` where recoverable.
 
