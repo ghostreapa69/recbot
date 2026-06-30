@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useUser, useAuth } from '@clerk/clerk-react';
+import { useUser, useAuth } from './auth';
 import {
   Box,
   Typography,
@@ -104,18 +104,20 @@ function AdminPage({ darkMode }) {
   const [usageError, setUsageError] = useState('');
   const [usageExporting, setUsageExporting] = useState(false);
 
-  // Check if user has admin role
+  // Check role. Admins get the full dashboard; managers get the Reporting tab only.
   const isAdmin = user?.publicMetadata?.role === 'admin';
+  const isManager = user?.publicMetadata?.role === 'manager';
+  const REPORTING_TAB = 3;
 
   useEffect(() => {
-    if (isLoaded && !isAdmin) {
-      // Redirect non-admin users or show error
-      return;
-    }
+    if (!isLoaded) return;
     if (isAdmin) {
       fetchDatabaseStats();
+    } else if (isManager) {
+      // Managers can only see the Reporting tab — land them there.
+      setCurrentTab(REPORTING_TAB);
     }
-  }, [isLoaded, isAdmin]);
+  }, [isLoaded, isAdmin, isManager]);
 
   const fetchDatabaseStats = async () => {
     try {
@@ -267,7 +269,7 @@ function AdminPage({ darkMode }) {
   };
 
   const fetchUserUsage = async () => {
-    if (!isAdmin) return;
+    if (!isAdmin && !isManager) return;
     setUsageLoading(true);
     setUsageError('');
     try {
@@ -297,7 +299,7 @@ function AdminPage({ darkMode }) {
   };
 
   const downloadUserUsageCsv = async () => {
-    if (!isAdmin || usageExporting) return;
+    if ((!isAdmin && !isManager) || usageExporting) return;
     setUsageExporting(true);
     try {
       const params = new URLSearchParams({
@@ -338,12 +340,12 @@ function AdminPage({ darkMode }) {
   };
 
   useEffect(() => {
-    if (!isAdmin) return;
-    if (currentTab === 3 && !usageFetchedRef.current) {
+    if (!isAdmin && !isManager) return;
+    if (currentTab === REPORTING_TAB && !usageFetchedRef.current) {
       usageFetchedRef.current = true;
       fetchUserUsage();
     }
-  }, [currentTab, isAdmin]);
+  }, [currentTab, isAdmin, isManager]);
 
   const syncDatabase = async (dateRange = null) => {
     setSyncing(true);
@@ -379,7 +381,7 @@ function AdminPage({ darkMode }) {
     return <LinearProgress />;
   }
 
-  if (!isAdmin) {
+  if (!isAdmin && !isManager) {
     return (
       <Box sx={{ p: 3, maxWidth: 600, mx: 'auto', mt: 4 }}>
         <Alert severity="info" sx={{ mb: 2 }}>
@@ -393,16 +395,18 @@ function AdminPage({ darkMode }) {
     <Box sx={{ p: 3, maxWidth: 1200, mx: 'auto' }}>
       <Typography variant="h4" gutterBottom sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
         <DatabaseIcon />
-        Admin Dashboard
+        {isAdmin ? 'Admin Dashboard' : 'Reporting'}
       </Typography>
-      
+
       <Divider sx={{ mb: 3 }} />
 
+      {/* Managers see only the Reporting tab; admins see everything. Explicit
+          `value`s keep Reporting at index 3 so its content gating still matches. */}
       <Tabs value={currentTab} onChange={(e, newValue) => setCurrentTab(newValue)} sx={{ mb: 3 }}>
-        <Tab label="Database Management" icon={<DatabaseIcon />} />
-        <Tab label="Audit Logs" icon={<AuditIcon />} />
-        <Tab label="User Sessions" icon={<UsersIcon />} />
-        <Tab label="Reporting" icon={<ReportIcon />} />
+        {isAdmin && <Tab value={0} label="Database Management" icon={<DatabaseIcon />} />}
+        {isAdmin && <Tab value={1} label="Audit Logs" icon={<AuditIcon />} />}
+        {isAdmin && <Tab value={2} label="User Sessions" icon={<UsersIcon />} />}
+        <Tab value={REPORTING_TAB} label="Reporting" icon={<ReportIcon />} />
       </Tabs>
 
       {currentTab === 0 && (

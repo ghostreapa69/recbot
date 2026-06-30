@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useUser, useAuth } from '@clerk/clerk-react';
+import { useUser, useAuth } from './auth';
 import { Container, Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Paper, Pagination, Stack, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer, Link as MuiLink } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import { LocalizationProvider, DateTimePicker } from '@mui/x-date-pickers';
@@ -208,6 +208,8 @@ export default function ReportsPage(){
   const [initialized,setInitialized]=useState(false);
   const [reportExporting,setReportExporting]=useState(false);
   const isAdmin = user?.publicMetadata?.role === 'admin';
+  const isManager = user?.publicMetadata?.role === 'manager';
+  const canExportReports = isAdmin || isManager;
 
   const columns = React.useMemo(() => ([
     { key:'call_id', label:'Call ID', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
@@ -344,7 +346,7 @@ export default function ReportsPage(){
   };
 
   const downloadReportsCsv = React.useCallback(async () => {
-    if (!isAdmin || reportExporting) return;
+    if (!canExportReports || reportExporting) return;
     setReportExporting(true);
     try {
       const token = await getToken();
@@ -431,7 +433,7 @@ export default function ReportsPage(){
     } finally {
       setReportExporting(false);
     }
-  }, [isAdmin, reportExporting, getToken, startDate, endDate, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, sortOrder]);
+  }, [canExportReports, reportExporting, getToken, startDate, endDate, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, sortOrder]);
 
   useEffect(() => { 
     if (initialized) {
@@ -599,9 +601,7 @@ export default function ReportsPage(){
         <Button size="small" variant="outlined" onClick={()=>applyPreset('today')} disabled={loading}>Today</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('last24h')} disabled={loading}>Last 24h</Button>
-        {isAdmin && <Button variant="outlined" onClick={downloadReportsCsv} disabled={loading || reportExporting}>{reportExporting ? 'Exporting...' : 'Export CSV'}</Button>}
-        {isAdmin && <Button variant="outlined" color="secondary" onClick={ingest} disabled={loading}>Ingest Recent</Button>}
-        {isAdmin && <Button variant="outlined" color="warning" onClick={fixTimezones} disabled={loading}>Fix Timezones</Button>}
+        {canExportReports && <Button variant="outlined" onClick={downloadReportsCsv} disabled={loading || reportExporting}>{reportExporting ? 'Exporting...' : 'Export CSV'}</Button>}
       </Stack>
       {error && <Alert severity="error" sx={{ mt:2 }}>{error}</Alert>}
     </Paper>

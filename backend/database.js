@@ -112,6 +112,16 @@ pool.on('error', (err) => {
   console.error('Unexpected PostgreSQL pool error:', err);
 });
 
+// Attach an error listener to every pooled client. A checked-out client whose
+// connection drops ("Connection terminated unexpectedly") emits an 'error'
+// event; without a listener Node treats it as uncaught and CRASHES the process.
+// The pool discards the broken connection and opens a new one on the next query.
+pool.on('connect', (client) => {
+  client.on('error', (err) => {
+    console.error('PostgreSQL client connection error (handled):', err.message);
+  });
+});
+
 // ============================================================
 // Database Initialization (must be called at startup)
 // ============================================================
@@ -198,6 +208,18 @@ export async function initializeDatabase() {
     );
   `);
 
+  // Maps a user's stable email to their auth-provider IDs. Used to relink
+  // historical logs (originally keyed by Clerk user IDs) to Logto user IDs
+  // after the Clerk -> Logto migration. Email is the bridge between providers.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_identity_map (
+      email          TEXT PRIMARY KEY,
+      clerk_user_id  TEXT,
+      logto_user_id  TEXT,
+      linked_at      TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
   // Create indexes
   // Migration: add call_disposition column to existing files tables
   await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS call_disposition TEXT;`);
@@ -235,6 +257,8 @@ export async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_file_path ON audit_logs(file_path);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_composite ON audit_logs(user_id, action_type, action_timestamp);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_call_id ON audit_logs(call_id);`);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_identity_map_logto ON user_identity_map(logto_user_id);`);
 
   // Test query
   try {
@@ -448,6 +472,7 @@ export async function backfillAuditLogCallIds(batchSize = 500) {
 
 export async function indexFiles(files) {
   const client = await pool.connect();
+  let failed;
   try {
     await client.query('BEGIN');
     let indexed = 0;
@@ -489,11 +514,12 @@ export async function indexFiles(files) {
     await client.query('COMMIT');
     return indexed;
   } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Error in indexFiles transaction:', error);
+    failed = error;
+    try { await client.query('ROLLBACK'); } catch (e) { /* connection may be gone */ }
+    console.error('Error in indexFiles transaction:', error.message);
     return 0;
   } finally {
-    client.release();
+    try { client.release(failed); } catch (e) { /* already released */ }
   }
 }
 
@@ -614,6 +640,147 @@ export async function getDatabaseStats() {
   } catch (error) {
     console.error('Error getting database stats:', error);
     return { totalFiles: 0, databasePath: 'postgresql', databaseSize: 0 };
+  }
+}
+
+// ============================================================
+// Auth identity linking (Clerk -> Logto migration)
+// ============================================================
+// Called on each authenticated request. The first time a given email is seen
+// under a Logto user ID, it rewrites that user's historical log rows (which
+// were keyed by their old Clerk `user_xxx` ID) to the Logto ID, using email as
+// the bridge. Idempotent: once linked, subsequent calls short-circuit cheaply
+// so this does not scan the log tables on every request.
+// Look up a user's email by their Logto user ID via the identity map (populated
+// on a prior header-authenticated login). Used to authenticate requests that
+// can't send the ID token header — e.g. native <audio> ?auth= stream URLs.
+export async function getEmailByLogtoId(logtoUserId) {
+  if (!logtoUserId) return null;
+  try {
+    const r = await pool.query(
+      `SELECT email FROM user_identity_map WHERE logto_user_id = $1 LIMIT 1`,
+      [logtoUserId]
+    );
+    return r.rows.length ? r.rows[0].email : null;
+  } catch (e) {
+    console.error('getEmailByLogtoId failed:', e.message);
+    return null;
+  }
+}
+
+// In-memory cache of (logtoUserId, email) pairs already linked in this process,
+// so linkLogtoIdentity does NOT touch the DB on every authenticated request
+// (which otherwise contends for pool connections and can exhaust it).
+const linkedIdentityCache = new Set();
+
+export async function linkLogtoIdentity(logtoUserId, email) {
+  if (!logtoUserId || !email) return { linked: false, reason: 'missing_args' };
+
+  const cacheKey = `${logtoUserId} ${email.toLowerCase()}`;
+  if (linkedIdentityCache.has(cacheKey)) {
+    return { linked: false, reason: 'cached' };
+  }
+
+  // Fast path (the common case after a user's first login): if this email is
+  // already mapped to this Logto ID, do nothing. Uses pool.query so we don't
+  // check out a manual client or open a transaction on every request.
+  try {
+    const existing = await pool.query(
+      `SELECT logto_user_id FROM user_identity_map WHERE email = $1`,
+      [email]
+    );
+    if (existing.rows.length && existing.rows[0].logto_user_id === logtoUserId) {
+      linkedIdentityCache.add(cacheKey);
+      return { linked: false, reason: 'already_linked' };
+    }
+  } catch (e) {
+    console.error('Identity link: lookup failed:', e.message);
+    return { linked: false, reason: 'error', error: e.message };
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (e) {
+    // Could not get a connection (pool exhausted / DB down). Don't crash — the
+    // relink is best-effort and idempotent, so it retries on the next request.
+    console.error('Identity link: could not acquire DB client:', e.message);
+    return { linked: false, reason: 'no_client' };
+  }
+
+  // A checked-out client whose connection drops emits an 'error' event. Without
+  // this listener that becomes an unhandled error and crashes the process.
+  client.on('error', (e) => {
+    console.error('Identity link: pg client connection error:', e.message);
+  });
+
+  let failed;
+  try {
+    await client.query('BEGIN');
+
+    // Already linked to this exact Logto ID? Nothing to do.
+    const existing = await client.query(
+      `SELECT logto_user_id FROM user_identity_map WHERE email = $1`,
+      [email]
+    );
+    if (existing.rows.length && existing.rows[0].logto_user_id === logtoUserId) {
+      await client.query('COMMIT');
+      return { linked: false, reason: 'already_linked' };
+    }
+
+    // Capture the prior (e.g. Clerk) ID we're relinking from, for the audit trail.
+    const prior = await client.query(
+      `SELECT user_id FROM user_sessions WHERE user_email = $1 AND user_id <> $2
+       UNION
+       SELECT user_id FROM audit_logs   WHERE user_email = $1 AND user_id <> $2
+       LIMIT 1`,
+      [email, logtoUserId]
+    );
+    const clerkUserId = prior.rows.length ? prior.rows[0].user_id : null;
+
+    // Rewrite historical logs from the old ID to the Logto ID.
+    const sessions = await client.query(
+      `UPDATE user_sessions SET user_id = $1 WHERE user_email = $2 AND user_id <> $1`,
+      [logtoUserId, email]
+    );
+    const audits = await client.query(
+      `UPDATE audit_logs SET user_id = $1 WHERE user_email = $2 AND user_id <> $1`,
+      [logtoUserId, email]
+    );
+
+    await client.query(
+      `INSERT INTO user_identity_map (email, clerk_user_id, logto_user_id, linked_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (email) DO UPDATE
+         SET logto_user_id = EXCLUDED.logto_user_id,
+             clerk_user_id = COALESCE(user_identity_map.clerk_user_id, EXCLUDED.clerk_user_id),
+             linked_at = NOW()`,
+      [email, clerkUserId, logtoUserId]
+    );
+
+    await client.query('COMMIT');
+    linkedIdentityCache.add(cacheKey);
+
+    const relinked = (sessions.rowCount || 0) + (audits.rowCount || 0);
+    if (relinked > 0) {
+      console.log(`🔗 [IDENTITY] Linked ${email} -> ${logtoUserId} (relinked ${sessions.rowCount} session rows, ${audits.rowCount} audit rows from ${clerkUserId || 'n/a'})`);
+    }
+    return {
+      linked: true,
+      relinkedSessions: sessions.rowCount || 0,
+      relinkedAudit: audits.rowCount || 0,
+      clerkUserId
+    };
+  } catch (error) {
+    failed = error;
+    // The connection may already be dead; don't let a failing ROLLBACK throw.
+    try { await client.query('ROLLBACK'); } catch (e) { /* connection gone */ }
+    console.error('Error linking Logto identity:', error.message);
+    return { linked: false, reason: 'error', error: error.message };
+  } finally {
+    // Passing the error to release() discards a possibly-broken connection
+    // instead of returning it to the pool.
+    try { client.release(failed); } catch (e) { /* already released */ }
   }
 }
 
@@ -1139,6 +1306,7 @@ export async function upsertReportRow(row) {
 
 export async function bulkUpsertReports(rows = []) {
   const client = await pool.connect();
+  let failed;
   try {
     await client.query('BEGIN');
     let inserted = 0;
@@ -1182,11 +1350,12 @@ export async function bulkUpsertReports(rows = []) {
     await client.query('COMMIT');
     return inserted;
   } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('Failed to bulk upsert reports:', e);
+    failed = e;
+    try { await client.query('ROLLBACK'); } catch (err) { /* connection may be gone */ }
+    console.error('Failed to bulk upsert reports:', e.message);
     return 0;
   } finally {
-    client.release();
+    try { client.release(failed); } catch (err) { /* already released */ }
   }
 }
 

@@ -40,7 +40,8 @@ COPY --from=build /app/frontend/build ./frontend/build
 
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Strip any CRLF line endings (Windows checkouts) so the shebang resolves, then make executable
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 ENV WAV_DIR=/data/wav
 

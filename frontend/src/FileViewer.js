@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { useUser, useAuth } from '@clerk/clerk-react';
+import { useUser, useAuth } from './auth';
 import {
   Container,
   Typography,
@@ -139,6 +139,9 @@ function FileViewer({ darkMode }) {
   const [fileDispositions, setFileDispositions] = useState([]);
   const callIdDebounceRef = React.useRef(null);
   const applyingUrlParamsRef = React.useRef(false);
+  // True until the first wav-files fetch after mount, so VIEW_FILES is audited
+  // once per page load/refresh rather than on every fetch.
+  const loggedViewRef = React.useRef(true);
   const [error500, setError500] = useState(false);
   const [loading, setLoading] = useState(false);
   const [filesPerPage, setFilesPerPage] = useState(25);
@@ -162,13 +165,10 @@ function FileViewer({ darkMode }) {
     let url = `/api/wav-files?dateStart=${encodeURIComponent(dayjs(start).format("M_D_YYYY"))}`;
     if (end) url += `&dateEnd=${encodeURIComponent(dayjs(end).format("M_D_YYYY"))}`;
     
-    // Add role-based email filtering
-    // Only members are restricted to their own files
-    // Admins, managers, and users with no role can see all files
+    // All roles (admin/manager/member) can view & listen to all recordings.
+    // The email field is just a free filter for everyone.
     const emailValue = customEmailFilter !== null ? customEmailFilter : emailFilter;
-    const effectiveEmailFilter = isAdmin || userRole === undefined
-      ? emailValue
-      : userEmail; // Only members are restricted to their own files
+    const effectiveEmailFilter = emailValue;
 
     const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
     const phoneValueRaw = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
@@ -204,6 +204,13 @@ function FileViewer({ darkMode }) {
     if (currentTimeMode === "range") {
       if (startTime) url += `&timeStart=${encodeURIComponent(dayjs(startTime).format("h:mm A"))}`;
       if (endTime) url += `&timeEnd=${encodeURIComponent(dayjs(endTime).format("h:mm A"))}`;
+    }
+
+    // Audit VIEW_FILES only on the first fetch after a page load/refresh,
+    // not on subsequent filter/sort/pagination fetches.
+    if (loggedViewRef.current) {
+      url += `&logView=1`;
+      loggedViewRef.current = false;
     }
 
     const makeRequest = async () => {
@@ -1333,9 +1340,8 @@ function FileViewer({ darkMode }) {
               fullWidth
               size="small"
               label="Email"
-              value={(isAdmin || userRole === undefined) ? emailFilter : userEmail}
-              onChange={(e) => (isAdmin || userRole === undefined) && setEmailFilter(e.target.value)}
-              disabled={!(isAdmin || userRole === undefined)}
+              value={emailFilter}
+              onChange={(e) => setEmailFilter(e.target.value)}
               InputProps={{
                 startAdornment: <InputAdornment position="start">📧</InputAdornment>,
               }}

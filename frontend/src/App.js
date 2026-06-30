@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { ClerkProvider, SignIn, SignUp, SignedIn, SignedOut, UserButton, useUser, useClerk } from '@clerk/clerk-react';
+import { LogtoProvider, useLogto, useHandleSignInCallback, UserScope } from '@logto/react';
 import { BrowserRouter as Router, Routes, Route, Navigate, Link } from 'react-router-dom';
 import {
   AppBar,
@@ -20,10 +20,23 @@ import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import FileViewer from './FileViewer';
 import AdminPage from './AdminPage';
 import ReportsPage from './ReportsPage';
+import { AuthProvider, useUser, useAuth } from './auth';
 
-// Try build-time env var first, then runtime config
-const CLERK_PUBLISHABLE_KEY = process.env.REACT_APP_CLERK_PUBLISHABLE_KEY;
+// Build-time env fallbacks; runtime values come from /api/config.
+const ENV_LOGTO_ENDPOINT = process.env.REACT_APP_LOGTO_ENDPOINT;
+const ENV_LOGTO_APP_ID = process.env.REACT_APP_LOGTO_APP_ID;
+const ENV_LOGTO_API_RESOURCE = process.env.REACT_APP_LOGTO_API_RESOURCE;
+
 const DEFAULT_ALLOWED_LOGIN_IDENTIFIERS = ['mtgpros.com'];
+
+// Scopes requested from Logto: profile + email (for the allowlist/verification
+// checks). The role is derived from the API access token's permission scopes
+// (see auth.js), so we do NOT request the `roles` user scope — some Logto
+// setups reject it with invalid_scope.
+const LOGTO_SCOPES = [UserScope.Email, UserScope.Profile];
+
+const SIGN_IN_REDIRECT_URI = `${window.location.origin}/callback`;
+const POST_SIGN_OUT_REDIRECT_URI = `${window.location.origin}/`;
 
 function parseAllowedIdentifiers(value, fallbackList = DEFAULT_ALLOWED_LOGIN_IDENTIFIERS) {
   const hasValue = typeof value === 'string' && value.trim().length > 0;
@@ -82,9 +95,19 @@ function matchesAllowedIdentifier(email, identifier) {
 
 const ENV_ALLOWED_LOGIN_CONFIG = normalizeAllowedLoginConfig(process.env.REACT_APP_ALLOWED_LOGIN_IDENTIFIERS);
 
+// Small reusable sign-out button for the access-denied / unverified screens.
+function SignOutButton({ children = 'Sign out' }) {
+  const { signOut } = useLogto();
+  return (
+    <Button variant="outlined" size="small" onClick={() => signOut(POST_SIGN_OUT_REDIRECT_URI)}>
+      {children}
+    </Button>
+  );
+}
+
 // Domain validation component
 function DomainValidator({ children, allowedLoginConfig }) {
-  const { user, isLoaded } = useUser();
+  const { user, isLoaded, roleResolved } = useUser();
 
   if (!isLoaded) {
     return <div>Loading...</div>;
@@ -117,7 +140,7 @@ function DomainValidator({ children, allowedLoginConfig }) {
             <Typography variant="body2" color="text.secondary" paragraph>
               If you believe this is an error, please contact your administrator.
             </Typography>
-            <UserButton afterSignOutUrl="/" />
+            <SignOutButton />
           </Box>
         </Paper>
       </Container>
@@ -143,29 +166,72 @@ function DomainValidator({ children, allowedLoginConfig }) {
             <Typography variant="body2" color="text.secondary" paragraph>
               Check your email for a verification link, or contact your administrator if you need assistance.
             </Typography>
-            <UserButton afterSignOutUrl="/" />
+            <SignOutButton />
           </Box>
         </Paper>
       </Container>
     );
   }
 
-  // User has valid allowlist match and verified email, render the app
+  // Wait for the role lookup before deciding authorized vs. unauthorized, so a
+  // user who has a role doesn't briefly flash the unauthorized screen.
+  if (!roleResolved) {
+    return <div>Loading...</div>;
+  }
+
+  // No recbot role (none of admin/manager/member) => not authorized.
+  const role = user?.publicMetadata?.role;
+  if (!role) {
+    return (
+      <Container maxWidth="md" sx={{ mt: 8 }}>
+        <Paper sx={{ p: 4, textAlign: 'center' }}>
+          <Alert severity="error" sx={{ mb: 3 }}>
+            <Typography variant="h5" gutterBottom>
+              Not Authorized
+            </Typography>
+            <Typography variant="body1" paragraph>
+              Your account does not have a role for this application.
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              Signed in as: <strong>{userEmail}</strong>
+            </Typography>
+          </Alert>
+          <Box sx={{ mt: 3 }}>
+            <Typography variant="body2" color="text.secondary" paragraph>
+              Please contact your administrator to be granted access.
+            </Typography>
+            <SignOutButton />
+          </Box>
+        </Paper>
+      </Container>
+    );
+  }
+
+  // User has valid allowlist match, verified email, and a role — render the app
   return children;
 }
 
 function Navigation({ darkMode, setDarkMode }) {
   const { user } = useUser();
-  const { signOut } = useClerk();
+  const { signOut } = useLogto();
+  const { getToken } = useAuth();
   const isAdmin = user?.publicMetadata?.role === 'admin';
+  const isManager = user?.publicMetadata?.role === 'manager';
 
   const handleLogout = async () => {
     try {
-      await fetch('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const token = await getToken();
+      await fetch('/api/logout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {})
+        }
+      });
     } catch (e) {
       console.error('Failed to record logout', e);
     } finally {
-      await signOut({ redirectUrl: '/' });
+      signOut(POST_SIGN_OUT_REDIRECT_URI);
     }
   };
 
@@ -175,26 +241,31 @@ function Navigation({ darkMode, setDarkMode }) {
         <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
           MTGPros Five9 Recordings
         </Typography>
-        
+
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
           {isAdmin && (
             <Button component={Link} to="/admin" variant="outlined" size="small">
               Admin Dashboard
             </Button>
           )}
-          
+          {!isAdmin && isManager && (
+            <Button component={Link} to="/admin" variant="outlined" size="small">
+              Reporting
+            </Button>
+          )}
+
           <Button component={Link} to="/" variant="text" size="small">
             Recordings
           </Button>
           <Button component={Link} to="/reports" variant="text" size="small">
             Reports
           </Button>
-          
+
           <FormControlLabel
             control={<Switch checked={darkMode} onChange={(e) => setDarkMode(e.target.checked)} />}
             label="Dark Mode"
           />
-          
+
           <Button variant="outlined" size="small" color="error" onClick={handleLogout}>Logout</Button>
         </Box>
       </Toolbar>
@@ -202,10 +273,63 @@ function Navigation({ darkMode, setDarkMode }) {
   );
 }
 
+function LoadingScreen({ text = 'Loading...' }) {
+  return (
+    <Container maxWidth="sm" sx={{ mt: 8 }}>
+      <Box sx={{ textAlign: 'center', p: 4 }}>
+        <Typography variant="h6">{text}</Typography>
+      </Box>
+    </Container>
+  );
+}
+
+// Handles the OIDC redirect back from Logto at /callback.
+function Callback() {
+  const { error } = useHandleSignInCallback(() => {
+    // Mark that we just re-authorized (so AuthProvider doesn't immediately
+    // re-authorize again — prevents a redirect loop) and return to the page the
+    // user was on before the round-trip.
+    sessionStorage.setItem('logto_reauthed', '1');
+    const returnPath = sessionStorage.getItem('logto_return_path') || '/';
+    sessionStorage.removeItem('logto_return_path');
+    window.location.replace(returnPath);
+  });
+
+  if (error) {
+    return (
+      <Container maxWidth="sm" sx={{ mt: 8 }}>
+        <Box sx={{ textAlign: 'center', p: 4, bgcolor: 'error.light', borderRadius: 2 }}>
+          <Typography variant="h5" color="error" gutterBottom>⚠️ Sign-in Error</Typography>
+          <Typography variant="body1">{error.message || String(error)}</Typography>
+        </Box>
+      </Container>
+    );
+  }
+
+  return <LoadingScreen text="Completing sign-in..." />;
+}
+
+function SignInScreen() {
+  const { signIn } = useLogto();
+  return (
+    <Container maxWidth="sm" sx={{ mt: 8 }}>
+      <Typography variant="h4" gutterBottom align="center">
+        MTGPros Five9 Recordings
+      </Typography>
+      <Box sx={{ display: 'flex', justifyContent: 'center', mt: 4 }}>
+        <Button variant="contained" size="large" onClick={() => signIn(SIGN_IN_REDIRECT_URI)}>
+          Sign in
+        </Button>
+      </Box>
+    </Container>
+  );
+}
+
 function AppContent({ allowedLoginConfig }) {
+  const { isAuthenticated, isLoading } = useLogto();
   const [darkMode, setDarkMode] = useState(localStorage.getItem('darkMode') === 'true');
 
-  React.useEffect(() => {
+  useEffect(() => {
     localStorage.setItem('darkMode', darkMode);
   }, [darkMode]);
 
@@ -213,40 +337,47 @@ function AppContent({ allowedLoginConfig }) {
     palette: { mode: darkMode ? "dark" : "light" },
   });
 
+  // Handle the OIDC callback before any auth gating.
+  const isCallback = typeof window !== 'undefined' && window.location.pathname === '/callback';
+
+  let body;
+  if (isCallback) {
+    body = <Callback />;
+  } else if (isAuthenticated) {
+    // Authenticated: render the app and IGNORE isLoading. The Logto SDK toggles
+    // isLoading during background token refreshes; gating on it here would
+    // unmount/remount the whole app subtree (and re-fire every mount fetch) on
+    // each refresh — a request storm. Only use isLoading for the first load.
+    body = (
+      <Router>
+        <DomainValidator allowedLoginConfig={allowedLoginConfig}>
+          <Navigation darkMode={darkMode} setDarkMode={setDarkMode} />
+          <Routes>
+            <Route path="/" element={<FileViewer darkMode={darkMode} />} />
+            <Route path="/admin" element={<AdminPage darkMode={darkMode} />} />
+            <Route path="/reports" element={<ReportsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </DomainValidator>
+      </Router>
+    );
+  } else if (isLoading) {
+    body = <LoadingScreen />;
+  } else {
+    body = <SignInScreen />;
+  }
+
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
       <LocalizationProvider dateAdapter={AdapterDayjs}>
-        <Router>
-          <SignedIn>
-            <DomainValidator allowedLoginConfig={allowedLoginConfig}>
-              <Navigation darkMode={darkMode} setDarkMode={setDarkMode} />
-              <Routes>
-                <Route path="/" element={<FileViewer darkMode={darkMode} />} />
-                <Route path="/admin" element={<AdminPage darkMode={darkMode} />} />
-                <Route path="/reports" element={<ReportsPage />} />
-                <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
-            </DomainValidator>
-          </SignedIn>
-          
-          <SignedOut>
-            <Container maxWidth="sm" sx={{ mt: 8 }}>
-              <Typography variant="h4" gutterBottom align="center">
-                MTGPros Five9 Recordings
-              </Typography>
-              <Box sx={{ display: 'flex', justifyContent: 'center' }}>
-                <SignIn routing="hash" />
-              </Box>
-            </Container>
-          </SignedOut>
-        </Router>
+        {body}
       </LocalizationProvider>
     </ThemeProvider>
   );
 }
 
-function ClerkConfigLoader() {
+function LogtoConfigLoader() {
   const [config, setConfig] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -254,20 +385,24 @@ function ClerkConfigLoader() {
   useEffect(() => {
     let cancelled = false;
 
-    if (CLERK_PUBLISHABLE_KEY) {
-      setConfig({
-        clerkPublishableKey: CLERK_PUBLISHABLE_KEY,
-        allowedLoginConfig: ENV_ALLOWED_LOGIN_CONFIG
-      });
-      setLoading(false);
-    }
-
     fetch('/api/config')
       .then(res => res.json())
       .then(data => {
         if (cancelled) return;
 
-        if (data.clerkPublishableKey) {
+        const endpoint = data.logtoEndpoint || ENV_LOGTO_ENDPOINT;
+        const appId = data.logtoAppId || ENV_LOGTO_APP_ID;
+        const apiResource = data.logtoApiResource || ENV_LOGTO_API_RESOURCE || '';
+
+        if (endpoint && appId) {
+          // Expose the API resource for the auth hooks' getAccessToken().
+          window.__LOGTO_API_RESOURCE__ = apiResource;
+          // Expose the role mappings so the frontend resolves the role the same
+          // way the backend does (keeps the admin UI in sync). roleNames is the
+          // live source (token `roles` claim); roleScopes kept for compatibility.
+          if (data.roleScopes) window.__RECBOT_ROLE_SCOPES__ = data.roleScopes;
+          if (data.roleNames) window.__RECBOT_ROLE_NAMES__ = data.roleNames;
+
           const serverAllowedConfig = data.allowedLoginConfig
             ? normalizeAllowedLoginConfig(
                 data.allowedLoginConfig,
@@ -275,32 +410,30 @@ function ClerkConfigLoader() {
               )
             : ENV_ALLOWED_LOGIN_CONFIG;
 
+          // Request the API permission scopes from the server so the access
+          // token's `scope` claim carries the user's granted permissions.
+          const apiScopes = Array.isArray(data.apiScopes) ? data.apiScopes : [];
+
           setConfig({
-            clerkPublishableKey: CLERK_PUBLISHABLE_KEY || data.clerkPublishableKey,
+            logto: {
+              endpoint,
+              appId,
+              resources: apiResource ? [apiResource] : [],
+              scopes: [...LOGTO_SCOPES, ...apiScopes],
+            },
             allowedLoginConfig: serverAllowedConfig
           });
-
-          if (!CLERK_PUBLISHABLE_KEY) {
-            setLoading(false);
-          }
         } else {
-          if (!CLERK_PUBLISHABLE_KEY) {
-            setError('Clerk publishable key not configured on server');
-          }
+          setError('Logto configuration is not available from the server.');
         }
       })
       .catch(err => {
         if (cancelled) return;
         console.error('Failed to load config:', err);
-        if (!CLERK_PUBLISHABLE_KEY) {
-          setError('Failed to load configuration');
-        }
+        setError('Failed to load configuration');
       })
       .finally(() => {
-        if (cancelled) return;
-        if (!CLERK_PUBLISHABLE_KEY) {
-          setLoading(false);
-        }
+        if (!cancelled) setLoading(false);
       });
 
     return () => {
@@ -309,16 +442,10 @@ function ClerkConfigLoader() {
   }, []);
 
   if (loading) {
-    return (
-      <Container maxWidth="sm" sx={{ mt: 8 }}>
-        <Box sx={{ textAlign: 'center', p: 4 }}>
-          <Typography variant="h6">Loading configuration...</Typography>
-        </Box>
-      </Container>
-    );
+    return <LoadingScreen text="Loading configuration..." />;
   }
 
-  if (error || !config?.clerkPublishableKey) {
+  if (error || !config) {
     return (
       <Container maxWidth="sm" sx={{ mt: 8 }}>
         <Box sx={{ textAlign: 'center', p: 4, bgcolor: 'error.light', borderRadius: 2 }}>
@@ -326,13 +453,10 @@ function ClerkConfigLoader() {
             ⚠️ Configuration Error
           </Typography>
           <Typography variant="body1" sx={{ mb: 2 }}>
-            {error || 'Clerk publishable key is not configured.'}
+            {error || 'Logto is not configured.'}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Please set CLERK_PUBLISHABLE_KEY in your server environment variables.
-          </Typography>
-          <Typography variant="caption" display="block" sx={{ mt: 2, fontFamily: 'monospace' }}>
-            Expected format: pk_test_... or pk_live_...
+            Please set LOGTO_ENDPOINT and LOGTO_APP_ID in your server environment variables.
           </Typography>
         </Box>
       </Container>
@@ -340,14 +464,16 @@ function ClerkConfigLoader() {
   }
 
   return (
-    <ClerkProvider publishableKey={config.clerkPublishableKey}>
-      <AppContent allowedLoginConfig={config.allowedLoginConfig} />
-    </ClerkProvider>
+    <LogtoProvider config={config.logto}>
+      <AuthProvider>
+        <AppContent allowedLoginConfig={config.allowedLoginConfig} />
+      </AuthProvider>
+    </LogtoProvider>
   );
 }
 
 function App() {
-  return <ClerkConfigLoader />;
+  return <LogtoConfigLoader />;
 }
 
 export default App;

@@ -22,7 +22,7 @@ import http from 'http';
 import https from 'https';
 import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
-import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig } from './auth.js';
+import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(isSameOrBefore);
@@ -67,7 +67,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(clerkAuth); // Add Clerk authentication middleware
+app.use(logtoAuth); // Logto auth (no-op passthrough; tokens verified per-route in requireAuth)
 
 // Fallback session creator: ensures every authenticated user has an active session row
 app.use(async (req, res, next) => {
@@ -656,7 +656,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   }
 });
 
-app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+app.get('/api/reports/export', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, hasRecording, sort } = req.query;
 
@@ -880,7 +880,14 @@ app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, async 
 // Public endpoint to get client configuration
 app.get('/api/config', (req, res) => {
   res.json({
-    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+    logtoEndpoint: process.env.LOGTO_ENDPOINT,
+    logtoAppId: process.env.LOGTO_APP_ID,
+    logtoApiResource: process.env.LOGTO_API_RESOURCE,
+    // scope -> role mapping, and the list of permission scopes the SPA should request
+    roleScopes: ROLE_SCOPES,
+    apiScopes: Object.values(ROLE_SCOPES),
+    // role-name -> app-role mapping (the live source: token `roles` claim)
+    roleNames: ROLE_NAMES,
     allowedLoginConfig: {
       allowAll: allowedLoginConfig.allowAll,
       entries: Array.isArray(allowedLoginConfig.entries) ? [...allowedLoginConfig.entries] : []
@@ -1638,32 +1645,35 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
     // Email filtering - allow all users to view all files (no email filtering)
     let effectiveEmail = email?.trim() || null;
     
-    // All authenticated users can view all files
-    console.log(`📄 [VIEW_FILES] User ${req.user.email} viewing file list`);
-    try {
-      await logAuditEvent(
-        req.user.id,
-        req.user.email,
-        'VIEW_FILES',
-        null,
-        phone?.trim() || null,
-        req.user.ipAddress,
-        req.user.userAgent,
-        null,
-        {
-          userRole: req.user.role,
-          dateStart: dateStart || null,
-          dateEnd: dateEnd || null,
-          durationMin: durationMin ? parseInt(durationMin) : null,
-          timeStart: timeStart || null,
+    // Audit VIEW_FILES only on the initial page load/refresh (frontend sends
+    // logView=1 on its first fetch), not on every filter/sort/pagination fetch.
+    if (req.query.logView === '1') {
+      console.log(`📄 [VIEW_FILES] User ${req.user.email} viewing file list`);
+      try {
+        await logAuditEvent(
+          req.user.id,
+          req.user.email,
+          'VIEW_FILES',
+          null,
+          phone?.trim() || null,
+          req.user.ipAddress,
+          req.user.userAgent,
+          null,
+          {
+            userRole: req.user.role,
+            dateStart: dateStart || null,
+            dateEnd: dateEnd || null,
+            durationMin: durationMin ? parseInt(durationMin) : null,
+            timeStart: timeStart || null,
             timeEnd: timeEnd || null,
-          sort: `${sortColumn}:${sortDirection}`,
-          offset: parseInt(offset) || 0,
-          limit: parseInt(limit) || 25
-        }
-      );
-    } catch (auditErr) {
-      console.error('⚠️ [AUDIT] Failed to log view files event:', auditErr);
+            sort: `${sortColumn}:${sortDirection}`,
+            offset: parseInt(offset) || 0,
+            limit: parseInt(limit) || 25
+          }
+        );
+      } catch (auditErr) {
+        console.error('⚠️ [AUDIT] Failed to log view files event:', auditErr);
+      }
     }
     
     // Note: Download protection is handled at the audio streaming level
@@ -1929,7 +1939,7 @@ app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin
   }
 });
 
-app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const rows = await getUserUsageReport(startDate || null, endDate || null);
@@ -1998,7 +2008,7 @@ app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, a
   }
 });
 
-app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const exportResult = await exportUserUsageReport(startDate || null, endDate || null);

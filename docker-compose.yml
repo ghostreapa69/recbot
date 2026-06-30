@@ -22,7 +22,12 @@ services:
       - recbot
 
   recbot:
-    image: ghostreaper69/recbot:v2.2.1
+    # Build from the local source (bakes the Logto frontend into the image).
+    # Without this, compose pulls the old published image with the Clerk UI.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghostreaper69/recbot:local
     container_name: "recbot"
     depends_on:
       postgres:
@@ -58,11 +63,23 @@ services:
       - AWS_REGION=your-aws-region-here
       - AWS_BUCKET=your-aws-bucket-name-here
 
-      # --- Clerk Authentication ---
-      - CLERK_PUBLISHABLE_KEY=pk_test_your_clerk_publishable_key_here
-      - CLERK_SECRET_KEY=sk_test_your_clerk_secret_key_here
+      # --- Logto Authentication ---
+      # Backend: validates access tokens against this Logto tenant + API resource.
+      - LOGTO_ENDPOINT=https://your-tenant.logto.app
+      - LOGTO_APP_ID=your-logto-spa-app-id
+      - LOGTO_API_RESOURCE=https://recbot.api
+      # Optional: override the permission scopes mapped to each role
+      # (defaults shown). Must match the scopes assigned to your Logto roles.
+      #- LOGTO_SCOPE_ADMIN=recbot:admin
+      #- LOGTO_SCOPE_MANAGER=recbot:manage
+      #- LOGTO_SCOPE_MEMBER=recbot:read
       - ALLOWED_LOGIN_IDENTIFIERS=mtgpros.com
-      - REACT_APP_CLERK_PUBLISHABLE_KEY=pk_test_your_clerk_publishable_key_here
+      # Frontend reads Logto config at runtime from /api/config, so the
+      # REACT_APP_LOGTO_* vars below are only build-time fallbacks (baked into
+      # the image at build, not read at runtime). The allowlist value IS used.
+      #- REACT_APP_LOGTO_ENDPOINT=https://your-tenant.logto.app
+      #- REACT_APP_LOGTO_APP_ID=your-logto-spa-app-id
+      #- REACT_APP_LOGTO_API_RESOURCE=https://recbot.api
       - REACT_APP_ALLOWED_LOGIN_IDENTIFIERS=mtgpros.com
 
       # --- Session & Security Controls ---
