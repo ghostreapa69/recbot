@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useUser, useAuth } from './auth';
-import { Container, Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Paper, Pagination, Stack, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer, Link as MuiLink } from '@mui/material';
+import { Container, Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Paper, Pagination, Stack, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer, TableSortLabel, Link as MuiLink } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import { LocalizationProvider, DateTimePicker } from '@mui/x-date-pickers';
 import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
@@ -194,6 +194,11 @@ export default function ReportsPage(){
   const [callId,setCallId]=useState('');
   const [customerName,setCustomerName]=useState('');
   const [afterCallWork,setAfterCallWork]=useState('');
+  // Typed text, and the debounced copy that actually filters (like agentInput/agentFilter).
+  const [callTimeMinInput,setCallTimeMinInput]=useState('');
+  const [callTimeMaxInput,setCallTimeMaxInput]=useState('');
+  const [callTimeMin,setCallTimeMin]=useState('');
+  const [callTimeMax,setCallTimeMax]=useState('');
   const [transfersFilter,setTransfersFilter]=useState('');
   const [conferencesFilter,setConferencesFilter]=useState('');
   const [abandonedFilter,setAbandonedFilter]=useState('');
@@ -207,6 +212,7 @@ export default function ReportsPage(){
   // The API caps the row count and only computes it on page 1; totalCapped means "at least this many".
   const [totalCapped,setTotalCapped]=useState(false);
   const [sortOrder,setSortOrder]=useState('desc');
+  const [sortBy,setSortBy]=useState('timestamp'); // 'timestamp' | 'callTime'
   const [initialized,setInitialized]=useState(false);
   const [reportExporting,setReportExporting]=useState(false);
   const isAdmin = user?.publicMetadata?.role === 'admin';
@@ -215,7 +221,7 @@ export default function ReportsPage(){
 
   const columns = React.useMemo(() => ([
     { key:'call_id', label:'Call ID', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
-    { key:'timestamp', label:'Timestamp', render: formatTimestamp, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'timestamp', label:'Timestamp', sortKey:'timestamp', render: formatTimestamp, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'campaign', label:'Campaign', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'call_type', label:'Call Type', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'agent', label:'Agent', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
@@ -231,7 +237,7 @@ export default function ReportsPage(){
     { key:'ivr_time', label:'IVR', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'park_time', label:'Park', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'after_call_work_time', label:'After Call Work', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
-    { key:'call_time', label:'Call Time', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
+    { key:'call_time', label:'Call Time', sortKey:'callTime', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'bill_time_rounded', label:'Bill Rounded', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'transfers', label:'Transfers', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'conferences', label:'Conferences', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
@@ -299,11 +305,16 @@ export default function ReportsPage(){
           console.warn('[Reports] Ignoring After Call Work filter; expected minimum seconds or HH:MM:SS.');
         }
       }
+      const callTimeMinMs = parseDurationInput(callTimeMin);
+      if (callTimeMinMs !== null) params.append('callTimeMin', String(callTimeMinMs));
+      const callTimeMaxMs = parseDurationInput(callTimeMax);
+      if (callTimeMaxMs !== null) params.append('callTimeMax', String(callTimeMaxMs));
       if (transfersFilter !== '') params.append('transfers', transfersFilter);
       if (conferencesFilter !== '') params.append('conferences', conferencesFilter);
       if (abandonedFilter !== '') params.append('abandoned', abandonedFilter);
       if (hasRecordingFilter !== '') params.append('hasRecording', hasRecordingFilter);
       params.append('sort', sortOrder);
+      params.append('sortBy', sortBy);
       params.append('limit', pageSize);
       params.append('offset', (page - 1) * pageSize);
       const res = await fetch(`/api/reports?${params.toString()}`, { headers: { Authorization: `Bearer ${token}` }});
@@ -321,7 +332,7 @@ export default function ReportsPage(){
     } catch (e) {
       setError(e.message);
     } finally { setLoading(false); }
-  }, [getToken, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, startDate, endDate, page, pageSize, sortOrder]);
+  }, [getToken, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, startDate, endDate, page, pageSize, sortOrder, sortBy]);
 
   const ingest = async () => {
     if(!isAdmin) return;
@@ -402,11 +413,16 @@ export default function ReportsPage(){
           console.warn('[Reports] Ignoring After Call Work export filter; expected minimum seconds or HH:MM:SS.');
         }
       }
+      const callTimeMinMs = parseDurationInput(callTimeMin);
+      if (callTimeMinMs !== null) params.append('callTimeMin', String(callTimeMinMs));
+      const callTimeMaxMs = parseDurationInput(callTimeMax);
+      if (callTimeMaxMs !== null) params.append('callTimeMax', String(callTimeMaxMs));
       if (transfersFilter !== '') params.append('transfers', transfersFilter);
       if (conferencesFilter !== '') params.append('conferences', conferencesFilter);
       if (abandonedFilter !== '') params.append('abandoned', abandonedFilter);
       if (hasRecordingFilter !== '') params.append('hasRecording', hasRecordingFilter);
       params.append('sort', sortOrder);
+      params.append('sortBy', sortBy);
 
       const qs = params.toString();
       const response = await fetch(`/api/reports/export${qs ? `?${qs}` : ''}`, {
@@ -440,7 +456,7 @@ export default function ReportsPage(){
     } finally {
       setReportExporting(false);
     }
-  }, [canExportReports, reportExporting, getToken, startDate, endDate, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, sortOrder]);
+  }, [canExportReports, reportExporting, getToken, startDate, endDate, agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, sortOrder, sortBy]);
 
   useEffect(() => { 
     if (initialized) {
@@ -470,6 +486,15 @@ export default function ReportsPage(){
     return () => clearTimeout(handle);
   }, [agentInput]);
 
+  // Same for call time, so typing "00:05:00" runs one query instead of one per keystroke
+  useEffect(() => {
+    const handle = setTimeout(() => {
+      setCallTimeMin(callTimeMinInput);
+      setCallTimeMax(callTimeMaxInput);
+    }, 400);
+    return () => clearTimeout(handle);
+  }, [callTimeMinInput, callTimeMaxInput]);
+
   // Set default preset to 'lastHour' on mount
   useEffect(() => {
     applyPreset('lastHour');
@@ -479,8 +504,17 @@ export default function ReportsPage(){
   // Reset page to 1 when filters change to avoid empty result pages
   useEffect(() => {
     setPage(1);
-  }, [agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, startDate, endDate, sortOrder, pageSize]);
+  }, [agentFilter, campaign, callType, disposition, phoneNumber, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter, startDate, endDate, sortOrder, sortBy, pageSize]);
 
+  // Header clicks: toggle the active column, or start a new one newest/longest first.
+  const handleSortClick = (key) => {
+    if (sortBy === key) {
+      setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc');
+    } else {
+      setSortBy(key);
+      setSortOrder('desc');
+    }
+  };
 
   function applyPreset(p){
     const now = dayjs();
@@ -563,6 +597,8 @@ export default function ReportsPage(){
           <TextField label="Call ID" value={callId} onChange={e=>setCallId(e.target.value)} size="small" />
           <TextField label="Customer Name" value={customerName} onChange={e=>setCustomerName(e.target.value)} size="small" sx={{ minWidth:200 }} />
           <TextField label="After Call Work (min)" value={afterCallWork} onChange={e=>setAfterCallWork(e.target.value)} size="small" sx={{ minWidth:190 }} placeholder="min seconds or HH:MM:SS" />
+          <TextField label="Min Call Time" value={callTimeMinInput} onChange={e=>setCallTimeMinInput(e.target.value)} size="small" sx={{ minWidth:170 }} placeholder="seconds or HH:MM:SS" error={callTimeMin.trim() !== '' && parseDurationInput(callTimeMin) === null} />
+          <TextField label="Max Call Time" value={callTimeMaxInput} onChange={e=>setCallTimeMaxInput(e.target.value)} size="small" sx={{ minWidth:170 }} placeholder="seconds or HH:MM:SS" error={callTimeMax.trim() !== '' && parseDurationInput(callTimeMax) === null} />
           <FormControl size="small" sx={{ minWidth:150 }}>
             <InputLabel id="transfers-filter-label">Transfers</InputLabel>
             <Select labelId="transfers-filter-label" value={transfersFilter} label="Transfers" onChange={e=>setTransfersFilter(e.target.value)}>
@@ -595,15 +631,17 @@ export default function ReportsPage(){
               <MenuItem value="0">No</MenuItem>
             </Select>
           </FormControl>
-        <FormControl size="small" sx={{ minWidth:150 }}>
+        <FormControl size="small" sx={{ minWidth:190 }}>
           <InputLabel id="sort-order-label">Sort</InputLabel>
-          <Select labelId="sort-order-label" value={sortOrder} label="Sort" onChange={(e)=>setSortOrder(e.target.value)}>
-            <MenuItem value="desc">Newest First</MenuItem>
-            <MenuItem value="asc">Oldest First</MenuItem>
+          <Select labelId="sort-order-label" value={`${sortBy}:${sortOrder}`} label="Sort" onChange={(e)=>{ const [by, order] = e.target.value.split(':'); setSortBy(by); setSortOrder(order); }}>
+            <MenuItem value="timestamp:desc">Newest First</MenuItem>
+            <MenuItem value="timestamp:asc">Oldest First</MenuItem>
+            <MenuItem value="callTime:desc">Longest Call Time</MenuItem>
+            <MenuItem value="callTime:asc">Shortest Call Time</MenuItem>
           </Select>
         </FormControl>
-        <Button variant="contained" onClick={()=>{ setAgentFilter(agentInput); setPage(1); }} disabled={loading}>Apply</Button>
-        <Button variant="text" onClick={()=>{ setAgentInput(''); setAgentFilter(''); setCampaign(''); setCallType(''); setDisposition(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); setHasRecordingFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
+        <Button variant="contained" onClick={()=>{ setAgentFilter(agentInput); setCallTimeMin(callTimeMinInput); setCallTimeMax(callTimeMaxInput); setPage(1); }} disabled={loading}>Apply</Button>
+        <Button variant="text" onClick={()=>{ setAgentInput(''); setAgentFilter(''); setCampaign(''); setCallType(''); setDisposition(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setCallTimeMinInput(''); setCallTimeMaxInput(''); setCallTimeMin(''); setCallTimeMax(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); setHasRecordingFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('lastHour')} disabled={loading}>Last Hour</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('today')} disabled={loading}>Today</Button>
         <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>
@@ -621,7 +659,15 @@ export default function ReportsPage(){
           <TableRow>
             {columns.map(col => (
               <TableCell key={col.key} sx={{ whiteSpace:'nowrap', ...(col.headerSx || {}) }}>
-                {col.label}
+                {col.sortKey ? (
+                  <TableSortLabel
+                    active={sortBy === col.sortKey}
+                    direction={sortBy === col.sortKey ? sortOrder : 'desc'}
+                    onClick={() => handleSortClick(col.sortKey)}
+                  >
+                    {col.label}
+                  </TableSortLabel>
+                ) : col.label}
               </TableCell>
             ))}
           </TableRow>

@@ -1577,7 +1577,7 @@ export async function bulkUpsertReports(rows = []) {
   }
 }
 
-function buildReportWhereClause(params, { start, end, agent, agentName, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned }, { alias = '' } = {}) {
+function buildReportWhereClause(params, { start, end, agent, agentName, campaign, callType, disposition, phone, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfers, conferences, abandoned }, { alias = '' } = {}) {
   const conditions = [];
   let paramIdx = params.length + 1;
   const p = alias ? `${alias}.` : '';
@@ -1606,6 +1606,8 @@ function buildReportWhereClause(params, { start, end, agent, agentName, campaign
   if (callId) { conditions.push(`${p}call_id LIKE '%' || $${paramIdx++} || '%'`); params.push(callId); }
   if (customerName) { conditions.push(`${p}customer_name LIKE '%' || $${paramIdx++} || '%'`); params.push(customerName); }
   if (afterCallWork !== null && afterCallWork !== undefined) { conditions.push(`${p}after_call_work_time >= $${paramIdx++}`); params.push(afterCallWork); }
+  if (callTimeMin !== null && callTimeMin !== undefined) { conditions.push(`${p}call_time >= $${paramIdx++}`); params.push(callTimeMin); }
+  if (callTimeMax !== null && callTimeMax !== undefined) { conditions.push(`${p}call_time <= $${paramIdx++}`); params.push(callTimeMax); }
   if (transfers !== null && transfers !== undefined) { conditions.push(`${p}transfers = $${paramIdx++}`); params.push(transfers); }
   if (conferences !== null && conferences !== undefined) { conditions.push(`${p}conferences = $${paramIdx++}`); params.push(conferences); }
   if (abandoned !== null && abandoned !== undefined) { conditions.push(`${p}abandoned = $${paramIdx++}`); params.push(abandoned); }
@@ -1613,7 +1615,20 @@ function buildReportWhereClause(params, { start, end, agent, agentName, campaign
   return conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 }
 
-export async function queryReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, limit = 100, offset = 0, sort = 'desc' } = {}) {
+// Call-time sorts put calls with no recorded call time last in both directions,
+// and break ties newest-first so pages stay stable.
+// There is deliberately no index on call_time: with one, the planner walks it for
+// date-ranged sorts and, because call_id order tracks time, can read every
+// zero-length call ever made before reaching the range (30 days, shortest first:
+// 0.26s -> 1.5s on 3M rows). Without it a date-ranged sort is a top-N sort over
+// that range; only an all-dates sort scans the whole table.
+function buildReportOrderBy(sortBy, sortDir, { alias = '' } = {}) {
+  const p = alias ? `${alias}.` : '';
+  if (sortBy === 'callTime') return `ORDER BY ${p}call_time ${sortDir} NULLS LAST, ${p}timestamp DESC, ${p}call_id DESC`;
+  return `ORDER BY ${p}timestamp ${sortDir}`;
+}
+
+export async function queryReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, callTimeMin = null, callTimeMax = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, limit = 100, offset = 0, sort = 'desc', sortBy = 'timestamp' } = {}) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => { if (v === null || v === undefined) return null; const str = String(v).trim(); return str === '' ? null : str; };
@@ -1624,15 +1639,16 @@ export async function queryReports({ start = null, end = null, agent = null, age
     const c = norm(campaign), ct = norm(callType), disp = norm(disposition);
     const phoneNorm = normLike(phone), ci = normLike(callId), cust = normLike(customerName);
     const acw = normDuration(afterCallWork), tr = normBinary(transfers), conf = normBinary(conferences), ab = normBinary(abandoned);
+    const ctMin = normDuration(callTimeMin), ctMax = normDuration(callTimeMax);
     const hr = normBinary(hasRecording);
     const sortDir = sort === 'asc' ? 'ASC' : 'DESC';
 
-    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, agentName=${aName}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
+    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, agentName=${aName}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, callTimeMin=${ctMin}, callTimeMax=${ctMax}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sortBy=${sortBy}, sort=${sortDir}`);
 
     const filterArgs = {
       start: s, end: e, agent: a, agentName: aName, campaign: c, callType: ct,
       disposition: disp, phone: phoneNorm, callId: ci, customerName: cust,
-      afterCallWork: acw, transfers: tr, conferences: conf, abandoned: ab
+      afterCallWork: acw, callTimeMin: ctMin, callTimeMax: ctMax, transfers: tr, conferences: conf, abandoned: ab
     };
 
     // Build WHERE clause with "r." alias for the data query
@@ -1673,7 +1689,7 @@ export async function queryReports({ start = null, end = null, agent = null, age
     const dataQuery = `SELECT ${reportCols}
       FROM reporting r
       ${dataWhereClause}
-      ORDER BY r.timestamp ${sortDir} LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
+      ${buildReportOrderBy(sortBy, sortDir, { alias: 'r' })} LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
 
     // The count is the expensive half of this request: LIMIT bounds the data
     // query, but nothing bounds a COUNT(*). Two mitigations:
@@ -1709,7 +1725,7 @@ export async function queryReports({ start = null, end = null, agent = null, age
   }
 }
 
-export async function exportReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, sort = 'desc' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
+export async function exportReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, callTimeMin = null, callTimeMax = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, sort = 'desc', sortBy = 'timestamp' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => { if (v === null || v === undefined) return null; const str = String(v).trim(); return str === '' ? null : str; };
@@ -1721,13 +1737,14 @@ export async function exportReports({ start = null, end = null, agent = null, ag
     const phoneNorm = normLike(phone), ci = normLike(callId), cust = normLike(customerName);
     const hr = normBinary(hasRecording);
     const acw = normDuration(afterCallWork), tr = normBinary(transfers), conf = normBinary(conferences), ab = normBinary(abandoned);
+    const ctMin = normDuration(callTimeMin), ctMax = normDuration(callTimeMax);
     const sortDir = sort === 'asc' ? 'ASC' : 'DESC';
 
     const params = [];
     const whereClause = buildReportWhereClause(params, {
       start: s, end: e, agent: a, agentName: aName, campaign: c, callType: ct,
       disposition: disp, phone: phoneNorm, callId: ci, customerName: cust,
-      afterCallWork: acw, transfers: tr, conferences: conf, abandoned: ab
+      afterCallWork: acw, callTimeMin: ctMin, callTimeMax: ctMax, transfers: tr, conferences: conf, abandoned: ab
     });
 
     let countHasRecording = '';
@@ -1755,7 +1772,7 @@ export async function exportReports({ start = null, end = null, agent = null, ag
     const total = counted;
 
     const dataResult = await pool.query(
-      `SELECT * FROM reporting ${whereClause}${countHasRecording} ORDER BY timestamp ${sortDir}`,
+      `SELECT * FROM reporting ${whereClause}${countHasRecording} ${buildReportOrderBy(sortBy, sortDir)}`,
       params
     );
 

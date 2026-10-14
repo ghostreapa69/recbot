@@ -488,7 +488,7 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, hasRecording, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfers, conferences, abandoned, hasRecording, limit = 100, offset = 0, timezone: userTimezone, sort, sortBy } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
@@ -505,6 +505,8 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     callId = cleanParam(callId);
     customerName = cleanParam(customerName);
     afterCallWork = cleanParam(afterCallWork);
+    callTimeMin = cleanParam(callTimeMin);
+    callTimeMax = cleanParam(callTimeMax);
     transfers = cleanParam(transfers);
     conferences = cleanParam(conferences);
     abandoned = cleanParam(abandoned);
@@ -539,7 +541,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       agent = null;
     }
 
-    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", agentName="${agentName}", agentSearchType="${agentSearchType}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
+    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", agentName="${agentName}", agentSearchType="${agentSearchType}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", callTimeMin="${callTimeMin}", callTimeMax="${callTimeMax}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
     
     const startFormatted = normalizeReportTimestamp(start);
     const endFormatted = normalizeReportTimestamp(end);
@@ -564,12 +566,15 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     };
 
     const afterCallWorkValue = parseInteger(afterCallWork);
+    const callTimeMinValue = parseInteger(callTimeMin);
+    const callTimeMaxValue = parseInteger(callTimeMax);
     const transfersValue = parseBinary(transfers);
     const conferencesValue = parseBinary(conferences);
     const abandonedValue = parseBinary(abandoned);
     const hasRecordingValue = parseBinary(hasRecording);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const sortByValue = sortBy === 'callTime' ? 'callTime' : 'timestamp';
     const result = await queryReports({
       start: appliedStart,
       end: appliedEnd,
@@ -582,21 +587,22 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       callId,
       customerName,
       afterCallWork: afterCallWorkValue,
+      callTimeMin: callTimeMinValue,
+      callTimeMax: callTimeMaxValue,
       transfers: transfersValue,
       conferences: conferencesValue,
       abandoned: abandonedValue,
       hasRecording: hasRecordingValue,
       limit: appliedLimit,
       offset: appliedOffset,
-      sort: sortDir
+      sort: sortDir,
+      sortBy: sortByValue
     });
       const hydratedRows = await hydrateReportRows(result.rows);
-      const returnedRange = hydratedRows && hydratedRows.length ? (
-        sortDir === 'asc'
-          ? { min: hydratedRows[0].timestamp || null, max: hydratedRows[hydratedRows.length - 1].timestamp || null }
-          : { max: hydratedRows[0].timestamp || null, min: hydratedRows[hydratedRows.length - 1].timestamp || null }
-      ) : { max: null, min: null };
-    console.log(`[API /api/reports] Applied range: start="${appliedStart}" end="${appliedEnd}" limit=${appliedLimit} offset=${appliedOffset} sort=${sortDir}`);
+      // Rows may be ordered by call time, so take the extremes rather than the first and last row.
+      const returnedTimestamps = (hydratedRows || []).map(row => row.timestamp).filter(Boolean).sort();
+      const returnedRange = { min: returnedTimestamps[0] || null, max: returnedTimestamps[returnedTimestamps.length - 1] || null };
+    console.log(`[API /api/reports] Applied range: start="${appliedStart}" end="${appliedEnd}" limit=${appliedLimit} offset=${appliedOffset} sortBy=${sortByValue} sort=${sortDir}`);
     console.log(`[API /api/reports] Returned range: min="${returnedRange.min}" max="${returnedRange.max}" total=${result.total}`);
 
     let legacyStats = null;
@@ -630,7 +636,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
             callType: callType || null,
             phone: phone || null
           },
-          pagination: { limit: appliedLimit, offset: appliedOffset, sort: sortDir },
+          pagination: { limit: appliedLimit, offset: appliedOffset, sort: sortDir, sortBy: sortByValue },
                     returned: hydratedRows ? hydratedRows.length : 0,
           // null when the count was skipped (page 2+) — don't record that as a real zero
           total: result.total ?? null,
@@ -660,7 +666,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
 
 app.get('/api/reports/export', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, hasRecording, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfers, conferences, abandoned, hasRecording, sort, sortBy } = req.query;
 
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
     start = cleanParam(start);
@@ -676,6 +682,8 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireManagerOrAdmin
     callId = cleanParam(callId);
     customerName = cleanParam(customerName);
     afterCallWork = cleanParam(afterCallWork);
+    callTimeMin = cleanParam(callTimeMin);
+    callTimeMax = cleanParam(callTimeMax);
     transfers = cleanParam(transfers);
     conferences = cleanParam(conferences);
     abandoned = cleanParam(abandoned);
@@ -723,12 +731,15 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireManagerOrAdmin
     };
 
     const afterCallWorkValue = parseInteger(afterCallWork);
+    const callTimeMinValue = parseInteger(callTimeMin);
+    const callTimeMaxValue = parseInteger(callTimeMax);
     const transfersValue = parseBinary(transfers);
     const conferencesValue = parseBinary(conferences);
     const abandonedValue = parseBinary(abandoned);
     const hasRecordingValue = parseBinary(hasRecording);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const sortByValue = sortBy === 'callTime' ? 'callTime' : 'timestamp';
     const exportResult = await exportReports({
       start: startFormatted || null,
       end: endFormatted || null,
@@ -741,11 +752,14 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireManagerOrAdmin
       callId,
       customerName,
       afterCallWork: afterCallWorkValue,
+      callTimeMin: callTimeMinValue,
+      callTimeMax: callTimeMaxValue,
       transfers: transfersValue,
       conferences: conferencesValue,
       abandoned: abandonedValue,
       hasRecording: hasRecordingValue,
-      sort: sortDir
+      sort: sortDir,
+      sortBy: sortByValue
     });
 
     if (exportResult.error) {
@@ -818,13 +832,16 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireManagerOrAdmin
             callId: callId || null,
             customerName: customerName || null,
             afterCallWorkMin: afterCallWorkValue,
+            callTimeMin: callTimeMinValue,
+            callTimeMax: callTimeMaxValue,
             transfers: transfersValue,
             conferences: conferencesValue,
             abandoned: abandonedValue
           },
           exported: hydratedRows.length,
           total: exportResult.total,
-          sort: sortDir
+          sort: sortDir,
+          sortBy: sortByValue
         }
       );
     } catch (auditErr) {
