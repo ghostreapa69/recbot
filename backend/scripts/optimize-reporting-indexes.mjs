@@ -11,6 +11,8 @@
 //     Used when the search input has 7+ digits. Expression indexes do
 //     NOT rewrite the table, so there is no ACCESS EXCLUSIVE lock.
 //   • pg_trgm GIN indexes — substring search, used for shorter inputs.
+//   • (lower(agent), call_id) — backs the Recordings page's "Only my
+//     calls" filter, which matches agents case-insensitively.
 //
 // It also drops idx_reporting_timestamp_desc: a b-tree scans backward
 // natively, so the DESC duplicate only cost write throughput on ingest.
@@ -68,6 +70,13 @@ const STATEMENTS = [
     label: 'idx_reporting_dnis_trgm',
     sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reporting_dnis_trgm
             ON reporting USING gin (dnis gin_trgm_ops)`,
+  },
+  {
+    // Must match ownedBySql() in backend/database.js (lower(r.agent) = email);
+    // without it, "Only my calls" over a long date range scans all of reporting.
+    label: 'idx_reporting_agent_lower_call_id',
+    sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reporting_agent_lower_call_id
+            ON reporting (lower(agent), call_id)`,
   },
   {
     label: 'drop redundant idx_reporting_timestamp_desc',

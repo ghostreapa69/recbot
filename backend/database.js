@@ -285,6 +285,54 @@ export async function initializeDatabase() {
     );
   `);
 
+  // Favorites, comments and notifications on recordings. Recordings are keyed by
+  // file_path (the unique S3 key the API already uses), not files.id, and there
+  // are no foreign keys: the SQLite migration script runs
+  // TRUNCATE files RESTART IDENTITY, which an FK would block and which renumbers
+  // ids. People are keyed by lowercased email, because recording owners and
+  // notification recipients only exist as emails (files.email, reporting.agent),
+  // and user ids already changed once (Clerk -> Logto).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS recording_favorites (
+      id SERIAL PRIMARY KEY,
+      file_path TEXT NOT NULL,
+      user_email TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      user_name TEXT,
+      user_role TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (file_path, user_email)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS recording_comments (
+      id SERIAL PRIMARY KEY,
+      file_path TEXT NOT NULL,
+      user_email TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      user_name TEXT,
+      user_role TEXT NOT NULL,
+      body TEXT NOT NULL,
+      position_ms INTEGER,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      recipient_email TEXT NOT NULL,
+      type TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      actor_email TEXT NOT NULL,
+      actor_name TEXT,
+      comment_id INTEGER,
+      created_at TIMESTAMP DEFAULT NOW(),
+      read_at TIMESTAMP
+    );
+  `);
+
   // Create indexes
   // Migration: add call_disposition column to existing files tables
   await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS call_disposition TEXT;`);
@@ -318,6 +366,28 @@ export async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_user_email ON user_sessions(user_email);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_last_activity ON user_sessions(last_activity);`);
 
+  // At most one open session per user. A page load fires several API requests
+  // at once, and each used to see "no open session", open its own and log a
+  // LOGIN; with this index logUserSession() lets exactly one of them win.
+  // First close duplicates left by that race — each user keeps the newest and
+  // the others end when it began — or the index can't be built.
+  await pool.query(`
+    WITH ranked AS (
+      SELECT id,
+             first_value(login_time) OVER newest_first AS kept_login,
+             row_number() OVER newest_first AS rn
+      FROM user_sessions
+      WHERE logout_time IS NULL
+      WINDOW newest_first AS (PARTITION BY user_id ORDER BY login_time DESC NULLS LAST, id DESC)
+    )
+    UPDATE user_sessions s
+    SET logout_time = COALESCE(GREATEST(r.kept_login, s.login_time), NOW()),
+        session_duration_ms = EXTRACT(EPOCH FROM (COALESCE(GREATEST(r.kept_login, s.login_time), NOW()) - s.login_time)) * 1000
+    FROM ranked r
+    WHERE s.id = r.id AND r.rn > 1;
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_one_open ON user_sessions(user_id) WHERE logout_time IS NULL;`);
+
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_action_type ON audit_logs(action_type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(action_timestamp);`);
@@ -327,6 +397,12 @@ export async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_call_id ON audit_logs(call_id);`);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_identity_map_logto ON user_identity_map(logto_user_id);`);
+
+  // recording_favorites' UNIQUE (file_path, user_email) already serves per-recording lookups.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recording_favorites_user_email ON recording_favorites(user_email);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recording_comments_file_path ON recording_comments(file_path);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_email, id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_file_path ON notifications(file_path);`);
 
   // Test query
   try {
@@ -594,6 +670,17 @@ export async function indexFiles(files) {
 // ============================================================
 // File queries
 // ============================================================
+
+// A user owns a recording when their sign-in email matches the call's agent:
+// the email embedded in legacy filenames ("{phone} by {email} @ ..."), or the
+// Five9 agent username on the call's reporting row (the newest filename format
+// only carries a display name). getRecordingContext() applies the same rule in
+// JS — keep the two in lockstep. `emailParam` must bind a lowercased email.
+// lower(r.agent) is served by idx_reporting_agent_lower_call_id, built by
+// scripts/optimize-reporting-indexes.mjs; changing the expression disables it.
+const ownedBySql = (emailParam) =>
+  `(lower(f.email) = ${emailParam} OR EXISTS (SELECT 1 FROM reporting r WHERE r.call_id = f.call_id AND lower(r.agent) = ${emailParam}))`;
+
 export async function queryFiles(filters = {}) {
   const {
     dateStart,
@@ -605,6 +692,10 @@ export async function queryFiles(filters = {}) {
     timeEnd,
     callId,
     callDisposition,
+    recordingPath,
+    favorites,
+    mine,
+    viewerEmail,
     sortColumn = 'date',
     sortDirection = 'desc',
     limit = 25,
@@ -628,8 +719,18 @@ export async function queryFiles(filters = {}) {
   if (timeEnd) { conditions.push(`call_time <= $${paramIdx++}`); params.push(timeEnd); }
   if (callId) { conditions.push(`call_id LIKE '%' || $${paramIdx++} || '%'`); params.push(callId); }
   if (callDisposition) { conditions.push(`call_disposition = $${paramIdx++}`); params.push(callDisposition); }
+  if (recordingPath) { conditions.push(`f.file_path = $${paramIdx++}`); params.push(recordingPath); }
+  if (favorites === 'mine') {
+    conditions.push(`EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path AND rf.user_email = $${paramIdx++})`);
+    params.push(viewerEmail || null);
+  } else if (favorites === 'any') {
+    conditions.push(`EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path)`);
+  }
+  if (mine) { conditions.push(ownedBySql(`$${paramIdx++}`)); params.push(viewerEmail || null); }
 
   const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+  // The count query binds exactly these; Postgres rejects unused bind values.
+  const whereParamCount = params.length;
 
   // Build ORDER BY
   const sortMap = {
@@ -639,26 +740,37 @@ export async function queryFiles(filters = {}) {
     email: 'email',
     durationMs: 'duration_ms',
     callId: 'call_id',
-    callDisposition: 'call_disposition'
+    callDisposition: 'call_disposition',
+    favoriteCount: 'favorite_count'
   };
   const sortCol = sortMap[sortColumn] || 'call_date';
   const sortDir = sortDirection === 'asc' ? 'ASC' : 'DESC';
   const orderBy = `ORDER BY ${sortCol} ${sortDir}, call_date DESC, call_time DESC`;
 
+  // Per-viewer columns, bound after the WHERE params so only the data query uses them.
+  const viewerParam = `$${paramIdx++}`;
+  params.push(viewerEmail || null);
   const limitParam = `$${paramIdx++}`;
   const offsetParam = `$${paramIdx++}`;
   params.push(limit, offset);
 
+  // The subqueries run only for the returned page: with a LIMIT, Postgres
+  // evaluates expensive select-list expressions after the sort (unless one is
+  // the sort key, as favorite_count is for "Most favorited").
   const dataQuery = `
-    SELECT file_path, phone, email, call_date, call_time, call_id, call_disposition, duration_ms, file_size
-    FROM files ${whereClause}
+    SELECT file_path, phone, email, call_date, call_time, call_id, call_disposition, duration_ms, file_size,
+      (SELECT COUNT(*) FROM recording_favorites rf WHERE rf.file_path = f.file_path)::int AS favorite_count,
+      (SELECT COUNT(*) FROM recording_comments rc WHERE rc.file_path = f.file_path)::int AS comment_count,
+      EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path AND rf.user_email = ${viewerParam}) AS favorited_by_me,
+      ${ownedBySql(viewerParam)} AS is_mine
+    FROM files f ${whereClause}
     ${orderBy}
     LIMIT ${limitParam} OFFSET ${offsetParam}
   `;
 
   // Count query (same conditions, no limit/offset)
-  const countParams = params.slice(0, params.length - 2);
-  const countQuery = `SELECT COUNT(*) as total FROM files ${whereClause}`;
+  const countParams = params.slice(0, whereParamCount);
+  const countQuery = `SELECT COUNT(*) as total FROM files f ${whereClause}`;
 
   const [dataResult, countResult] = await Promise.all([
     pool.query(dataQuery, params),
@@ -677,7 +789,12 @@ export async function queryFiles(filters = {}) {
       call_id: f.call_id || null,
       call_disposition: f.call_disposition || null,
       duration_ms: f.duration_ms,
-      file_size: f.file_size
+      file_size: f.file_size,
+      favorite_count: f.favorite_count,
+      comment_count: f.comment_count,
+      favorited_by_me: f.favorited_by_me,
+      // NULL when files.email is NULL and no reporting row matches.
+      is_mine: f.is_mine === true
     })),
     totalCount: total,
     hasMore: offset + limit < total
@@ -855,18 +972,51 @@ export async function linkLogtoIdentity(logtoUserId, email) {
 // ============================================================
 // Audit logging
 // ============================================================
+// Opens a session unless the user already has an open one. Concurrent requests
+// race here and idx_user_sessions_one_open lets exactly one insert. Returns the
+// new session's id, or null when another request opened it first (or on
+// error) — callers log a LOGIN only when they get an id.
 export async function logUserSession(userId, userEmail, ipAddress, userAgent) {
   try {
     const result = await pool.query(`
       INSERT INTO user_sessions (user_id, user_email, ip_address, user_agent, last_activity)
       VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (user_id) WHERE logout_time IS NULL DO NOTHING
       RETURNING id
     `, [userId, userEmail, ipAddress, userAgent]);
+    if (!result.rows.length) return null;
     console.log(`📋 [AUDIT] User session created for ${userEmail} (ID: ${userId})`);
     return result.rows[0].id;
   } catch (error) {
     console.error('Error creating user session:', error);
     return null;
+  }
+}
+
+export async function getOpenSessionId(userId) {
+  try {
+    const { rows } = await pool.query(`SELECT id FROM user_sessions WHERE user_id = $1 AND logout_time IS NULL`, [userId]);
+    return rows.length ? rows[0].id : null;
+  } catch (error) {
+    console.error('Error getting open session:', error);
+    return null;
+  }
+}
+
+// Closes one specific session. Returns true only for the call that actually
+// closed it, so concurrent requests expiring the same session log one LOGOUT.
+export async function closeUserSession(sessionId) {
+  try {
+    const { rowCount } = await pool.query(`
+      UPDATE user_sessions
+      SET logout_time = NOW(),
+          session_duration_ms = EXTRACT(EPOCH FROM (NOW() - login_time)) * 1000
+      WHERE id = $1 AND logout_time IS NULL
+    `, [sessionId]);
+    return rowCount > 0;
+  } catch (error) {
+    console.error('Error closing user session:', error);
+    return false;
   }
 }
 
@@ -1625,25 +1775,39 @@ export async function getReportingSummary() {
   }
 }
 
-export async function getDistinctCampaigns() {
+// Postgres 16 can't skip ahead in a b-tree for SELECT DISTINCT, so on a
+// multi-million-row reporting table it reads every row just to find a handful
+// of values. This walks the column's index instead: each step jumps straight to
+// the next larger value, so the cost is one index probe per distinct value.
+// `> ''` excludes both NULL and empty strings. `column` is interpolated, so it
+// must be a constant naming an indexed reporting column.
+async function getDistinctReportingValues(column) {
   try {
-    const { rows } = await pool.query(`SELECT DISTINCT campaign FROM reporting WHERE campaign IS NOT NULL AND campaign <> '' ORDER BY campaign`);
-    return rows.map(r => r.campaign);
-  } catch { return []; }
+    const { rows } = await pool.query(`
+      WITH RECURSIVE vals AS (
+        (SELECT ${column} AS v FROM reporting WHERE ${column} > '' ORDER BY ${column} LIMIT 1)
+        UNION ALL
+        SELECT (SELECT ${column} FROM reporting WHERE ${column} > vals.v ORDER BY ${column} LIMIT 1)
+        FROM vals WHERE vals.v IS NOT NULL
+      )
+      SELECT v FROM vals WHERE v IS NOT NULL`);
+    return rows.map(r => r.v);
+  } catch (e) {
+    console.error(`Failed to load distinct reporting ${column} values:`, e.message);
+    return [];
+  }
+}
+
+export async function getDistinctCampaigns() {
+  return getDistinctReportingValues('campaign');
 }
 
 export async function getDistinctCallTypes() {
-  try {
-    const { rows } = await pool.query(`SELECT DISTINCT call_type FROM reporting WHERE call_type IS NOT NULL AND call_type <> '' ORDER BY call_type`);
-    return rows.map(r => r.call_type);
-  } catch { return []; }
+  return getDistinctReportingValues('call_type');
 }
 
 export async function getDistinctDispositions() {
-  try {
-    const { rows } = await pool.query(`SELECT DISTINCT disposition FROM reporting WHERE disposition IS NOT NULL AND disposition <> '' ORDER BY disposition`);
-    return rows.map(r => r.disposition);
-  } catch { return []; }
+  return getDistinctReportingValues('disposition');
 }
 
 export async function getDistinctFileDispositions() {
@@ -1767,6 +1931,164 @@ export async function getLegacyReportTimestampStats(limit = 10) {
     if (REPORT_TIME_DEBUG) console.warn('[REPORT_TIME] Legacy timestamp stats failed:', e.message);
     return { total: 0, samples: [], error: e.message };
   }
+}
+
+// ============================================================
+// Recording favorites, comments & notifications
+// Mutations throw; the routes catch. `user` is { id, email (lowercased), name, role }.
+// ============================================================
+
+// Looks up a recording and who owns it — the JS twin of ownedBySql(). Owners are
+// a set: on a transfer the filename's agent and the Five9 agent can differ, and
+// both count. Returns null when the recording isn't indexed.
+export async function getRecordingContext(filePath) {
+  const { rows } = await pool.query(`
+    SELECT f.file_path, f.phone, f.email, f.call_date, f.call_time, f.call_id, f.duration_ms, r.agent
+    FROM files f
+    LEFT JOIN reporting r ON r.call_id = f.call_id
+    WHERE f.file_path = $1
+  `, [filePath]);
+  if (!rows.length) return null;
+  const { agent, ...file } = rows[0];
+  const ownerEmails = [...new Set(
+    [file.email, agent]
+      .filter(value => typeof value === 'string' && value.includes('@'))
+      .map(value => value.toLowerCase())
+  )];
+  return { file, ownerEmails };
+}
+
+// Returns true only when a favorite was actually added, so callers audit and
+// notify once even if the request is retried or double-clicked.
+export async function addFavorite(filePath, user) {
+  const { rows } = await pool.query(`
+    INSERT INTO recording_favorites (file_path, user_email, user_id, user_name, user_role)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (file_path, user_email) DO NOTHING
+    RETURNING id
+  `, [filePath, user.email, user.id, user.name, user.role]);
+  return rows.length > 0;
+}
+
+export async function removeFavorite(filePath, userEmail) {
+  const { rows } = await pool.query(
+    `DELETE FROM recording_favorites WHERE file_path = $1 AND user_email = $2 RETURNING id`,
+    [filePath, userEmail]
+  );
+  return rows.length > 0;
+}
+
+export async function getFavoriteState(filePath, userEmail) {
+  const { rows } = await pool.query(`
+    SELECT COUNT(*)::int AS favorite_count, COALESCE(bool_or(user_email = $2), false) AS favorited_by_me
+    FROM recording_favorites
+    WHERE file_path = $1
+  `, [filePath, userEmail]);
+  return { favoriteCount: rows[0].favorite_count, favoritedByMe: rows[0].favorited_by_me };
+}
+
+export async function getRecordingActivity(filePath) {
+  const [favorites, comments] = await Promise.all([
+    pool.query(`
+      SELECT user_email, user_name, user_role, created_at
+      FROM recording_favorites
+      WHERE file_path = $1
+      ORDER BY created_at, id
+    `, [filePath]),
+    pool.query(`
+      SELECT id, user_email, user_name, user_role, body, position_ms, created_at
+      FROM recording_comments
+      WHERE file_path = $1
+      ORDER BY created_at, id
+    `, [filePath])
+  ]);
+  return { favorites: favorites.rows, comments: comments.rows };
+}
+
+export async function addComment(filePath, user, body, positionMs) {
+  const { rows } = await pool.query(`
+    INSERT INTO recording_comments (file_path, user_email, user_id, user_name, user_role, body, position_ms)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    RETURNING id, user_email, user_name, user_role, body, position_ms, created_at
+  `, [filePath, user.email, user.id, user.name, user.role, body, positionMs]);
+  return rows[0];
+}
+
+// One statement, so the permission check can't race the delete. Pass
+// authorEmail = null to delete regardless of author (managers/admins).
+export async function deleteComment(commentId, authorEmail) {
+  const { rows } = await pool.query(`
+    DELETE FROM recording_comments
+    WHERE id = $1 AND ($2::text IS NULL OR user_email = $2)
+    RETURNING id, file_path, user_email, user_role, body, position_ms, created_at
+  `, [commentId, authorEmail]);
+  return rows[0] || null;
+}
+
+export async function commentExists(commentId) {
+  const { rows } = await pool.query(`SELECT 1 FROM recording_comments WHERE id = $1`, [commentId]);
+  return rows.length > 0;
+}
+
+export async function getCommenterEmails(filePath) {
+  const { rows } = await pool.query(`SELECT DISTINCT user_email FROM recording_comments WHERE file_path = $1`, [filePath]);
+  return rows.map(r => r.user_email);
+}
+
+// recipientEmails must be lowercased and already exclude the actor.
+export async function createNotifications(recipientEmails, type, filePath, actor, commentId = null) {
+  if (!recipientEmails.length) return;
+  await pool.query(`
+    INSERT INTO notifications (recipient_email, type, file_path, actor_email, actor_name, comment_id)
+    SELECT recipient, $2::text, $3::text, $4::text, $5::text, $6::int
+    FROM unnest($1::text[]) AS recipient
+  `, [recipientEmails, type, filePath, actor.email, actor.name, commentId]);
+}
+
+// Un-favoriting retracts the owner's notification if they haven't seen it yet.
+export async function deleteUnreadFavoriteNotifications(filePath, actorEmail) {
+  await pool.query(`
+    DELETE FROM notifications
+    WHERE file_path = $1 AND type = 'favorite' AND actor_email = $2 AND read_at IS NULL
+  `, [filePath, actorEmail]);
+}
+
+export async function deleteCommentNotifications(filePath, commentId) {
+  await pool.query(`DELETE FROM notifications WHERE file_path = $1 AND comment_id = $2`, [filePath, commentId]);
+}
+
+async function countUnreadNotifications(recipientEmail) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS unread FROM notifications WHERE recipient_email = $1 AND read_at IS NULL`,
+    [recipientEmail]
+  );
+  return rows[0].unread;
+}
+
+export async function getNotifications(recipientEmail, limit) {
+  const [list, unreadCount] = await Promise.all([
+    pool.query(`
+      SELECT n.id, n.type, n.file_path, n.actor_email, n.actor_name, n.created_at, n.read_at,
+             f.call_date, f.call_time, f.phone, left(c.body, 200) AS comment_excerpt
+      FROM notifications n
+      LEFT JOIN files f ON f.file_path = n.file_path
+      LEFT JOIN recording_comments c ON c.id = n.comment_id
+      WHERE n.recipient_email = $1
+      ORDER BY n.id DESC
+      LIMIT $2
+    `, [recipientEmail, limit]),
+    countUnreadNotifications(recipientEmail)
+  ]);
+  return { notifications: list.rows, unreadCount };
+}
+
+// ids = null marks all of the recipient's notifications read.
+export async function markNotificationsRead(recipientEmail, ids) {
+  await pool.query(`
+    UPDATE notifications SET read_at = NOW()
+    WHERE recipient_email = $1 AND read_at IS NULL AND ($2::int[] IS NULL OR id = ANY($2::int[]))
+  `, [recipientEmail, ids]);
+  return countUnreadNotifications(recipientEmail);
 }
 
 // ============================================================

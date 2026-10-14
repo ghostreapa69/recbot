@@ -270,10 +270,11 @@ export const requireAuth = async (req, res, next) => {
 
     let userEmail = payload.email;
     let isEmailVerified = payload.email_verified !== false;
+    const idTokenHeader = typeof req.headers['x-id-token'] === 'string' ? req.headers['x-id-token'] : null;
+    let idClaims; // undefined until verified; null if verification failed
 
     if (!userEmail) {
-      const idTokenHeader = req.headers['x-id-token'];
-      const idClaims = await verifyIdToken(typeof idTokenHeader === 'string' ? idTokenHeader : null);
+      idClaims = await verifyIdToken(idTokenHeader);
       if (idClaims) {
         // Guard against a mismatched token pair.
         if (idClaims.sub && idClaims.sub !== logtoUserId) {
@@ -368,12 +369,24 @@ export const requireAuth = async (req, res, next) => {
     if (!openSessionExists) {
       const now = new Date();
       const lastLogin = await getLastLogin(logtoUserId);
-      await logUserSession(logtoUserId, userEmail, ipAddress, userAgent);
-      await logAuditEvent(logtoUserId, userEmail, 'LOGIN', null, null, ipAddress, userAgent, null, {
-        lastLogin,
-        loginTime: now.toISOString(),
-        reason: 'new_session_no_open_session'
-      });
+      // A page load fires several requests at once and each can get here; only
+      // the one that actually opens the session logs the LOGIN.
+      const sessionId = await logUserSession(logtoUserId, userEmail, ipAddress, userAgent);
+      if (sessionId) {
+        await logAuditEvent(logtoUserId, userEmail, 'LOGIN', null, null, ipAddress, userAgent, null, {
+          lastLogin,
+          loginTime: now.toISOString(),
+          reason: 'new_session_no_open_session'
+        });
+      }
+    }
+
+    // The user's name (shown on favorites and comments) comes from the profile
+    // claims, which Logto puts in the ID token rather than the API access token.
+    let nameClaims = payload;
+    if (!payload.name && !payload.given_name && idTokenHeader) {
+      if (idClaims === undefined) idClaims = await verifyIdToken(idTokenHeader);
+      if (idClaims && (!idClaims.sub || idClaims.sub === logtoUserId)) nameClaims = idClaims;
     }
 
     // Add user info to request for easier access
@@ -381,8 +394,8 @@ export const requireAuth = async (req, res, next) => {
       id: logtoUserId,
       email: userEmail,
       role,
-      firstName: payload.given_name || payload.name || null,
-      lastName: payload.family_name || null,
+      firstName: nameClaims.given_name || nameClaims.name || null,
+      lastName: nameClaims.family_name || null,
       ipAddress: ipAddress,  // Real client IP (from realClientIP)
       userAgent: userAgent
     };

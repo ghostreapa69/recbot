@@ -20,6 +20,7 @@ import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import FileViewer from './FileViewer';
 import AdminPage from './AdminPage';
 import ReportsPage from './ReportsPage';
+import NotificationBell from './NotificationBell';
 import { AuthProvider, useUser, useAuth } from './auth';
 
 // Build-time env fallbacks; runtime values come from /api/config.
@@ -323,6 +324,8 @@ function Navigation({ darkMode, setDarkMode }) {
             Reports
           </Button>
 
+          <NotificationBell />
+
           <FormControlLabel
             control={<Switch checked={darkMode} onChange={(e) => setDarkMode(e.target.checked)} />}
             label="Dark Mode"
@@ -352,7 +355,9 @@ function Callback() {
     // re-authorize again — prevents a redirect loop) and return to the page the
     // user was on before the round-trip.
     sessionStorage.setItem('logto_reauthed', '1');
-    const returnPath = sessionStorage.getItem('logto_return_path') || '/';
+    const storedPath = sessionStorage.getItem('logto_return_path');
+    // Same-site paths only: "//host" or "/\host" would redirect off the site.
+    const returnPath = storedPath && /^\/(?![/\\])/.test(storedPath) ? storedPath : '/';
     sessionStorage.removeItem('logto_return_path');
     window.location.replace(returnPath);
   });
@@ -379,7 +384,15 @@ function SignInScreen() {
         MTGPros Five9 Recordings
       </Typography>
       <Box sx={{ display: 'flex', justifyContent: 'center', mt: 4 }}>
-        <Button variant="contained" size="large" onClick={() => signIn(SIGN_IN_REDIRECT_URI)}>
+        <Button
+          variant="contained"
+          size="large"
+          onClick={() => {
+            // Callback returns here after sign-in, so shared recording links survive the login.
+            sessionStorage.setItem('logto_return_path', window.location.pathname + window.location.search);
+            signIn(SIGN_IN_REDIRECT_URI);
+          }}
+        >
           Sign in
         </Button>
       </Box>

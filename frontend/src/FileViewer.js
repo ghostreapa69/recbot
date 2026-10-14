@@ -31,6 +31,8 @@ import {
   Slider,
   ToggleButton,
   ToggleButtonGroup,
+  Tooltip,
+  Badge,
 } from "@mui/material";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import PauseIcon from "@mui/icons-material/Pause";
@@ -40,6 +42,9 @@ import FastForwardIcon from "@mui/icons-material/FastForward";
 import FastRewindIcon from "@mui/icons-material/FastRewind";
 import DownloadIcon from "@mui/icons-material/Download";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import StarIcon from "@mui/icons-material/Star";
+import StarBorderIcon from "@mui/icons-material/StarBorder";
+import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutline";
 import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
 import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
@@ -47,6 +52,8 @@ import { TimePicker } from "@mui/x-date-pickers/TimePicker";
 import { useLocation } from 'react-router-dom';
 import dayjs from "dayjs";
 import customParseFormat from 'dayjs/plugin/customParseFormat';
+import RecordingActivityDrawer, { ACTIVITY_DRAWER_WIDTH } from './RecordingActivityDrawer';
+import { requestNotificationsRefresh } from './NotificationBell';
 
 dayjs.extend(customParseFormat);
 
@@ -61,7 +68,11 @@ function normalizeFile(rec) {
     callId: rec.callId || '',
     callDisposition: rec.callDisposition || '',
     durationMs: rec.durationMs || 0,
-    size: rec.size || 0
+    size: rec.size || 0,
+    favoriteCount: Number(rec.favoriteCount) || 0,
+    commentCount: Number(rec.commentCount) || 0,
+    favoritedByMe: Boolean(rec.favoritedByMe),
+    canFavorite: Boolean(rec.canFavorite)
   };
 }
 
@@ -74,8 +85,10 @@ function formatDuration(ms) {
 
 const DATE_PARAM_FORMATS = ['M_D_YYYY', 'M-D-YYYY', 'MM-DD-YYYY', 'YYYY-MM-DD', 'M/D/YYYY', 'MM/DD/YYYY'];
 const TIME_PARAM_FORMATS = ['h:mm A', 'hh:mm A', 'H:mm', 'HH:mm'];
-const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId', 'callDisposition']);
+const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId', 'callDisposition', 'favoriteCount']);
 const PLAYBACK_RATE_OPTIONS = [0.5, 1, 1.25, 1.5, 2];
+// Views besides the default 'all': the viewer's own favorites, and every favorited call ranked by count.
+const VIEW_VALUES = new Set(['favorites', 'top']);
 
 // Normalize phone filters so pasted formatting characters do not affect matching
 const stripPhoneFormatting = (input) => {
@@ -106,6 +119,22 @@ function parseTimeParam(value) {
     }
   }
   return null;
+}
+
+// Recording keys look like recordings/M_D_YYYY/<file>.wav; the folder is the call date.
+function dateFromRecordingPath(recordingPath) {
+  const match = /(?:^|\/)(\d{1,2}_\d{1,2}_\d{4})\//.exec(recordingPath || '');
+  return match ? parseDateParam(match[1]) : null;
+}
+
+// Drops a query param without a router navigation (which would re-run the URL
+// effect and refetch). Keeps history.state so React Router's key survives.
+function removeUrlParam(name) {
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has(name)) return;
+  params.delete(name);
+  const search = params.toString();
+  window.history.replaceState(window.history.state, '', search ? `${window.location.pathname}?${search}` : window.location.pathname);
 }
 
 function FileViewer({ darkMode }) {
@@ -152,6 +181,31 @@ function FileViewer({ darkMode }) {
   const [hasMore, setHasMore] = useState(false);
   const [currentOffset, setCurrentOffset] = useState(0);
 
+  // 'all' recordings, the viewer's 'favorites', or the 'top' (most favorited) calls.
+  const [view, setView] = useState('all');
+  const [onlyMine, setOnlyMine] = useState(false);
+  // fetchFiles reads the view from this ref, so every call site — including
+  // debounced timers holding stale closures — uses the current one. Change the
+  // view only through updateView().
+  const viewRef = React.useRef({ view: 'all', onlyMine: false });
+  // Recording shown by a ?recording= link. It is a one-off lookup: any other fetch clears it.
+  const [focusedPath, setFocusedPath] = useState(null);
+  // Row shown in the comments side panel, which is open whenever this is set.
+  const [activityTarget, setActivityTarget] = useState(null);
+  const [activityReloadKey, setActivityReloadKey] = useState(0);
+  const fetchSeqRef = React.useRef(0);
+  const savedAllDatesRef = React.useRef(null);
+  const filterDebounceRef = React.useRef(null);
+  const lastUrlRef = React.useRef(null);
+  const playRequestRef = React.useRef(0);
+  const pendingFavoritesRef = React.useRef(new Set());
+
+  const updateView = (patch) => {
+    viewRef.current = { ...viewRef.current, ...patch };
+    if ('view' in patch) setView(patch.view);
+    if ('onlyMine' in patch) setOnlyMine(patch.onlyMine);
+  };
+
   // Get user role for admin features
   const userRole = user?.publicMetadata?.role;
   const isAdmin = userRole === 'admin';
@@ -159,55 +213,74 @@ function FileViewer({ darkMode }) {
   const canDownload = isAdmin || isManager;
   const userEmail = user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
 
-  // Fetch files only when a date is selected or changed
-  const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null, customDisposition = null) => {
-    if (!start) return;
+  // Fetch files only when a date is selected or changed (dates are optional in
+  // the favorites views). options.path fetches exactly one recording — a
+  // shared link — and ignores the filters.
+  const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null, customDisposition = null, options = {}) => {
+    const { view: viewValue, onlyMine: onlyMineValue } = viewRef.current;
+    const pathValue = options.path || null;
+    if (!pathValue && !start && viewValue === 'all') return;
+    // The date pickers emit invalid dates while a date is half-typed.
+    if ((start && !dayjs(start).isValid()) || (end && !dayjs(end).isValid())) return;
+    // Only the newest request may update the table, so a slow all-dates query
+    // can't land after (and overwrite) a later one.
+    const requestSeq = ++fetchSeqRef.current;
+    const isStale = () => requestSeq !== fetchSeqRef.current;
     setLoading(true);
     setError500(false);
     setErrorMessage("");
 
-    let url = `/api/wav-files?dateStart=${encodeURIComponent(dayjs(start).format("M_D_YYYY"))}`;
-    if (end) url += `&dateEnd=${encodeURIComponent(dayjs(end).format("M_D_YYYY"))}`;
-    
-    // All roles (admin/manager/member) can view & listen to all recordings.
-    // The email field is just a free filter for everyone.
-    const emailValue = customEmailFilter !== null ? customEmailFilter : emailFilter;
-    const effectiveEmailFilter = emailValue;
-
-    const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
-    const phoneValueRaw = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
-    const normalizedPhoneValue = stripPhoneFormatting(phoneValueRaw);
-    const currentTimeMode = customTimeMode !== null ? customTimeMode : timeMode;
-    const startTime = customTimePickerStart !== null ? customTimePickerStart : timePickerStart;
-    const endTime = customTimePickerEnd !== null ? customTimePickerEnd : timePickerEnd;
-    const callIdValue = customCallId !== null ? customCallId : callIdFilter;
-
-    url += `&offset=${offset}&limit=${limit}`;
-    if (callIdValue && callIdValue.trim() !== '') {
-      url += `&callId=${encodeURIComponent(callIdValue.trim())}`;
-    }
+    let url = `/api/wav-files?offset=${offset}&limit=${limit}`;
     url += `&sortColumn=${customSortColumn || sortColumn}&sortDirection=${customSortDirection || sortDirection}`;
-    
-    if (durationValue !== null && durationValue !== "") {
-      url += `&durationMin=${encodeURIComponent(durationValue)}`;
-    }
-    
-    if (normalizedPhoneValue) {
-      url += `&phone=${encodeURIComponent(normalizedPhoneValue)}`;
-    }
-    
-    if (effectiveEmailFilter !== "") {
-      url += `&email=${encodeURIComponent(effectiveEmailFilter)}`;
-    }
-    
-    const dispositionValue = customDisposition !== null ? customDisposition : dispositionFilter;
-    if (dispositionValue) {
-      url += `&callDisposition=${encodeURIComponent(dispositionValue)}`;
-    }
 
-    if (currentTimeMode === "range") {
-      if (startTime) url += `&timeStart=${encodeURIComponent(dayjs(startTime).format("h:mm A"))}`;
-      if (endTime) url += `&timeEnd=${encodeURIComponent(dayjs(endTime).format("h:mm A"))}`;
+    if (pathValue) {
+      url += `&path=${encodeURIComponent(pathValue)}`;
+    } else {
+      if (start) url += `&dateStart=${encodeURIComponent(dayjs(start).format("M_D_YYYY"))}`;
+      if (end) url += `&dateEnd=${encodeURIComponent(dayjs(end).format("M_D_YYYY"))}`;
+
+      // All roles (admin/manager/member) can view & listen to all recordings.
+      // The email field is just a free filter for everyone.
+      const emailValue = customEmailFilter !== null ? customEmailFilter : emailFilter;
+      const effectiveEmailFilter = emailValue;
+
+      const durationValue = customDurationMin !== null ? customDurationMin : durationMin;
+      const phoneValueRaw = customPhoneFilter !== null ? customPhoneFilter : phoneFilter;
+      const normalizedPhoneValue = stripPhoneFormatting(phoneValueRaw);
+      const currentTimeMode = customTimeMode !== null ? customTimeMode : timeMode;
+      const startTime = customTimePickerStart !== null ? customTimePickerStart : timePickerStart;
+      const endTime = customTimePickerEnd !== null ? customTimePickerEnd : timePickerEnd;
+      const callIdValue = customCallId !== null ? customCallId : callIdFilter;
+
+      if (callIdValue && callIdValue.trim() !== '') {
+        url += `&callId=${encodeURIComponent(callIdValue.trim())}`;
+      }
+
+      if (durationValue !== null && durationValue !== "") {
+        url += `&durationMin=${encodeURIComponent(durationValue)}`;
+      }
+
+      if (normalizedPhoneValue) {
+        url += `&phone=${encodeURIComponent(normalizedPhoneValue)}`;
+      }
+
+      if (effectiveEmailFilter !== "") {
+        url += `&email=${encodeURIComponent(effectiveEmailFilter)}`;
+      }
+
+      const dispositionValue = customDisposition !== null ? customDisposition : dispositionFilter;
+      if (dispositionValue) {
+        url += `&callDisposition=${encodeURIComponent(dispositionValue)}`;
+      }
+
+      if (currentTimeMode === "range") {
+        if (startTime) url += `&timeStart=${encodeURIComponent(dayjs(startTime).format("h:mm A"))}`;
+        if (endTime) url += `&timeEnd=${encodeURIComponent(dayjs(endTime).format("h:mm A"))}`;
+      }
+
+      if (viewValue === 'favorites') url += `&favorites=mine`;
+      if (viewValue === 'top') url += `&favorites=any`;
+      if (onlyMineValue) url += `&mine=1`;
     }
 
     // Audit VIEW_FILES only on the first fetch after a page load/refresh,
@@ -228,6 +301,7 @@ function FileViewer({ darkMode }) {
 
     makeRequest()
       .then(async (res) => {
+        if (isStale()) return null;
         if (res.ok) return res.json();
 
         // Error responses carry a JSON error body ({ error, message }), NOT a
@@ -250,17 +324,25 @@ function FileViewer({ darkMode }) {
         return { files: [], totalCount: 0, hasMore: false };
       })
       .then((data) => {
+        if (!data || isStale()) return;
         setFiles((data.files || []).map(normalizeFile));
         setTotalCount(Number(data.totalCount) || 0);
         setHasMore(Boolean(data.hasMore));
         setCurrentOffset(offset);
+        setFocusedPath(pathValue);
       })
       .catch((err) => {
+        if (isStale()) return;
         console.error("Error fetching files:", err);
         setError500(true);
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!isStale()) setLoading(false);
+      });
   };
+
+  const fetchFocused = (recordingPath) =>
+    fetchFiles(null, null, 0, filesPerPage, null, null, null, null, null, null, null, null, null, null, { path: recordingPath });
 
   const refreshFiles = (reset = false) => {
     const newOffset = reset ? 0 : currentOffset;
@@ -285,7 +367,7 @@ function FileViewer({ darkMode }) {
   // Debounced fetch when callIdFilter changes (consistent auto behavior)
   useEffect(() => {
     if (applyingUrlParamsRef.current) return;
-    if (!calendarDateStart) return; // need a start date selected
+    if (!calendarDateStart && viewRef.current.view === 'all') return; // need a start date selected
     if (callIdDebounceRef.current) clearTimeout(callIdDebounceRef.current);
     callIdDebounceRef.current = setTimeout(() => {
       // Only trigger automatically when empty or at least 2 chars (reduce noise)
@@ -300,6 +382,16 @@ function FileViewer({ darkMode }) {
     if (!isLoaded) return;
 
     const params = new URLSearchParams(location.search || '');
+    // ?recording=<file path> (a shared link or notification) shows that one
+    // recording with its side panel open.
+    const recordingParam = params.get('recording') || null;
+    // Navigating to the URL already applied (same search, new location.key)
+    // only matters for a recording link, which must reopen its panel.
+    const urlId = location.pathname + location.search;
+    const sameUrl = lastUrlRef.current === urlId;
+    lastUrlRef.current = urlId;
+    if (sameUrl && !recordingParam) return;
+
     applyingUrlParamsRef.current = true;
     const timerId = setTimeout(() => {
       applyingUrlParamsRef.current = false;
@@ -311,14 +403,33 @@ function FileViewer({ darkMode }) {
     let endFromQuery = endParamRaw !== null ? parseDateParam(endParamRaw) : null;
     let historyNeedsUpdate = false;
 
-    if (!startFromQuery) {
+    // A recording link always shows the plain list, so "Show all" lands on that call's day.
+    let viewValue = 'all';
+    if (!recordingParam && params.has('view')) {
+      const candidate = (params.get('view') || '').toLowerCase();
+      if (VIEW_VALUES.has(candidate)) {
+        viewValue = candidate;
+      } else {
+        params.delete('view');
+        historyNeedsUpdate = true;
+      }
+    }
+    updateView({ view: viewValue, onlyMine: !recordingParam && params.get('mine') === '1' });
+
+    if (recordingParam) {
+      startFromQuery = dateFromRecordingPath(recordingParam) || dayjs();
+      endFromQuery = startFromQuery;
+    } else if (!startFromQuery && viewValue === 'all') {
+      // Favorites views default to all dates; only the plain list needs a start date.
       startFromQuery = dayjs();
       params.set('dateStart', startFromQuery.format('M_D_YYYY'));
       historyNeedsUpdate = true;
     }
     setCalendarDateStart(startFromQuery);
 
-    if (endParamRaw !== null) {
+    if (recordingParam) {
+      setCalendarDateEnd(endFromQuery);
+    } else if (endParamRaw !== null) {
       if (endParamRaw && !endFromQuery) {
         params.delete('dateEnd');
         historyNeedsUpdate = true;
@@ -373,6 +484,14 @@ function FileViewer({ darkMode }) {
         params.delete('sortDirection');
         historyNeedsUpdate = true;
       }
+    }
+
+    // "Most favorited" ranks by count unless the link says otherwise.
+    if (viewValue === 'top' && !params.has('sortColumn')) {
+      sortColumnValue = 'favoriteCount';
+      sortDirectionValue = 'desc';
+      setSortColumn(sortColumnValue);
+      setSortDirection(sortDirectionValue);
     }
 
     let durationValue = durationMin;
@@ -442,35 +561,46 @@ function FileViewer({ darkMode }) {
     if (historyNeedsUpdate) {
       const newSearch = params.toString();
       const newUrl = newSearch ? `${location.pathname}?${newSearch}` : location.pathname;
-      window.history.replaceState(null, '', newUrl);
+      // Keep history.state: React Router stores its location key there.
+      window.history.replaceState(window.history.state, '', newUrl);
     }
 
-    fetchFiles(
-      startFromQuery,
-      endFromQuery,
-      offsetValue,
-      limitValue,
-      sortColumnValue,
-      sortDirectionValue,
-      durationValue,
-      phoneValue,
-      emailValue,
-      timeModeValue === 'range' ? timeStartValue : null,
-      timeModeValue === 'range' ? timeEndValue : null,
-      timeModeValue,
-      callIdValue
-    );
+    if (recordingParam) {
+      fetchFiles(null, null, 0, limitValue, sortColumnValue, sortDirectionValue, null, null, null, null, null, null, null, null, { path: recordingParam });
+      // Open the side panel (or reload it, so a repeat notification shows the
+      // new comment). Never auto-play.
+      setActivityTarget(prev => (prev?.file === recordingParam ? prev : { file: recordingParam }));
+      setActivityReloadKey(key => key + 1);
+    } else {
+      fetchFiles(
+        startFromQuery,
+        endFromQuery,
+        offsetValue,
+        limitValue,
+        sortColumnValue,
+        sortDirectionValue,
+        durationValue,
+        phoneValue,
+        emailValue,
+        timeModeValue === 'range' ? timeStartValue : null,
+        timeModeValue === 'range' ? timeEndValue : null,
+        timeModeValue,
+        callIdValue
+      );
+    }
 
     return () => {
       clearTimeout(timerId);
       applyingUrlParamsRef.current = false;
     };
-  }, [location.pathname, location.search, isLoaded]);
+  }, [location.pathname, location.search, location.key, isLoaded]);
 
   const handleSort = (column) => {
     const normalized = column === 'duration' ? 'durationMs' : column;
     const isAsc = sortColumn === normalized && sortDirection === "asc";
-    const newDirection = isAsc ? "desc" : "asc";
+    let newDirection = isAsc ? "desc" : "asc";
+    // Counts read best highest-first, so a fresh sort by favorites starts descending.
+    if (normalized === 'favoriteCount' && sortColumn !== normalized) newDirection = "desc";
     setSortColumn(normalized);
     setSortDirection(newDirection);
     fetchFiles(calendarDateStart, calendarDateEnd, 0, filesPerPage, normalized, newDirection);
@@ -479,6 +609,138 @@ function FileViewer({ darkMode }) {
   const handlePageChange = (event, value) => {
     const newOffset = (value - 1) * filesPerPage;
     fetchFiles(calendarDateStart, calendarDateEnd, newOffset);
+  };
+
+  // Debounced filter fetches captured the old view and dates; drop them so they
+  // can't replace the list the view switch is about to load.
+  const cancelPendingFilterFetches = () => {
+    clearTimeout(filterDebounceRef.current);
+    clearTimeout(callIdDebounceRef.current);
+  };
+
+  const handleViewChange = (_event, nextView) => {
+    // An exclusive ToggleButtonGroup reports null when the active button is clicked again.
+    if (!nextView || nextView === viewRef.current.view) return;
+    const prevView = viewRef.current.view;
+    let start = calendarDateStart;
+    let end = calendarDateEnd;
+    if (prevView === 'all') {
+      // Favorites views start at all dates; remember the range for the way back.
+      savedAllDatesRef.current = { start, end };
+      start = null;
+      end = null;
+    } else if (nextView === 'all' && !start) {
+      const saved = savedAllDatesRef.current;
+      start = saved?.start || dayjs();
+      end = saved?.start ? saved.end : null;
+    }
+    let column = sortColumn;
+    let direction = sortDirection;
+    if (nextView === 'top') {
+      column = 'favoriteCount';
+      direction = 'desc';
+    } else if (prevView === 'top' && sortColumn === 'favoriteCount') {
+      // Back to the page's initial sort.
+      column = 'date';
+      direction = 'asc';
+    }
+    cancelPendingFilterFetches();
+    removeUrlParam('recording');
+    updateView({ view: nextView });
+    setCalendarDateStart(start);
+    setCalendarDateEnd(end);
+    setSortColumn(column);
+    setSortDirection(direction);
+    fetchFiles(start, end, 0, filesPerPage, column, direction);
+  };
+
+  const handleOnlyMineChange = (event) => {
+    cancelPendingFilterFetches();
+    removeUrlParam('recording');
+    updateView({ onlyMine: event.target.checked });
+    fetchFiles(calendarDateStart, calendarDateEnd, 0);
+  };
+
+  // Leaves a shared link's single recording for that day's full list.
+  const clearFocus = () => {
+    removeUrlParam('recording');
+    refreshFiles(true);
+  };
+
+  // Keeps a recording's table row and the side panel in step.
+  const patchRow = React.useCallback((file, patch) => {
+    setFiles(prev => prev.map(f => (f.file === file ? { ...f, ...patch } : f)));
+    setActivityTarget(prev => (prev && prev.file === file ? { ...prev, ...patch } : prev));
+  }, []);
+
+  const toggleFavorite = async (row) => {
+    if (!row?.canFavorite || pendingFavoritesRef.current.has(row.file)) return;
+    pendingFavoritesRef.current.add(row.file);
+    const before = { favoritedByMe: row.favoritedByMe, favoriteCount: row.favoriteCount };
+    const favorite = !row.favoritedByMe;
+    // Show the change immediately; roll back if the server refuses it.
+    patchRow(row.file, { favoritedByMe: favorite, favoriteCount: Math.max(0, row.favoriteCount + (favorite ? 1 : -1)) });
+    try {
+      const token = await getToken();
+      const res = await fetch('/api/recordings/favorite', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ path: row.file, favorite })
+      });
+      if (!res.ok) {
+        const error = new Error(`HTTP ${res.status}`);
+        error.status = res.status;
+        throw error;
+      }
+      const json = await res.json();
+      patchRow(row.file, {
+        favoritedByMe: Boolean(json.favoritedByMe),
+        favoriteCount: Number(json.favoriteCount) || 0,
+        canFavorite: Boolean(json.canFavorite)
+      });
+      // The side panel lists who favorited the call.
+      if (activityTarget?.file === row.file) setActivityReloadKey(key => key + 1);
+      requestNotificationsRefresh();
+    } catch (error) {
+      console.error('Failed to update favorite:', error);
+      patchRow(row.file, error.status === 403 ? { ...before, canFavorite: false } : before);
+      window.alert(error.status === 403 ? 'You can only favorite your own calls.' : 'Could not update the favorite. Please try again.');
+    } finally {
+      pendingFavoritesRef.current.delete(row.file);
+    }
+  };
+
+  const favoriteTooltip = (row) => {
+    if (!row.canFavorite) return 'You can only favorite your own calls';
+    return row.favoritedByMe ? 'Remove from favorites' : 'Add to favorites';
+  };
+
+  const closeActivity = () => {
+    setActivityTarget(null);
+    removeUrlParam('recording');
+  };
+
+  const handleCommentsClick = (row) => {
+    if (activityTarget?.file === row.file) {
+      closeActivity();
+    } else {
+      setActivityTarget(row);
+      // The closed panel may still hold this recording from earlier; reload it.
+      setActivityReloadKey(key => key + 1);
+    }
+  };
+
+  // Jumps to a moment in a recording, loading it first unless it is the one playing.
+  const seekRecording = (file, seconds) => {
+    if (currentTrack === file && playing) {
+      seekTo(seconds);
+      if (!isPlaying) resumeAudio();
+    } else {
+      playAudio(file, seconds);
+    }
   };
 
   // Optimized waveform generation with chunked processing
@@ -674,7 +936,13 @@ function FileViewer({ darkMode }) {
     }
   };
 
-  const playAudio = async (filename) => {
+  const playAudio = async (filename, startAtSeconds = 0) => {
+    // A newer playAudio call supersedes this one — e.g. two quick timestamp
+    // clicks while an uncached recording is still converting — and from then
+    // on this call must not touch the player, or its audio would play unseen.
+    const requestId = ++playRequestRef.current;
+    const superseded = () => requestId !== playRequestRef.current;
+
     // Stop current audio if playing
     if (playing) {
       playing.pause();
@@ -685,32 +953,39 @@ function FileViewer({ darkMode }) {
 
     // Clear old waveform data when starting new track
     setWaveformData(null);
+    setCurrentTime(startAtSeconds);
 
     try {
       // Get authentication token
       const token = await getToken();
-      
+      if (superseded()) return;
+
       // Create new audio element
       const audio = new Audio();
-      
+
       // OPTIMIZATION 1: Set up event listeners FIRST
       audio.addEventListener('loadedmetadata', () => {
+        if (superseded()) return;
         setDuration(audio.duration);
+        if (startAtSeconds > 0) audio.currentTime = Math.min(startAtSeconds, audio.duration || startAtSeconds);
       });
-      
+
       audio.addEventListener('timeupdate', () => {
+        if (superseded()) return;
         setCurrentTime(audio.currentTime);
       });
-      
+
       audio.addEventListener('ended', () => {
+        if (superseded()) return;
         setPlaying(null);
         setIsPlaying(false);
         setCurrentTrack(null);
         setCurrentTime(0);
         setWaveformData(null);
       });
-      
+
       audio.addEventListener('error', (e) => {
+        if (superseded()) return;
         console.error('Audio playback error:', e);
         setPlaying(null);
         setIsPlaying(false);
@@ -740,7 +1015,8 @@ function FileViewer({ darkMode }) {
           'Authorization': `Bearer ${token}`
         }
       });
-      
+      if (superseded()) return;
+
       if (!authResponse.ok) {
         console.error('Failed to authenticate for audio stream:', authResponse.status);
         setCurrentTrack(null);
@@ -762,6 +1038,10 @@ function FileViewer({ darkMode }) {
       
       try {
         await audio.play();
+        if (superseded()) {
+          audio.pause();
+          return;
+        }
         const playTime = performance.now() - playStartTime;
         console.log(`🚀 Playback started in ${playTime.toFixed(0)}ms (Total: ${(performance.now() - startTime).toFixed(0)}ms)`);
         
@@ -769,6 +1049,7 @@ function FileViewer({ darkMode }) {
         setIsPlaying(true);
         
       } catch (playError) {
+        if (superseded()) return;
         console.error('Failed to start playback:', playError);
         setCurrentTrack(null);
         cleanup();
@@ -787,6 +1068,7 @@ function FileViewer({ darkMode }) {
           
           if (waveformResponse.ok) {
             const waveformResult = await waveformResponse.json();
+            if (superseded()) return;
             setWaveformData(waveformResult.waveform);
             console.log(`📊 Waveform loaded: ${waveformResult.waveform.length} points (${waveformResult.cached ? 'cached' : 'generated'})`);
             if (!waveformResult.cached && waveformResult.generationTime) {
@@ -936,12 +1218,12 @@ function FileViewer({ darkMode }) {
 
   useEffect(() => {
     if (applyingUrlParamsRef.current) return;
-    const delayedFilterChange = setTimeout(() => {
-      if (calendarDateStart) {
+    filterDebounceRef.current = setTimeout(() => {
+      if (calendarDateStart || viewRef.current.view !== 'all') {
         handleFilterChange();
       }
     }, 300);
-    return () => clearTimeout(delayedFilterChange);
+    return () => clearTimeout(filterDebounceRef.current);
   }, [phoneFilter, emailFilter, durationMin, timePickerStart, timePickerEnd, timeMode]);
 
   // Keyboard controls for audio player
@@ -1016,22 +1298,56 @@ function FileViewer({ darkMode }) {
     );
   }
 
+  const activityOpen = Boolean(activityTarget);
+  // The side panel shows the live table row when it's on this page, otherwise
+  // the snapshot it was opened with (e.g. a link, before its row has loaded).
+  const activityRecording = activityTarget ? (files.find(f => f.file === activityTarget.file) || activityTarget) : null;
+  const activityTrackState = !activityRecording || currentTrack !== activityRecording.file ? 'none' : (playing ? 'loaded' : 'loading');
+
+  const formatRange = (start, end) => {
+    if (start && end) return `${dayjs(start).format("MMM D")} - ${dayjs(end).format("MMM D, YYYY")}`;
+    if (start) return view === 'all' ? dayjs(start).format("MMM D, YYYY") : `Since ${dayjs(start).format("MMM D, YYYY")}`;
+    if (end) return `Through ${dayjs(end).format("MMM D, YYYY")}`;
+    return view === 'all' ? null : 'All dates';
+  };
+  let listHeading;
+  if (focusedPath) {
+    listHeading = 'Linked recording';
+  } else if (view === 'all') {
+    listHeading = calendarDateStart ? formatRange(calendarDateStart, calendarDateEnd) : "Select dates to view recordings";
+  } else {
+    listHeading = `${view === 'favorites' ? 'My favorites' : 'Most favorited'} · ${formatRange(calendarDateStart, calendarDateEnd)}`;
+  }
+
+  let emptyMessage = 'No recordings found for the selected criteria';
+  if (focusedPath) emptyMessage = 'This recording could not be found';
+  else if (view === 'favorites') emptyMessage = 'No favorites found for the selected criteria';
+  else if (view === 'top') emptyMessage = 'No favorited recordings found for the selected criteria';
+
   return (
     <LocalizationProvider dateAdapter={AdapterDayjs}>
-      <Container maxWidth="xl" sx={{ py: 4 }}>
+      <Container
+        maxWidth="xl"
+        sx={{
+          py: 4,
+          // Make room for the side panel on wide screens; it covers the page on small ones.
+          ...(activityOpen && { width: { md: 'auto' }, mr: { md: `${ACTIVITY_DRAWER_WIDTH}px` } })
+        }}
+      >
         <Typography variant="h4" gutterBottom>
           MTGPros Five9 Recordings {isAdmin && '(Admin View)'}
         </Typography>
-        
+
         {/* Audio Player */}
         {currentTrack && (
-          <Paper 
-            elevation={3} 
-            sx={{ 
-              position: 'fixed', 
-              bottom: 20, 
-              left: '50%', 
-              transform: 'translateX(-50%)', 
+          <Paper
+            elevation={3}
+            sx={{
+              position: 'fixed',
+              bottom: 20,
+              // Centered in the space left of the side panel when it is open.
+              left: { xs: '50%', md: activityOpen ? `calc((100% - ${ACTIVITY_DRAWER_WIDTH}px) / 2)` : '50%' },
+              transform: 'translateX(-50%)',
               p: 2, 
               zIndex: 1000,
               minWidth: 600,
@@ -1278,16 +1594,35 @@ function FileViewer({ darkMode }) {
           </Paper>
         )}
 
+        {/* View: all recordings, my favorites, or most favorited */}
+        <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2, mb: 2 }}>
+          <ToggleButtonGroup
+            exclusive
+            size="small"
+            color="primary"
+            value={view}
+            onChange={handleViewChange}
+            aria-label="Recordings view"
+            sx={{ '& .MuiToggleButton-root': { textTransform: 'none', whiteSpace: 'nowrap' } }}
+          >
+            <ToggleButton value="all">All recordings</ToggleButton>
+            <ToggleButton value="favorites">My favorites</ToggleButton>
+            <ToggleButton value="top">Most favorited</ToggleButton>
+          </ToggleButtonGroup>
+          <FormControlLabel
+            control={<Switch checked={onlyMine} onChange={handleOnlyMineChange} />}
+            label="Only my calls"
+          />
+        </Box>
+
         <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
           <Box display="flex" alignItems="center" gap={2}>
             <Typography variant="h6">
-              {calendarDateStart
-                ? `${calendarDateEnd ? `${dayjs(calendarDateStart).format("MMM D")} - ${dayjs(calendarDateEnd).format("MMM D, YYYY")}` : dayjs(calendarDateStart).format("MMM D, YYYY")}`
-                : "Select dates to view recordings"}
+              {listHeading}
             </Typography>
-            <IconButton 
-              onClick={() => refreshFiles(true)} 
-              disabled={loading || !calendarDateStart}
+            <IconButton
+              onClick={() => (focusedPath ? fetchFocused(focusedPath) : refreshFiles(true))}
+              disabled={loading || (view === 'all' && !calendarDateStart && !focusedPath)}
               color="primary"
             >
               <RefreshIcon />
@@ -1302,27 +1637,32 @@ function FileViewer({ darkMode }) {
           </Typography>
           <Box display="flex" gap={2} alignItems="center" flexWrap="wrap">
             <DatePicker
-              label="Start Date"
+              label={view === 'all' ? "Start Date" : "Start Date (Optional)"}
               value={calendarDateStart}
               onChange={(newValue) => {
                 setCalendarDateStart(newValue);
-                if (newValue) {
+                if (newValue || view !== 'all') {
                   fetchFiles(newValue, calendarDateEnd, 0);
                 }
               }}
-              slotProps={{ textField: { size: 'small' } }}
+              slotProps={{ textField: { size: 'small' }, field: { clearable: view !== 'all' } }}
             />
             <DatePicker
               label="End Date (Optional)"
               value={calendarDateEnd}
               onChange={(newValue) => {
                 setCalendarDateEnd(newValue);
-                if (calendarDateStart) {
+                if (calendarDateStart || view !== 'all') {
                   fetchFiles(calendarDateStart, newValue, 0);
                 }
               }}
-              slotProps={{ textField: { size: 'small' } }}
+              slotProps={{ textField: { size: 'small' }, field: { clearable: view !== 'all' } }}
             />
+            {view !== 'all' && (
+              <Typography variant="caption" color="text.secondary">
+                Leave empty for all dates
+              </Typography>
+            )}
           </Box>
         </Paper>
 
@@ -1389,7 +1729,7 @@ function FileViewer({ darkMode }) {
                 label="Disposition"
                 onChange={(e) => {
                   setDispositionFilter(e.target.value);
-                  if (calendarDateStart) {
+                  if (calendarDateStart || view !== 'all') {
                     fetchFiles(calendarDateStart, calendarDateEnd, 0, filesPerPage, null, null, null, null, null, null, null, null, null, e.target.value);
                   }
                 }}
@@ -1428,6 +1768,16 @@ function FileViewer({ darkMode }) {
           </Grid>
         </Grid>
 
+        {focusedPath && (
+          <Alert
+            severity="info"
+            sx={{ mb: 2 }}
+            action={<Button color="inherit" size="small" onClick={clearFocus}>Show all</Button>}
+          >
+            Showing one linked recording{dateFromRecordingPath(focusedPath) ? ` from ${dateFromRecordingPath(focusedPath).format("MMM D, YYYY")}` : ''}.
+          </Alert>
+        )}
+
         {/* Results and pagination controls */}
         <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
           <Typography variant="body2" color="text.secondary">
@@ -1462,11 +1812,16 @@ function FileViewer({ darkMode }) {
           </Box>
         )}
 
-        {files.length === 0 && !loading && calendarDateStart && (
+        {files.length === 0 && !loading && (calendarDateStart || view !== 'all' || focusedPath) && (
           <Paper sx={{ p: 4, textAlign: 'center', backgroundColor: darkMode ? 'grey.900' : 'grey.50' }}>
             <Typography variant="h6" color="text.secondary">
-              No recordings found for the selected criteria
+              {emptyMessage}
             </Typography>
+            {view === 'favorites' && !focusedPath && (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                Use the ☆ in the Favorites column to add a recording to your favorites.
+              </Typography>
+            )}
           </Paper>
         )}
 
@@ -1539,12 +1894,21 @@ function FileViewer({ darkMode }) {
                         Disposition
                       </TableSortLabel>
                     </TableCell>
+                    <TableCell>
+                      <TableSortLabel
+                        active={sortColumn === 'favoriteCount'}
+                        direction={sortColumn === 'favoriteCount' ? sortDirection : 'desc'}
+                        onClick={() => handleSort('favoriteCount')}
+                      >
+                        Favorites
+                      </TableSortLabel>
+                    </TableCell>
                     <TableCell align="center">Actions</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {files.map((fileInfo, index) => (
-                    <TableRow key={index} hover>
+                  {files.map((fileInfo) => (
+                    <TableRow key={fileInfo.file} hover selected={activityTarget?.file === fileInfo.file}>
                       <TableCell>{fileInfo.date}</TableCell>
                       <TableCell>{fileInfo.time}</TableCell>
                       <TableCell>{fileInfo.callId || '-'}</TableCell>
@@ -1552,14 +1916,46 @@ function FileViewer({ darkMode }) {
                       <TableCell>{fileInfo.email}</TableCell>
                       <TableCell>{formatDuration(fileInfo.durationMs)}</TableCell>
                       <TableCell>{fileInfo.callDisposition || '-'}</TableCell>
+                      <TableCell>
+                        <Box display="flex" alignItems="center">
+                          {/* The span lets the tooltip explain a disabled star. */}
+                          <Tooltip title={favoriteTooltip(fileInfo)}>
+                            <span>
+                              <IconButton
+                                size="small"
+                                disabled={!fileInfo.canFavorite}
+                                onClick={() => toggleFavorite(fileInfo)}
+                                aria-pressed={fileInfo.favoritedByMe}
+                                aria-label={favoriteTooltip(fileInfo)}
+                              >
+                                {fileInfo.favoritedByMe ? <StarIcon color="warning" /> : <StarBorderIcon />}
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                          {fileInfo.favoriteCount > 0 && (
+                            <Typography variant="body2" component="span">{fileInfo.favoriteCount}</Typography>
+                          )}
+                        </Box>
+                      </TableCell>
                       <TableCell align="center">
-                        <IconButton 
-                          color="primary" 
+                        <IconButton
+                          color="primary"
                           onClick={() => playAudio(fileInfo.file)}
                           size="small"
                           title="Play"
                         >
                           <PlayArrowIcon />
+                        </IconButton>
+                        <IconButton
+                          onClick={() => handleCommentsClick(fileInfo)}
+                          size="small"
+                          title="Comments"
+                          aria-label={`Comments (${fileInfo.commentCount})`}
+                          sx={{ ml: 1 }}
+                        >
+                          <Badge badgeContent={fileInfo.commentCount} color="primary" max={99}>
+                            <ChatBubbleOutlineIcon fontSize="small" />
+                          </Badge>
                         </IconButton>
                         {canDownload && (
                           <IconButton 
@@ -1592,6 +1988,19 @@ function FileViewer({ darkMode }) {
           </>
         )}
       </Container>
+
+      <RecordingActivityDrawer
+        open={activityOpen}
+        recording={activityRecording}
+        onClose={closeActivity}
+        trackState={activityTrackState}
+        currentTime={activityTrackState === 'loaded' ? currentTime : 0}
+        onPlay={() => playAudio(activityRecording.file)}
+        onSeek={(seconds) => seekRecording(activityRecording.file, seconds)}
+        onToggleFavorite={() => toggleFavorite(activityRecording)}
+        onRowPatch={patchRow}
+        reloadKey={activityReloadKey}
+      />
     </LocalizationProvider>
   );
 }

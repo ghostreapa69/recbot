@@ -142,6 +142,9 @@ const INDEXES = [
   'CREATE INDEX IF NOT EXISTS idx_user_sessions_login_time ON user_sessions(login_time)',
   'CREATE INDEX IF NOT EXISTS idx_user_sessions_user_email ON user_sessions(user_email)',
   'CREATE INDEX IF NOT EXISTS idx_user_sessions_last_activity ON user_sessions(last_activity)',
+  // Dropped before the load because legacy data can hold duplicate open
+  // sessions. If rebuilding it fails on those, app startup closes them and builds it.
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_one_open ON user_sessions(user_id) WHERE logout_time IS NULL',
   'CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)',
   'CREATE INDEX IF NOT EXISTS idx_audit_logs_action_type ON audit_logs(action_type)',
   'CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(action_timestamp)',

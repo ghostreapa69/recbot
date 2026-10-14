@@ -42,6 +42,32 @@ import {
   Assessment as ReportIcon
 } from '@mui/icons-material';
 
+// Comments are hard-deleted, so a COMMENT_DELETE row's additional_data holds
+// the only copy of what the comment said. Other actions show nothing extra.
+function renderAuditDetails(log) {
+  if (log.action_type !== 'COMMENT_DELETE' || !log.additional_data) return '-';
+  let meta;
+  try { meta = JSON.parse(log.additional_data); } catch { return '-'; }
+  if (!meta.body) return '-';
+  const context = [
+    meta.authorEmail && `Written by ${meta.authorEmail}`,
+    meta.positionMs != null && `at ${Math.floor(meta.positionMs / 60000)}:${String(Math.floor(meta.positionMs / 1000) % 60).padStart(2, '0')} in the call`,
+    meta.createdAt && `posted ${new Date(meta.createdAt).toLocaleString()}`
+  ].filter(Boolean).join(' · ');
+  return (
+    <Box>
+      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+        “{meta.body}”
+      </Typography>
+      {context && (
+        <Typography variant="caption" color="text.secondary">
+          {context}
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
 function AdminPage({ darkMode }) {
   const { user, isLoaded } = useUser();
   const { getToken } = useAuth();
@@ -486,6 +512,10 @@ function AdminPage({ darkMode }) {
                   <MenuItem value="VIEW_FILES">View Files</MenuItem>
                   <MenuItem value="DOWNLOAD_FILE">Download File</MenuItem>
                   <MenuItem value="PLAY_FILE">Play File</MenuItem>
+                  <MenuItem value="FAVORITE_ADD">Favorite Added</MenuItem>
+                  <MenuItem value="FAVORITE_REMOVE">Favorite Removed</MenuItem>
+                  <MenuItem value="COMMENT_ADD">Comment Added</MenuItem>
+                  <MenuItem value="COMMENT_DELETE">Comment Deleted</MenuItem>
                 </Select>
               </FormControl>
             </Grid>
@@ -580,6 +610,7 @@ function AdminPage({ darkMode }) {
                     <TableCell>File</TableCell>
                     <TableCell>Call ID</TableCell>
                     <TableCell>IP Address</TableCell>
+                    <TableCell>Details</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -633,11 +664,12 @@ function AdminPage({ darkMode }) {
                         );
                       })()}</TableCell>
                       <TableCell>{log.ip_address || '-'}</TableCell>
+                      <TableCell sx={{ minWidth: 220, maxWidth: 360 }}>{renderAuditDetails(log)}</TableCell>
                     </TableRow>
                   ))}
                   {auditLogs.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={6} align="center">
+                      <TableCell colSpan={7} align="center">
                         No audit logs found. Click "Search Logs" to load recent activity.
                       </TableCell>
                     </TableRow>
