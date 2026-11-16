@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useUser, useAuth } from '@clerk/clerk-react';
+import { useUser, useAuth } from './auth';
 import {
   Box,
   Typography,
@@ -41,6 +41,32 @@ import {
   Download as DownloadIcon,
   Assessment as ReportIcon
 } from '@mui/icons-material';
+
+// Comments are hard-deleted, so a COMMENT_DELETE row's additional_data holds
+// the only copy of what the comment said. Other actions show nothing extra.
+function renderAuditDetails(log) {
+  if (log.action_type !== 'COMMENT_DELETE' || !log.additional_data) return '-';
+  let meta;
+  try { meta = JSON.parse(log.additional_data); } catch { return '-'; }
+  if (!meta.body) return '-';
+  const context = [
+    meta.authorEmail && `Written by ${meta.authorEmail}`,
+    meta.positionMs != null && `at ${Math.floor(meta.positionMs / 60000)}:${String(Math.floor(meta.positionMs / 1000) % 60).padStart(2, '0')} in the call`,
+    meta.createdAt && `posted ${new Date(meta.createdAt).toLocaleString()}`
+  ].filter(Boolean).join(' · ');
+  return (
+    <Box>
+      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+        “{meta.body}”
+      </Typography>
+      {context && (
+        <Typography variant="caption" color="text.secondary">
+          {context}
+        </Typography>
+      )}
+    </Box>
+  );
+}
 
 function AdminPage({ darkMode }) {
   const { user, isLoaded } = useUser();
@@ -104,18 +130,20 @@ function AdminPage({ darkMode }) {
   const [usageError, setUsageError] = useState('');
   const [usageExporting, setUsageExporting] = useState(false);
 
-  // Check if user has admin role
+  // Check role. Admins get the full dashboard; managers get the Reporting tab only.
   const isAdmin = user?.publicMetadata?.role === 'admin';
+  const isManager = user?.publicMetadata?.role === 'manager';
+  const REPORTING_TAB = 3;
 
   useEffect(() => {
-    if (isLoaded && !isAdmin) {
-      // Redirect non-admin users or show error
-      return;
-    }
+    if (!isLoaded) return;
     if (isAdmin) {
       fetchDatabaseStats();
+    } else if (isManager) {
+      // Managers can only see the Reporting tab — land them there.
+      setCurrentTab(REPORTING_TAB);
     }
-  }, [isLoaded, isAdmin]);
+  }, [isLoaded, isAdmin, isManager]);
 
   const fetchDatabaseStats = async () => {
     try {
@@ -124,6 +152,13 @@ function AdminPage({ darkMode }) {
           'Authorization': `Bearer ${await getToken()}`
         }
       });
+      // On 401/403/500 the body is an error object, not stats — storing it would
+      // render `undefined.toLocaleString()` below and blank the page.
+      if (!response.ok) {
+        console.error(`Error fetching database stats: HTTP ${response.status}`);
+        setDbStats(null);
+        return;
+      }
       const stats = await response.json();
       setDbStats(stats);
     } catch (error) {
@@ -267,7 +302,7 @@ function AdminPage({ darkMode }) {
   };
 
   const fetchUserUsage = async () => {
-    if (!isAdmin) return;
+    if (!isAdmin && !isManager) return;
     setUsageLoading(true);
     setUsageError('');
     try {
@@ -297,7 +332,7 @@ function AdminPage({ darkMode }) {
   };
 
   const downloadUserUsageCsv = async () => {
-    if (!isAdmin || usageExporting) return;
+    if ((!isAdmin && !isManager) || usageExporting) return;
     setUsageExporting(true);
     try {
       const params = new URLSearchParams({
@@ -338,12 +373,12 @@ function AdminPage({ darkMode }) {
   };
 
   useEffect(() => {
-    if (!isAdmin) return;
-    if (currentTab === 3 && !usageFetchedRef.current) {
+    if (!isAdmin && !isManager) return;
+    if (currentTab === REPORTING_TAB && !usageFetchedRef.current) {
       usageFetchedRef.current = true;
       fetchUserUsage();
     }
-  }, [currentTab, isAdmin]);
+  }, [currentTab, isAdmin, isManager]);
 
   const syncDatabase = async (dateRange = null) => {
     setSyncing(true);
@@ -379,7 +414,7 @@ function AdminPage({ darkMode }) {
     return <LinearProgress />;
   }
 
-  if (!isAdmin) {
+  if (!isAdmin && !isManager) {
     return (
       <Box sx={{ p: 3, maxWidth: 600, mx: 'auto', mt: 4 }}>
         <Alert severity="info" sx={{ mb: 2 }}>
@@ -393,22 +428,24 @@ function AdminPage({ darkMode }) {
     <Box sx={{ p: 3, maxWidth: 1200, mx: 'auto' }}>
       <Typography variant="h4" gutterBottom sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
         <DatabaseIcon />
-        Admin Dashboard
+        {isAdmin ? 'Admin Dashboard' : 'Reporting'}
       </Typography>
-      
+
       <Divider sx={{ mb: 3 }} />
 
+      {/* Managers see only the Reporting tab; admins see everything. Explicit
+          `value`s keep Reporting at index 3 so its content gating still matches. */}
       <Tabs value={currentTab} onChange={(e, newValue) => setCurrentTab(newValue)} sx={{ mb: 3 }}>
-        <Tab label="Database Management" icon={<DatabaseIcon />} />
-        <Tab label="Audit Logs" icon={<AuditIcon />} />
-        <Tab label="User Sessions" icon={<UsersIcon />} />
-        <Tab label="Reporting" icon={<ReportIcon />} />
+        {isAdmin && <Tab value={0} label="Database Management" icon={<DatabaseIcon />} />}
+        {isAdmin && <Tab value={1} label="Audit Logs" icon={<AuditIcon />} />}
+        {isAdmin && <Tab value={2} label="User Sessions" icon={<UsersIcon />} />}
+        <Tab value={REPORTING_TAB} label="Reporting" icon={<ReportIcon />} />
       </Tabs>
 
       {currentTab === 0 && (
         <Paper elevation={1} sx={{ p: 3, mb: 3, backgroundColor: darkMode ? 'grey.900' : 'grey.50' }}>
           <Typography variant="h6" gutterBottom>
-            Database Management - Scale: {dbStats ? `${dbStats.totalFiles.toLocaleString()} files` : 'Loading...'}
+            Database Management - Scale: {dbStats ? `${(Number(dbStats.totalFiles) || 0).toLocaleString()} files` : 'Loading...'}
           </Typography>
           
           {dbStats && (
@@ -475,6 +512,10 @@ function AdminPage({ darkMode }) {
                   <MenuItem value="VIEW_FILES">View Files</MenuItem>
                   <MenuItem value="DOWNLOAD_FILE">Download File</MenuItem>
                   <MenuItem value="PLAY_FILE">Play File</MenuItem>
+                  <MenuItem value="FAVORITE_ADD">Favorite Added</MenuItem>
+                  <MenuItem value="FAVORITE_REMOVE">Favorite Removed</MenuItem>
+                  <MenuItem value="COMMENT_ADD">Comment Added</MenuItem>
+                  <MenuItem value="COMMENT_DELETE">Comment Deleted</MenuItem>
                 </Select>
               </FormControl>
             </Grid>
@@ -569,6 +610,7 @@ function AdminPage({ darkMode }) {
                     <TableCell>File</TableCell>
                     <TableCell>Call ID</TableCell>
                     <TableCell>IP Address</TableCell>
+                    <TableCell>Details</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -622,11 +664,12 @@ function AdminPage({ darkMode }) {
                         );
                       })()}</TableCell>
                       <TableCell>{log.ip_address || '-'}</TableCell>
+                      <TableCell sx={{ minWidth: 220, maxWidth: 360 }}>{renderAuditDetails(log)}</TableCell>
                     </TableRow>
                   ))}
                   {auditLogs.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={6} align="center">
+                      <TableCell colSpan={7} align="center">
                         No audit logs found. Click "Search Logs" to load recent activity.
                       </TableCell>
                     </TableRow>

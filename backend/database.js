@@ -22,6 +22,31 @@ const AUDIT_EXPORT_MAX_ROWS = parsePositiveInt(process.env.AUDIT_EXPORT_MAX_ROWS
 const REPORT_EXPORT_MAX_ROWS = parsePositiveInt(process.env.REPORT_EXPORT_MAX_ROWS, 5000);
 const USER_USAGE_EXPORT_MAX_ROWS = parsePositiveInt(process.env.USER_USAGE_EXPORT_MAX_ROWS, 5000);
 
+// Upper bound on the pagination COUNT(*). Without it a broad filter (a whole
+// month with no phone number) counts millions of rows on every page-1 request.
+// We count to CAP + 1 so "exactly CAP" is distinguishable from "more than CAP".
+const REPORT_COUNT_CAP = parsePositiveInt(process.env.REPORT_COUNT_CAP, 10000);
+
+// Phone numbers arrive from Five9 in whatever shape the carrier sent
+// (5551234567, +15551234567, (555) 123-4567), so both the index and the
+// predicate normalize to the last 10 digits before comparing.
+//
+// This expression is the *definition* of idx_reporting_{ani,dnis}_last10.
+// Postgres matches an expression index by the parsed expression tree, so it
+// must stay in lockstep with what backend/scripts/optimize-reporting-indexes.mjs
+// builds — same functions, same arguments, same order. Any drift silently
+// disables the index and the seq scans come back.
+const phoneLast10Expr = (column) => `right(regexp_replace(coalesce(${column}, ''), '[^0-9]', '', 'g'), 10)`;
+
+// Below this many digits we can't use the last-10 index and fall back to a
+// trigram-backed substring LIKE.
+const PHONE_EXACT_MIN_DIGITS = 7;
+
+function phoneDigits(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/[^0-9]/g, '');
+}
+
 export function normalizeReportTimestamp(raw) {
   if (raw === null || raw === undefined) return null;
   const trimmed = typeof raw === 'string' ? raw.trim() : String(raw).trim();
@@ -112,6 +137,56 @@ pool.on('error', (err) => {
   console.error('Unexpected PostgreSQL pool error:', err);
 });
 
+// Attach an error listener to every pooled client. A checked-out client whose
+// connection drops ("Connection terminated unexpectedly") emits an 'error'
+// event; without a listener Node treats it as uncaught and CRASHES the process.
+// The pool discards the broken connection and opens a new one on the next query.
+pool.on('connect', (client) => {
+  client.on('error', (err) => {
+    console.error('PostgreSQL client connection error (handled):', err.message);
+  });
+});
+
+// Indexes backing the phone filter. On a fresh or small install these build
+// instantly, so we create them inline. On an established table they take
+// minutes and a plain CREATE INDEX holds a write lock for the duration —
+// which would stall the container past its healthcheck start_period — so
+// above the threshold we skip and point at the CONCURRENTLY script instead.
+const PHONE_INDEX_INLINE_ROW_LIMIT = 100_000;
+
+async function createPhoneSearchIndexes() {
+  // reltuples is the planner's estimate, updated by ANALYZE — free to read,
+  // no scan. It is -1 on a table that has never been analyzed.
+  let estimate = 0;
+  try {
+    const { rows } = await pool.query(`SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'reporting'`);
+    estimate = Number(rows[0]?.estimate ?? 0);
+  } catch (e) {
+    console.warn('[REPORTING] Could not estimate reporting size:', e.message);
+  }
+
+  if (estimate > PHONE_INDEX_INLINE_ROW_LIMIT) {
+    console.warn(`[REPORTING] Skipping inline phone index creation (~${estimate.toLocaleString('en-US')} rows).`);
+    console.warn('[REPORTING] Build them without locking writes by running:');
+    console.warn('[REPORTING]   node scripts/optimize-reporting-indexes.mjs');
+    return;
+  }
+
+  try {
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm;`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_ani_last10 ON reporting (${phoneLast10Expr('ani')});`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_dnis_last10 ON reporting (${phoneLast10Expr('dnis')});`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_ani_trgm ON reporting USING gin (ani gin_trgm_ops);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_dnis_trgm ON reporting USING gin (dnis gin_trgm_ops);`);
+  } catch (e) {
+    // Creating an extension needs superuser on some managed Postgres hosts.
+    // Without the indexes phone search still returns correct results, just
+    // slowly, so this must not take the app down at boot.
+    console.warn('[REPORTING] Phone search index creation failed:', e.message);
+    console.warn('[REPORTING] Phone lookups will fall back to sequential scans.');
+  }
+}
+
 // ============================================================
 // Database Initialization (must be called at startup)
 // ============================================================
@@ -198,6 +273,66 @@ export async function initializeDatabase() {
     );
   `);
 
+  // Maps a user's stable email to their auth-provider IDs. Used to relink
+  // historical logs (originally keyed by Clerk user IDs) to Logto user IDs
+  // after the Clerk -> Logto migration. Email is the bridge between providers.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_identity_map (
+      email          TEXT PRIMARY KEY,
+      clerk_user_id  TEXT,
+      logto_user_id  TEXT,
+      linked_at      TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // Favorites, comments and notifications on recordings. Recordings are keyed by
+  // file_path (the unique S3 key the API already uses), not files.id, and there
+  // are no foreign keys: the SQLite migration script runs
+  // TRUNCATE files RESTART IDENTITY, which an FK would block and which renumbers
+  // ids. People are keyed by lowercased email, because recording owners and
+  // notification recipients only exist as emails (files.email, reporting.agent),
+  // and user ids already changed once (Clerk -> Logto).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS recording_favorites (
+      id SERIAL PRIMARY KEY,
+      file_path TEXT NOT NULL,
+      user_email TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      user_name TEXT,
+      user_role TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (file_path, user_email)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS recording_comments (
+      id SERIAL PRIMARY KEY,
+      file_path TEXT NOT NULL,
+      user_email TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      user_name TEXT,
+      user_role TEXT NOT NULL,
+      body TEXT NOT NULL,
+      position_ms INTEGER,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      recipient_email TEXT NOT NULL,
+      type TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      actor_email TEXT NOT NULL,
+      actor_name TEXT,
+      comment_id INTEGER,
+      created_at TIMESTAMP DEFAULT NOW(),
+      read_at TIMESTAMP
+    );
+  `);
+
   // Create indexes
   // Migration: add call_disposition column to existing files tables
   await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS call_disposition TEXT;`);
@@ -211,8 +346,9 @@ export async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_composite ON files(call_date, phone, email);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_call_id ON files(call_id);`);
 
+  // No DESC twin for idx_reporting_timestamp — a b-tree scans backward natively,
+  // so the duplicate only cost write throughput on every ingest batch.
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_timestamp ON reporting(timestamp);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_timestamp_desc ON reporting(timestamp DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_agent ON reporting(agent);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_agent_name ON reporting(agent_name);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_campaign ON reporting(campaign);`);
@@ -223,10 +359,34 @@ export async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reporting_disposition ON reporting(disposition);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_call_disposition ON files(call_disposition);`);
 
+  await createPhoneSearchIndexes();
+
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_login_time ON user_sessions(login_time);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_user_email ON user_sessions(user_email);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_last_activity ON user_sessions(last_activity);`);
+
+  // At most one open session per user. A page load fires several API requests
+  // at once, and each used to see "no open session", open its own and log a
+  // LOGIN; with this index logUserSession() lets exactly one of them win.
+  // First close duplicates left by that race — each user keeps the newest and
+  // the others end when it began — or the index can't be built.
+  await pool.query(`
+    WITH ranked AS (
+      SELECT id,
+             first_value(login_time) OVER newest_first AS kept_login,
+             row_number() OVER newest_first AS rn
+      FROM user_sessions
+      WHERE logout_time IS NULL
+      WINDOW newest_first AS (PARTITION BY user_id ORDER BY login_time DESC NULLS LAST, id DESC)
+    )
+    UPDATE user_sessions s
+    SET logout_time = COALESCE(GREATEST(r.kept_login, s.login_time), NOW()),
+        session_duration_ms = EXTRACT(EPOCH FROM (COALESCE(GREATEST(r.kept_login, s.login_time), NOW()) - s.login_time)) * 1000
+    FROM ranked r
+    WHERE s.id = r.id AND r.rn > 1;
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_one_open ON user_sessions(user_id) WHERE logout_time IS NULL;`);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_action_type ON audit_logs(action_type);`);
@@ -235,6 +395,14 @@ export async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_file_path ON audit_logs(file_path);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_composite ON audit_logs(user_id, action_type, action_timestamp);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_call_id ON audit_logs(call_id);`);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_identity_map_logto ON user_identity_map(logto_user_id);`);
+
+  // recording_favorites' UNIQUE (file_path, user_email) already serves per-recording lookups.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recording_favorites_user_email ON recording_favorites(user_email);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recording_comments_file_path ON recording_comments(file_path);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_email, id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_file_path ON notifications(file_path);`);
 
   // Test query
   try {
@@ -448,6 +616,7 @@ export async function backfillAuditLogCallIds(batchSize = 500) {
 
 export async function indexFiles(files) {
   const client = await pool.connect();
+  let failed;
   try {
     await client.query('BEGIN');
     let indexed = 0;
@@ -489,17 +658,29 @@ export async function indexFiles(files) {
     await client.query('COMMIT');
     return indexed;
   } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Error in indexFiles transaction:', error);
+    failed = error;
+    try { await client.query('ROLLBACK'); } catch (e) { /* connection may be gone */ }
+    console.error('Error in indexFiles transaction:', error.message);
     return 0;
   } finally {
-    client.release();
+    try { client.release(failed); } catch (e) { /* already released */ }
   }
 }
 
 // ============================================================
 // File queries
 // ============================================================
+
+// A user owns a recording when their sign-in email matches the call's agent:
+// the email embedded in legacy filenames ("{phone} by {email} @ ..."), or the
+// Five9 agent username on the call's reporting row (the newest filename format
+// only carries a display name). getRecordingContext() applies the same rule in
+// JS — keep the two in lockstep. `emailParam` must bind a lowercased email.
+// lower(r.agent) is served by idx_reporting_agent_lower_call_id, built by
+// scripts/optimize-reporting-indexes.mjs; changing the expression disables it.
+const ownedBySql = (emailParam) =>
+  `(lower(f.email) = ${emailParam} OR EXISTS (SELECT 1 FROM reporting r WHERE r.call_id = f.call_id AND lower(r.agent) = ${emailParam}))`;
+
 export async function queryFiles(filters = {}) {
   const {
     dateStart,
@@ -511,6 +692,10 @@ export async function queryFiles(filters = {}) {
     timeEnd,
     callId,
     callDisposition,
+    recordingPath,
+    favorites,
+    mine,
+    viewerEmail,
     sortColumn = 'date',
     sortDirection = 'desc',
     limit = 25,
@@ -534,8 +719,18 @@ export async function queryFiles(filters = {}) {
   if (timeEnd) { conditions.push(`call_time <= $${paramIdx++}`); params.push(timeEnd); }
   if (callId) { conditions.push(`call_id LIKE '%' || $${paramIdx++} || '%'`); params.push(callId); }
   if (callDisposition) { conditions.push(`call_disposition = $${paramIdx++}`); params.push(callDisposition); }
+  if (recordingPath) { conditions.push(`f.file_path = $${paramIdx++}`); params.push(recordingPath); }
+  if (favorites === 'mine') {
+    conditions.push(`EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path AND rf.user_email = $${paramIdx++})`);
+    params.push(viewerEmail || null);
+  } else if (favorites === 'any') {
+    conditions.push(`EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path)`);
+  }
+  if (mine) { conditions.push(ownedBySql(`$${paramIdx++}`)); params.push(viewerEmail || null); }
 
   const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+  // The count query binds exactly these; Postgres rejects unused bind values.
+  const whereParamCount = params.length;
 
   // Build ORDER BY
   const sortMap = {
@@ -545,26 +740,37 @@ export async function queryFiles(filters = {}) {
     email: 'email',
     durationMs: 'duration_ms',
     callId: 'call_id',
-    callDisposition: 'call_disposition'
+    callDisposition: 'call_disposition',
+    favoriteCount: 'favorite_count'
   };
   const sortCol = sortMap[sortColumn] || 'call_date';
   const sortDir = sortDirection === 'asc' ? 'ASC' : 'DESC';
   const orderBy = `ORDER BY ${sortCol} ${sortDir}, call_date DESC, call_time DESC`;
 
+  // Per-viewer columns, bound after the WHERE params so only the data query uses them.
+  const viewerParam = `$${paramIdx++}`;
+  params.push(viewerEmail || null);
   const limitParam = `$${paramIdx++}`;
   const offsetParam = `$${paramIdx++}`;
   params.push(limit, offset);
 
+  // The subqueries run only for the returned page: with a LIMIT, Postgres
+  // evaluates expensive select-list expressions after the sort (unless one is
+  // the sort key, as favorite_count is for "Most favorited").
   const dataQuery = `
-    SELECT file_path, phone, email, call_date, call_time, call_id, call_disposition, duration_ms, file_size
-    FROM files ${whereClause}
+    SELECT file_path, phone, email, call_date, call_time, call_id, call_disposition, duration_ms, file_size,
+      (SELECT COUNT(*) FROM recording_favorites rf WHERE rf.file_path = f.file_path)::int AS favorite_count,
+      (SELECT COUNT(*) FROM recording_comments rc WHERE rc.file_path = f.file_path)::int AS comment_count,
+      EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path AND rf.user_email = ${viewerParam}) AS favorited_by_me,
+      ${ownedBySql(viewerParam)} AS is_mine
+    FROM files f ${whereClause}
     ${orderBy}
     LIMIT ${limitParam} OFFSET ${offsetParam}
   `;
 
   // Count query (same conditions, no limit/offset)
-  const countParams = params.slice(0, params.length - 2);
-  const countQuery = `SELECT COUNT(*) as total FROM files ${whereClause}`;
+  const countParams = params.slice(0, whereParamCount);
+  const countQuery = `SELECT COUNT(*) as total FROM files f ${whereClause}`;
 
   const [dataResult, countResult] = await Promise.all([
     pool.query(dataQuery, params),
@@ -583,7 +789,12 @@ export async function queryFiles(filters = {}) {
       call_id: f.call_id || null,
       call_disposition: f.call_disposition || null,
       duration_ms: f.duration_ms,
-      file_size: f.file_size
+      file_size: f.file_size,
+      favorite_count: f.favorite_count,
+      comment_count: f.comment_count,
+      favorited_by_me: f.favorited_by_me,
+      // NULL when files.email is NULL and no reporting row matches.
+      is_mine: f.is_mine === true
     })),
     totalCount: total,
     hasMore: offset + limit < total
@@ -618,20 +829,194 @@ export async function getDatabaseStats() {
 }
 
 // ============================================================
+// Auth identity linking (Clerk -> Logto migration)
+// ============================================================
+// Called on each authenticated request. The first time a given email is seen
+// under a Logto user ID, it rewrites that user's historical log rows (which
+// were keyed by their old Clerk `user_xxx` ID) to the Logto ID, using email as
+// the bridge. Idempotent: once linked, subsequent calls short-circuit cheaply
+// so this does not scan the log tables on every request.
+// Look up a user's email by their Logto user ID via the identity map (populated
+// on a prior header-authenticated login). Used to authenticate requests that
+// can't send the ID token header — e.g. native <audio> ?auth= stream URLs.
+export async function getEmailByLogtoId(logtoUserId) {
+  if (!logtoUserId) return null;
+  try {
+    const r = await pool.query(
+      `SELECT email FROM user_identity_map WHERE logto_user_id = $1 LIMIT 1`,
+      [logtoUserId]
+    );
+    return r.rows.length ? r.rows[0].email : null;
+  } catch (e) {
+    console.error('getEmailByLogtoId failed:', e.message);
+    return null;
+  }
+}
+
+// In-memory cache of (logtoUserId, email) pairs already linked in this process,
+// so linkLogtoIdentity does NOT touch the DB on every authenticated request
+// (which otherwise contends for pool connections and can exhaust it).
+const linkedIdentityCache = new Set();
+
+export async function linkLogtoIdentity(logtoUserId, email) {
+  if (!logtoUserId || !email) return { linked: false, reason: 'missing_args' };
+
+  const cacheKey = `${logtoUserId} ${email.toLowerCase()}`;
+  if (linkedIdentityCache.has(cacheKey)) {
+    return { linked: false, reason: 'cached' };
+  }
+
+  // Fast path (the common case after a user's first login): if this email is
+  // already mapped to this Logto ID, do nothing. Uses pool.query so we don't
+  // check out a manual client or open a transaction on every request.
+  try {
+    const existing = await pool.query(
+      `SELECT logto_user_id FROM user_identity_map WHERE email = $1`,
+      [email]
+    );
+    if (existing.rows.length && existing.rows[0].logto_user_id === logtoUserId) {
+      linkedIdentityCache.add(cacheKey);
+      return { linked: false, reason: 'already_linked' };
+    }
+  } catch (e) {
+    console.error('Identity link: lookup failed:', e.message);
+    return { linked: false, reason: 'error', error: e.message };
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (e) {
+    // Could not get a connection (pool exhausted / DB down). Don't crash — the
+    // relink is best-effort and idempotent, so it retries on the next request.
+    console.error('Identity link: could not acquire DB client:', e.message);
+    return { linked: false, reason: 'no_client' };
+  }
+
+  // A checked-out client whose connection drops emits an 'error' event. Without
+  // this listener that becomes an unhandled error and crashes the process.
+  client.on('error', (e) => {
+    console.error('Identity link: pg client connection error:', e.message);
+  });
+
+  let failed;
+  try {
+    await client.query('BEGIN');
+
+    // Already linked to this exact Logto ID? Nothing to do.
+    const existing = await client.query(
+      `SELECT logto_user_id FROM user_identity_map WHERE email = $1`,
+      [email]
+    );
+    if (existing.rows.length && existing.rows[0].logto_user_id === logtoUserId) {
+      await client.query('COMMIT');
+      return { linked: false, reason: 'already_linked' };
+    }
+
+    // Capture the prior (e.g. Clerk) ID we're relinking from, for the audit trail.
+    const prior = await client.query(
+      `SELECT user_id FROM user_sessions WHERE user_email = $1 AND user_id <> $2
+       UNION
+       SELECT user_id FROM audit_logs   WHERE user_email = $1 AND user_id <> $2
+       LIMIT 1`,
+      [email, logtoUserId]
+    );
+    const clerkUserId = prior.rows.length ? prior.rows[0].user_id : null;
+
+    // Rewrite historical logs from the old ID to the Logto ID.
+    const sessions = await client.query(
+      `UPDATE user_sessions SET user_id = $1 WHERE user_email = $2 AND user_id <> $1`,
+      [logtoUserId, email]
+    );
+    const audits = await client.query(
+      `UPDATE audit_logs SET user_id = $1 WHERE user_email = $2 AND user_id <> $1`,
+      [logtoUserId, email]
+    );
+
+    await client.query(
+      `INSERT INTO user_identity_map (email, clerk_user_id, logto_user_id, linked_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (email) DO UPDATE
+         SET logto_user_id = EXCLUDED.logto_user_id,
+             clerk_user_id = COALESCE(user_identity_map.clerk_user_id, EXCLUDED.clerk_user_id),
+             linked_at = NOW()`,
+      [email, clerkUserId, logtoUserId]
+    );
+
+    await client.query('COMMIT');
+    linkedIdentityCache.add(cacheKey);
+
+    const relinked = (sessions.rowCount || 0) + (audits.rowCount || 0);
+    if (relinked > 0) {
+      console.log(`🔗 [IDENTITY] Linked ${email} -> ${logtoUserId} (relinked ${sessions.rowCount} session rows, ${audits.rowCount} audit rows from ${clerkUserId || 'n/a'})`);
+    }
+    return {
+      linked: true,
+      relinkedSessions: sessions.rowCount || 0,
+      relinkedAudit: audits.rowCount || 0,
+      clerkUserId
+    };
+  } catch (error) {
+    failed = error;
+    // The connection may already be dead; don't let a failing ROLLBACK throw.
+    try { await client.query('ROLLBACK'); } catch (e) { /* connection gone */ }
+    console.error('Error linking Logto identity:', error.message);
+    return { linked: false, reason: 'error', error: error.message };
+  } finally {
+    // Passing the error to release() discards a possibly-broken connection
+    // instead of returning it to the pool.
+    try { client.release(failed); } catch (e) { /* already released */ }
+  }
+}
+
+// ============================================================
 // Audit logging
 // ============================================================
+// Opens a session unless the user already has an open one. Concurrent requests
+// race here and idx_user_sessions_one_open lets exactly one insert. Returns the
+// new session's id, or null when another request opened it first (or on
+// error) — callers log a LOGIN only when they get an id.
 export async function logUserSession(userId, userEmail, ipAddress, userAgent) {
   try {
     const result = await pool.query(`
       INSERT INTO user_sessions (user_id, user_email, ip_address, user_agent, last_activity)
       VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (user_id) WHERE logout_time IS NULL DO NOTHING
       RETURNING id
     `, [userId, userEmail, ipAddress, userAgent]);
+    if (!result.rows.length) return null;
     console.log(`📋 [AUDIT] User session created for ${userEmail} (ID: ${userId})`);
     return result.rows[0].id;
   } catch (error) {
     console.error('Error creating user session:', error);
     return null;
+  }
+}
+
+export async function getOpenSessionId(userId) {
+  try {
+    const { rows } = await pool.query(`SELECT id FROM user_sessions WHERE user_id = $1 AND logout_time IS NULL`, [userId]);
+    return rows.length ? rows[0].id : null;
+  } catch (error) {
+    console.error('Error getting open session:', error);
+    return null;
+  }
+}
+
+// Closes one specific session. Returns true only for the call that actually
+// closed it, so concurrent requests expiring the same session log one LOGOUT.
+export async function closeUserSession(sessionId) {
+  try {
+    const { rowCount } = await pool.query(`
+      UPDATE user_sessions
+      SET logout_time = NOW(),
+          session_duration_ms = EXTRACT(EPOCH FROM (NOW() - login_time)) * 1000
+      WHERE id = $1 AND logout_time IS NULL
+    `, [sessionId]);
+    return rowCount > 0;
+  } catch (error) {
+    console.error('Error closing user session:', error);
+    return false;
   }
 }
 
@@ -1139,6 +1524,7 @@ export async function upsertReportRow(row) {
 
 export async function bulkUpsertReports(rows = []) {
   const client = await pool.connect();
+  let failed;
   try {
     await client.query('BEGIN');
     let inserted = 0;
@@ -1182,15 +1568,16 @@ export async function bulkUpsertReports(rows = []) {
     await client.query('COMMIT');
     return inserted;
   } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('Failed to bulk upsert reports:', e);
+    failed = e;
+    try { await client.query('ROLLBACK'); } catch (err) { /* connection may be gone */ }
+    console.error('Failed to bulk upsert reports:', e.message);
     return 0;
   } finally {
-    client.release();
+    try { client.release(failed); } catch (err) { /* already released */ }
   }
 }
 
-function buildReportWhereClause(params, { start, end, agent, agentName, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned }, { alias = '' } = {}) {
+function buildReportWhereClause(params, { start, end, agent, agentName, campaign, callType, disposition, phone, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfers, conferences, abandoned }, { alias = '' } = {}) {
   const conditions = [];
   let paramIdx = params.length + 1;
   const p = alias ? `${alias}.` : '';
@@ -1202,10 +1589,25 @@ function buildReportWhereClause(params, { start, end, agent, agentName, campaign
   if (campaign) { conditions.push(`${p}campaign = $${paramIdx++}`); params.push(campaign); }
   if (callType) { conditions.push(`${p}call_type = $${paramIdx++}`); params.push(callType); }
   if (disposition) { conditions.push(`${p}disposition = $${paramIdx++}`); params.push(disposition); }
-  if (phone) { conditions.push(`(${p}ani LIKE '%' || $${paramIdx} || '%' OR ${p}dnis LIKE '%' || $${paramIdx} || '%')`); params.push(phone); paramIdx++; }
+  if (phone) {
+    // A full number matches on normalized digits (indexed equality, and it
+    // ignores +1 / dashes / parens). Anything shorter keeps the original
+    // substring behaviour, which the trigram indexes now serve.
+    const digits = phoneDigits(phone);
+    if (digits.length >= PHONE_EXACT_MIN_DIGITS) {
+      conditions.push(`(${phoneLast10Expr(`${p}ani`)} = $${paramIdx} OR ${phoneLast10Expr(`${p}dnis`)} = $${paramIdx})`);
+      params.push(digits.slice(-10));
+    } else {
+      conditions.push(`(${p}ani LIKE '%' || $${paramIdx} || '%' OR ${p}dnis LIKE '%' || $${paramIdx} || '%')`);
+      params.push(phone);
+    }
+    paramIdx++;
+  }
   if (callId) { conditions.push(`${p}call_id LIKE '%' || $${paramIdx++} || '%'`); params.push(callId); }
   if (customerName) { conditions.push(`${p}customer_name LIKE '%' || $${paramIdx++} || '%'`); params.push(customerName); }
   if (afterCallWork !== null && afterCallWork !== undefined) { conditions.push(`${p}after_call_work_time >= $${paramIdx++}`); params.push(afterCallWork); }
+  if (callTimeMin !== null && callTimeMin !== undefined) { conditions.push(`${p}call_time >= $${paramIdx++}`); params.push(callTimeMin); }
+  if (callTimeMax !== null && callTimeMax !== undefined) { conditions.push(`${p}call_time <= $${paramIdx++}`); params.push(callTimeMax); }
   if (transfers !== null && transfers !== undefined) { conditions.push(`${p}transfers = $${paramIdx++}`); params.push(transfers); }
   if (conferences !== null && conferences !== undefined) { conditions.push(`${p}conferences = $${paramIdx++}`); params.push(conferences); }
   if (abandoned !== null && abandoned !== undefined) { conditions.push(`${p}abandoned = $${paramIdx++}`); params.push(abandoned); }
@@ -1213,7 +1615,20 @@ function buildReportWhereClause(params, { start, end, agent, agentName, campaign
   return conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 }
 
-export async function queryReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, limit = 100, offset = 0, sort = 'desc' } = {}) {
+// Call-time sorts put calls with no recorded call time last in both directions,
+// and break ties newest-first so pages stay stable.
+// There is deliberately no index on call_time: with one, the planner walks it for
+// date-ranged sorts and, because call_id order tracks time, can read every
+// zero-length call ever made before reaching the range (30 days, shortest first:
+// 0.26s -> 1.5s on 3M rows). Without it a date-ranged sort is a top-N sort over
+// that range; only an all-dates sort scans the whole table.
+function buildReportOrderBy(sortBy, sortDir, { alias = '' } = {}) {
+  const p = alias ? `${alias}.` : '';
+  if (sortBy === 'callTime') return `ORDER BY ${p}call_time ${sortDir} NULLS LAST, ${p}timestamp DESC, ${p}call_id DESC`;
+  return `ORDER BY ${p}timestamp ${sortDir}`;
+}
+
+export async function queryReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, callTimeMin = null, callTimeMax = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, limit = 100, offset = 0, sort = 'desc', sortBy = 'timestamp' } = {}) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => { if (v === null || v === undefined) return null; const str = String(v).trim(); return str === '' ? null : str; };
@@ -1224,76 +1639,93 @@ export async function queryReports({ start = null, end = null, agent = null, age
     const c = norm(campaign), ct = norm(callType), disp = norm(disposition);
     const phoneNorm = normLike(phone), ci = normLike(callId), cust = normLike(customerName);
     const acw = normDuration(afterCallWork), tr = normBinary(transfers), conf = normBinary(conferences), ab = normBinary(abandoned);
+    const ctMin = normDuration(callTimeMin), ctMax = normDuration(callTimeMax);
     const hr = normBinary(hasRecording);
     const sortDir = sort === 'asc' ? 'ASC' : 'DESC';
 
-    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, agentName=${aName}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sort=${sortDir}`);
+    console.log(`[QUERY REPORTS] Filters: start=${s}, end=${e}, agent=${a}, agentName=${aName}, campaign=${c}, callType=${ct}, phone=${phoneNorm}, callId=${ci}, customer=${cust}, afterCallWorkMin=${acw}, callTimeMin=${ctMin}, callTimeMax=${ctMax}, transfers=${tr}, conferences=${conf}, abandoned=${ab}, limit=${limit}, offset=${offset}, sortBy=${sortBy}, sort=${sortDir}`);
 
     const filterArgs = {
       start: s, end: e, agent: a, agentName: aName, campaign: c, callType: ct,
       disposition: disp, phone: phoneNorm, callId: ci, customerName: cust,
-      afterCallWork: acw, transfers: tr, conferences: conf, abandoned: ab
+      afterCallWork: acw, callTimeMin: ctMin, callTimeMax: ctMax, transfers: tr, conferences: conf, abandoned: ab
     };
 
-    // Build WHERE clause with "r." alias for the JOIN query
+    // Build WHERE clause with "r." alias for the data query
     const dataParams = [];
-    const joinWhereClause = buildReportWhereClause(dataParams, filterArgs, { alias: 'r' });
+    let dataWhereClause = buildReportWhereClause(dataParams, filterArgs, { alias: 'r' });
 
     // Build a second WHERE clause without alias for the COUNT query
     const countParams = [];
-    const countWhereClause = buildReportWhereClause(countParams, filterArgs);
+    let countWhereClause = buildReportWhereClause(countParams, filterArgs);
+
+    // hasRecording: a semi-join against files, not a LEFT JOIN. The previous
+    // "LEFT JOIN (SELECT DISTINCT call_id FROM files)" could not be inlined by
+    // the planner, so the full distinct set was materialized on every request
+    // and the ORDER BY ... LIMIT could not stream off the timestamp index.
+    const recordingExists = (alias) => `EXISTS (SELECT 1 FROM files WHERE files.call_id = ${alias}.call_id)`;
+    const appendCondition = (clause, condition) => (clause ? `${clause} AND ${condition}` : `WHERE ${condition}`);
+
+    if (hr === 1) {
+      dataWhereClause = appendCondition(dataWhereClause, recordingExists('r'));
+      countWhereClause = appendCondition(countWhereClause, recordingExists('reporting'));
+    } else if (hr === 0) {
+      dataWhereClause = appendCondition(dataWhereClause, `NOT ${recordingExists('r')}`);
+      countWhereClause = appendCondition(countWhereClause, `NOT ${recordingExists('reporting')}`);
+    }
 
     const paramIdx = dataParams.length + 1;
     dataParams.push(limit, offset);
 
     // Explicit column list — exclude raw_json (large TEXT blob, only needed for hydration
     // which we now do selectively) and recordings (rarely needed in list views).
-    // LEFT JOIN files to compute hasRecording in-query instead of a separate round-trip.
     const reportCols = `r.call_id, r.timestamp, r.campaign, r.call_type, r.agent, r.agent_name,
       r.disposition, r.ani, r.customer_name, r.dnis, r.call_time, r.bill_time_rounded,
       r.cost, r.ivr_time, r.queue_wait_time, r.ring_time, r.talk_time, r.hold_time,
       r.park_time, r.after_call_work_time, r.transfers, r.conferences, r.holds,
       r.abandoned, r.created_at,
-      CASE WHEN f.call_id IS NOT NULL THEN true ELSE false END AS "hasRecording"`;
-
-    // hasRecording filter: applied after the LEFT JOIN
-    let hasRecordingJoinCondition = '';
-    if (hr === 1) {
-      hasRecordingJoinCondition = joinWhereClause ? ' AND f.call_id IS NOT NULL' : ' WHERE f.call_id IS NOT NULL';
-    } else if (hr === 0) {
-      hasRecordingJoinCondition = joinWhereClause ? ' AND f.call_id IS NULL' : ' WHERE f.call_id IS NULL';
-    }
+      ${recordingExists('r')} AS "hasRecording"`;
 
     const dataQuery = `SELECT ${reportCols}
       FROM reporting r
-      LEFT JOIN (SELECT DISTINCT call_id FROM files WHERE call_id IS NOT NULL) f ON f.call_id = r.call_id
-      ${joinWhereClause}${hasRecordingJoinCondition}
-      ORDER BY r.timestamp ${sortDir} LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
+      ${dataWhereClause}
+      ${buildReportOrderBy(sortBy, sortDir, { alias: 'r' })} LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
 
-    // Count query: use EXISTS/NOT EXISTS for hasRecording filter
-    let countHasRecording = '';
-    if (hr === 1) {
-      countHasRecording = (countWhereClause ? ' AND ' : ' WHERE ') + 'EXISTS (SELECT 1 FROM files WHERE files.call_id = reporting.call_id)';
-    } else if (hr === 0) {
-      countHasRecording = (countWhereClause ? ' AND ' : ' WHERE ') + 'NOT EXISTS (SELECT 1 FROM files WHERE files.call_id = reporting.call_id)';
-    }
-    const countQuery = `SELECT COUNT(*) as total FROM reporting ${countWhereClause}${countHasRecording}`;
+    // The count is the expensive half of this request: LIMIT bounds the data
+    // query, but nothing bounds a COUNT(*). Two mitigations:
+    //   1. Only count on the first page. ReportsPage resets to page 1 whenever
+    //      a filter changes, so while paging the client's cached total is still
+    //      correct for the current filter set.
+    //   2. Stop counting at the cap, so a broad filter can never walk millions
+    //      of rows. Counting to CAP + 1 tells "exactly CAP" from "more".
+    const shouldCount = offset === 0;
+    const countQuery = `SELECT COUNT(*) as total FROM (
+        SELECT 1 FROM reporting ${countWhereClause} LIMIT ${REPORT_COUNT_CAP + 1}
+      ) t`;
 
     const [dataResult, countResult] = await Promise.all([
       pool.query(dataQuery, dataParams),
-      pool.query(countQuery, countParams)
+      shouldCount ? pool.query(countQuery, countParams) : Promise.resolve(null)
     ]);
 
-    const total = parseInt(countResult.rows[0].total, 10);
-    console.log(`[QUERY REPORTS] Results: returned ${dataResult.rows.length} rows, total=${total}`);
-    return { rows: dataResult.rows, total, sort: sort === 'asc' ? 'asc' : 'desc' };
+    // null total means "unchanged since page 1" — the caller keeps its value.
+    let total = null;
+    let totalCapped = false;
+    if (countResult) {
+      const counted = parseInt(countResult.rows[0].total, 10);
+      totalCapped = counted > REPORT_COUNT_CAP;
+      total = totalCapped ? REPORT_COUNT_CAP : counted;
+    }
+
+    console.log(`[QUERY REPORTS] Results: returned ${dataResult.rows.length} rows, total=${total === null ? 'skipped' : total}${totalCapped ? '+ (capped)' : ''}`);
+    return { rows: dataResult.rows, total, totalCapped, sort: sort === 'asc' ? 'asc' : 'desc' };
   } catch (e) {
     console.error('Failed to query reports', e);
-    return { rows: [], total: 0 };
+    return { rows: [], total: 0, totalCapped: false };
   }
 }
 
-export async function exportReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, sort = 'desc' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
+export async function exportReports({ start = null, end = null, agent = null, agentName = null, campaign = null, callType = null, disposition = null, phone = null, callId = null, customerName = null, afterCallWork = null, callTimeMin = null, callTimeMax = null, transfers = null, conferences = null, abandoned = null, hasRecording = null, sort = 'desc', sortBy = 'timestamp' } = {}, maxRows = REPORT_EXPORT_MAX_ROWS) {
   try {
     const norm = v => (v && typeof v === 'string' && v.trim() !== '') ? v.trim() : null;
     const normLike = (v) => { if (v === null || v === undefined) return null; const str = String(v).trim(); return str === '' ? null : str; };
@@ -1305,13 +1737,14 @@ export async function exportReports({ start = null, end = null, agent = null, ag
     const phoneNorm = normLike(phone), ci = normLike(callId), cust = normLike(customerName);
     const hr = normBinary(hasRecording);
     const acw = normDuration(afterCallWork), tr = normBinary(transfers), conf = normBinary(conferences), ab = normBinary(abandoned);
+    const ctMin = normDuration(callTimeMin), ctMax = normDuration(callTimeMax);
     const sortDir = sort === 'asc' ? 'ASC' : 'DESC';
 
     const params = [];
     const whereClause = buildReportWhereClause(params, {
       start: s, end: e, agent: a, agentName: aName, campaign: c, callType: ct,
       disposition: disp, phone: phoneNorm, callId: ci, customerName: cust,
-      afterCallWork: acw, transfers: tr, conferences: conf, abandoned: ab
+      afterCallWork: acw, callTimeMin: ctMin, callTimeMax: ctMax, transfers: tr, conferences: conf, abandoned: ab
     });
 
     let countHasRecording = '';
@@ -1320,15 +1753,26 @@ export async function exportReports({ start = null, end = null, agent = null, ag
     } else if (hr === 0) {
       countHasRecording = (whereClause ? ' AND ' : ' WHERE ') + 'NOT EXISTS (SELECT 1 FROM files WHERE files.call_id = reporting.call_id)';
     }
-    const countResult = await pool.query(`SELECT COUNT(*) as total FROM reporting ${whereClause}${countHasRecording}`, params);
-    const total = parseInt(countResult.rows[0].total, 10);
 
-    if (total > maxRows) {
-      return { rows: [], total, truncated: true, maxRows, sort: sort === 'asc' ? 'asc' : 'desc' };
+    // This count only decides whether the export exceeds maxRows, so stop at
+    // maxRows + 1. An unbounded COUNT(*) here would scan the whole table just
+    // to tell the caller a number we then refuse to act on.
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as total FROM (
+         SELECT 1 FROM reporting ${whereClause}${countHasRecording} LIMIT ${maxRows + 1}
+       ) t`,
+      params
+    );
+    const counted = parseInt(countResult.rows[0].total, 10);
+
+    if (counted > maxRows) {
+      // total is not the true row count — only "more than maxRows".
+      return { rows: [], total: null, truncated: true, maxRows, sort: sort === 'asc' ? 'asc' : 'desc' };
     }
+    const total = counted;
 
     const dataResult = await pool.query(
-      `SELECT * FROM reporting ${whereClause}${countHasRecording} ORDER BY timestamp ${sortDir}`,
+      `SELECT * FROM reporting ${whereClause}${countHasRecording} ${buildReportOrderBy(sortBy, sortDir)}`,
       params
     );
 
@@ -1348,25 +1792,39 @@ export async function getReportingSummary() {
   }
 }
 
-export async function getDistinctCampaigns() {
+// Postgres 16 can't skip ahead in a b-tree for SELECT DISTINCT, so on a
+// multi-million-row reporting table it reads every row just to find a handful
+// of values. This walks the column's index instead: each step jumps straight to
+// the next larger value, so the cost is one index probe per distinct value.
+// `> ''` excludes both NULL and empty strings. `column` is interpolated, so it
+// must be a constant naming an indexed reporting column.
+async function getDistinctReportingValues(column) {
   try {
-    const { rows } = await pool.query(`SELECT DISTINCT campaign FROM reporting WHERE campaign IS NOT NULL AND campaign <> '' ORDER BY campaign`);
-    return rows.map(r => r.campaign);
-  } catch { return []; }
+    const { rows } = await pool.query(`
+      WITH RECURSIVE vals AS (
+        (SELECT ${column} AS v FROM reporting WHERE ${column} > '' ORDER BY ${column} LIMIT 1)
+        UNION ALL
+        SELECT (SELECT ${column} FROM reporting WHERE ${column} > vals.v ORDER BY ${column} LIMIT 1)
+        FROM vals WHERE vals.v IS NOT NULL
+      )
+      SELECT v FROM vals WHERE v IS NOT NULL`);
+    return rows.map(r => r.v);
+  } catch (e) {
+    console.error(`Failed to load distinct reporting ${column} values:`, e.message);
+    return [];
+  }
+}
+
+export async function getDistinctCampaigns() {
+  return getDistinctReportingValues('campaign');
 }
 
 export async function getDistinctCallTypes() {
-  try {
-    const { rows } = await pool.query(`SELECT DISTINCT call_type FROM reporting WHERE call_type IS NOT NULL AND call_type <> '' ORDER BY call_type`);
-    return rows.map(r => r.call_type);
-  } catch { return []; }
+  return getDistinctReportingValues('call_type');
 }
 
 export async function getDistinctDispositions() {
-  try {
-    const { rows } = await pool.query(`SELECT DISTINCT disposition FROM reporting WHERE disposition IS NOT NULL AND disposition <> '' ORDER BY disposition`);
-    return rows.map(r => r.disposition);
-  } catch { return []; }
+  return getDistinctReportingValues('disposition');
 }
 
 export async function getDistinctFileDispositions() {
@@ -1490,6 +1948,164 @@ export async function getLegacyReportTimestampStats(limit = 10) {
     if (REPORT_TIME_DEBUG) console.warn('[REPORT_TIME] Legacy timestamp stats failed:', e.message);
     return { total: 0, samples: [], error: e.message };
   }
+}
+
+// ============================================================
+// Recording favorites, comments & notifications
+// Mutations throw; the routes catch. `user` is { id, email (lowercased), name, role }.
+// ============================================================
+
+// Looks up a recording and who owns it — the JS twin of ownedBySql(). Owners are
+// a set: on a transfer the filename's agent and the Five9 agent can differ, and
+// both count. Returns null when the recording isn't indexed.
+export async function getRecordingContext(filePath) {
+  const { rows } = await pool.query(`
+    SELECT f.file_path, f.phone, f.email, f.call_date, f.call_time, f.call_id, f.duration_ms, r.agent
+    FROM files f
+    LEFT JOIN reporting r ON r.call_id = f.call_id
+    WHERE f.file_path = $1
+  `, [filePath]);
+  if (!rows.length) return null;
+  const { agent, ...file } = rows[0];
+  const ownerEmails = [...new Set(
+    [file.email, agent]
+      .filter(value => typeof value === 'string' && value.includes('@'))
+      .map(value => value.toLowerCase())
+  )];
+  return { file, ownerEmails };
+}
+
+// Returns true only when a favorite was actually added, so callers audit and
+// notify once even if the request is retried or double-clicked.
+export async function addFavorite(filePath, user) {
+  const { rows } = await pool.query(`
+    INSERT INTO recording_favorites (file_path, user_email, user_id, user_name, user_role)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (file_path, user_email) DO NOTHING
+    RETURNING id
+  `, [filePath, user.email, user.id, user.name, user.role]);
+  return rows.length > 0;
+}
+
+export async function removeFavorite(filePath, userEmail) {
+  const { rows } = await pool.query(
+    `DELETE FROM recording_favorites WHERE file_path = $1 AND user_email = $2 RETURNING id`,
+    [filePath, userEmail]
+  );
+  return rows.length > 0;
+}
+
+export async function getFavoriteState(filePath, userEmail) {
+  const { rows } = await pool.query(`
+    SELECT COUNT(*)::int AS favorite_count, COALESCE(bool_or(user_email = $2), false) AS favorited_by_me
+    FROM recording_favorites
+    WHERE file_path = $1
+  `, [filePath, userEmail]);
+  return { favoriteCount: rows[0].favorite_count, favoritedByMe: rows[0].favorited_by_me };
+}
+
+export async function getRecordingActivity(filePath) {
+  const [favorites, comments] = await Promise.all([
+    pool.query(`
+      SELECT user_email, user_name, user_role, created_at
+      FROM recording_favorites
+      WHERE file_path = $1
+      ORDER BY created_at, id
+    `, [filePath]),
+    pool.query(`
+      SELECT id, user_email, user_name, user_role, body, position_ms, created_at
+      FROM recording_comments
+      WHERE file_path = $1
+      ORDER BY created_at, id
+    `, [filePath])
+  ]);
+  return { favorites: favorites.rows, comments: comments.rows };
+}
+
+export async function addComment(filePath, user, body, positionMs) {
+  const { rows } = await pool.query(`
+    INSERT INTO recording_comments (file_path, user_email, user_id, user_name, user_role, body, position_ms)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    RETURNING id, user_email, user_name, user_role, body, position_ms, created_at
+  `, [filePath, user.email, user.id, user.name, user.role, body, positionMs]);
+  return rows[0];
+}
+
+// One statement, so the permission check can't race the delete. Pass
+// authorEmail = null to delete regardless of author (managers/admins).
+export async function deleteComment(commentId, authorEmail) {
+  const { rows } = await pool.query(`
+    DELETE FROM recording_comments
+    WHERE id = $1 AND ($2::text IS NULL OR user_email = $2)
+    RETURNING id, file_path, user_email, user_role, body, position_ms, created_at
+  `, [commentId, authorEmail]);
+  return rows[0] || null;
+}
+
+export async function commentExists(commentId) {
+  const { rows } = await pool.query(`SELECT 1 FROM recording_comments WHERE id = $1`, [commentId]);
+  return rows.length > 0;
+}
+
+export async function getCommenterEmails(filePath) {
+  const { rows } = await pool.query(`SELECT DISTINCT user_email FROM recording_comments WHERE file_path = $1`, [filePath]);
+  return rows.map(r => r.user_email);
+}
+
+// recipientEmails must be lowercased and already exclude the actor.
+export async function createNotifications(recipientEmails, type, filePath, actor, commentId = null) {
+  if (!recipientEmails.length) return;
+  await pool.query(`
+    INSERT INTO notifications (recipient_email, type, file_path, actor_email, actor_name, comment_id)
+    SELECT recipient, $2::text, $3::text, $4::text, $5::text, $6::int
+    FROM unnest($1::text[]) AS recipient
+  `, [recipientEmails, type, filePath, actor.email, actor.name, commentId]);
+}
+
+// Un-favoriting retracts the owner's notification if they haven't seen it yet.
+export async function deleteUnreadFavoriteNotifications(filePath, actorEmail) {
+  await pool.query(`
+    DELETE FROM notifications
+    WHERE file_path = $1 AND type = 'favorite' AND actor_email = $2 AND read_at IS NULL
+  `, [filePath, actorEmail]);
+}
+
+export async function deleteCommentNotifications(filePath, commentId) {
+  await pool.query(`DELETE FROM notifications WHERE file_path = $1 AND comment_id = $2`, [filePath, commentId]);
+}
+
+async function countUnreadNotifications(recipientEmail) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS unread FROM notifications WHERE recipient_email = $1 AND read_at IS NULL`,
+    [recipientEmail]
+  );
+  return rows[0].unread;
+}
+
+export async function getNotifications(recipientEmail, limit) {
+  const [list, unreadCount] = await Promise.all([
+    pool.query(`
+      SELECT n.id, n.type, n.file_path, n.actor_email, n.actor_name, n.created_at, n.read_at,
+             f.call_date, f.call_time, f.phone, left(c.body, 200) AS comment_excerpt
+      FROM notifications n
+      LEFT JOIN files f ON f.file_path = n.file_path
+      LEFT JOIN recording_comments c ON c.id = n.comment_id
+      WHERE n.recipient_email = $1
+      ORDER BY n.id DESC
+      LIMIT $2
+    `, [recipientEmail, limit]),
+    countUnreadNotifications(recipientEmail)
+  ]);
+  return { notifications: list.rows, unreadCount };
+}
+
+// ids = null marks all of the recipient's notifications read.
+export async function markNotificationsRead(recipientEmail, ids) {
+  await pool.query(`
+    UPDATE notifications SET read_at = NOW()
+    WHERE recipient_email = $1 AND read_at IS NULL AND ($2::int[] IS NULL OR id = ANY($2::int[]))
+  `, [recipientEmail, ids]);
+  return countUnreadNotifications(recipientEmail);
 }
 
 // ============================================================

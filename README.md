@@ -32,7 +32,7 @@ RecBot is a production-focused web platform for browsing, filtering, auditing, a
 - **Loading States**: Visual feedback during data loading
 
 ### 🔐 Authentication & Authorization
-- **Clerk Authentication**: Email/domain restricted sign‑in (e.g. only approved company domain)
+- **Logto Authentication**: OIDC sign‑in with email/domain allowlist (e.g. only approved company domain)
 - **Role-Based Access**: Admin, manager, member tiers (download & admin visibility controlled)
 - **Session Lifecycle**: Automatic inactivity timeout & hard session expiration with rotation
 - **Secure Playback & Download Logging**: Each access event audited with IP & session linkage
@@ -49,7 +49,7 @@ RecBot is a production-focused web platform for browsing, filtering, auditing, a
 - **Database**: SQLite (better-sqlite3) with on‑startup adaptive migrations
 - **Audio Processing**: FFmpeg for transcoding & stream trimming (Range support)
 - **Object Storage**: AWS S3 via AWS SDK v3
-- **Auth Middleware**: Clerk + custom role guards
+- **Auth Middleware**: Logto access-token (JWT) verification + custom role guards
 - **Session Engine**: user_sessions table + inactivity & duration expirers
 - **Audit Layer**: audit_logs table (LOGIN, LOGOUT with reasons, VIEW_FILES, PLAY_FILE, DOWNLOAD_FILE, MAINTENANCE)
 
@@ -57,7 +57,7 @@ RecBot is a production-focused web platform for browsing, filtering, auditing, a
 - **React 18 + Material UI**: Responsive data & admin dashboards
 - **Filtering UX**: Debounced substring filters (phone, email, callId)
 - **Call ID Highlighting**: Partial match highlighting in audit logs
-- **Clerk Frontend SDK**: Auth gating & role awareness
+- **Logto React SDK**: Auth gating & role awareness
 - **Session / Audit Visibility**: Admin panel for real‑time log & session review
 
 ### Infrastructure
@@ -97,8 +97,14 @@ ENABLE_SFTP=true
 SFTP_USER=your_sftp_username
 SFTP_PASS=your_sftp_password
 
-CLERK_PUBLISHABLE_KEY=your_clerk_publishable_key
-CLERK_SECRET_KEY=your_clerk_secret_key
+# Logto authentication
+LOGTO_ENDPOINT=https://your-tenant.logto.app
+LOGTO_APP_ID=your_logto_spa_app_id
+LOGTO_API_RESOURCE=https://recbot.api
+# Optional: permission scopes mapped to each role (defaults shown)
+# LOGTO_SCOPE_ADMIN=recbot:admin
+# LOGTO_SCOPE_MANAGER=recbot:manage
+# LOGTO_SCOPE_MEMBER=recbot:read
 # Comma-separated domains or exact email addresses (e.g. company.com,@partners.io,admin@vendor.com)
 ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com
 REACT_APP_ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com
@@ -211,12 +217,14 @@ GET /api/wav-files/recordings/9_26_2025/filename.wav
 
 Supports HTTP Range requests for audio seeking.
 
-### Authentication Setup (Clerk)
+### Authentication Setup (Logto)
 
-1. Create a Clerk application → obtain Publishable & Secret keys.
-2. Configure allowed email/domain allowlist (or enforce in middleware with ALLOWED_LOGIN_IDENTIFIERS).
-3. Add keys to environment (.env or container env vars).
-4. Deploy – frontend uses Clerk React SDK; backend validates JWT / session via Clerk middleware.
+See [LOGTO_SETUP.md](LOGTO_SETUP.md) for the full walkthrough. In short:
+
+1. Create a Logto **SPA application** (obtain the App ID + endpoint) and register the redirect URI `https://<domain>/callback` and post-sign-out URI `https://<domain>/`.
+2. Create an **API resource** (e.g. `https://recbot.api`) and define `admin` / `manager` / `member` roles whose permission scopes (`recbot:admin` / `recbot:manage` / `recbot:read`) the backend maps to app roles.
+3. Set `LOGTO_ENDPOINT`, `LOGTO_APP_ID`, `LOGTO_API_RESOURCE`, and the email allowlist (`ALLOWED_LOGIN_IDENTIFIERS`) in the environment.
+4. Deploy – the frontend uses the Logto React SDK; the backend verifies the access token (JWT) against Logto's JWKS and reads the user's email/roles from the userinfo endpoint.
 
 ## Development
 
@@ -271,8 +279,9 @@ docker push ghostreaper69/recbot:v1.1.0
 - Check Docker container logs: `docker-compose logs recbot`
 
 **Authentication not working**:
-- Verify Clerk keys & domain restrictions
-- Confirm frontend and backend share the same Clerk environment settings
+- Verify `LOGTO_ENDPOINT`, `LOGTO_APP_ID`, and `LOGTO_API_RESOURCE` are set and the API resource matches the one configured in Logto
+- Confirm the SPA app's redirect URI (`/callback`) and allowed origins are registered in the Logto console
+- Roles missing? Ensure the user is assigned a role in Logto and the `Roles` user scope is enabled so role names reach the frontend
 
 **Audio not playing**:
 - Check FFmpeg installation in container

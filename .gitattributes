@@ -1,0 +1,7 @@
+# Keep shell scripts and the container entrypoint LF-only, even on Windows
+# checkouts (core.autocrlf=true would otherwise rewrite them to CRLF and break
+# the Linux container with "exec /entrypoint.sh: no such file or directory").
+*.sh        text eol=lf
+entrypoint.sh text eol=lf
+*.mjs       text eol=lf
+*.cjs       text eol=lf

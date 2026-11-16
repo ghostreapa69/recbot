@@ -20,9 +20,9 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings } from './database.js';
+import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead } from './database.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
-import { clerkAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig } from './auth.js';
+import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(isSameOrBefore);
@@ -67,7 +67,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(clerkAuth); // Add Clerk authentication middleware
+app.use(logtoAuth); // Logto auth (no-op passthrough; tokens verified per-route in requireAuth)
 
 // Fallback session creator: ensures every authenticated user has an active session row
 app.use(async (req, res, next) => {
@@ -488,7 +488,7 @@ app.post('/api/reports/fix-timezones', requireAuth, ensureSession, requireAdmin,
 // Query reports with filters
 app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, hasRecording, limit = 100, offset = 0, timezone: userTimezone, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfers, conferences, abandoned, hasRecording, limit = 100, offset = 0, timezone: userTimezone, sort, sortBy } = req.query;
     
     // Clean up "undefined" strings
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
@@ -505,6 +505,8 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     callId = cleanParam(callId);
     customerName = cleanParam(customerName);
     afterCallWork = cleanParam(afterCallWork);
+    callTimeMin = cleanParam(callTimeMin);
+    callTimeMax = cleanParam(callTimeMax);
     transfers = cleanParam(transfers);
     conferences = cleanParam(conferences);
     abandoned = cleanParam(abandoned);
@@ -539,7 +541,7 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       agent = null;
     }
 
-    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", agentName="${agentName}", agentSearchType="${agentSearchType}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
+    console.log(`[API /api/reports] Query params: start="${start}", end="${end}", userTz="${userTimezone}", agent="${agent}", agentName="${agentName}", agentSearchType="${agentSearchType}", campaign="${campaign}", callType="${callType}", phone="${phone}", callId="${callId}", customerName="${customerName}", afterCallWork="${afterCallWork}", callTimeMin="${callTimeMin}", callTimeMax="${callTimeMax}", transfers="${transfers}", conferences="${conferences}", abandoned="${abandoned}", limit=${limit}, offset=${offset}`);
     
     const startFormatted = normalizeReportTimestamp(start);
     const endFormatted = normalizeReportTimestamp(end);
@@ -564,12 +566,15 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
     };
 
     const afterCallWorkValue = parseInteger(afterCallWork);
+    const callTimeMinValue = parseInteger(callTimeMin);
+    const callTimeMaxValue = parseInteger(callTimeMax);
     const transfersValue = parseBinary(transfers);
     const conferencesValue = parseBinary(conferences);
     const abandonedValue = parseBinary(abandoned);
     const hasRecordingValue = parseBinary(hasRecording);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const sortByValue = sortBy === 'callTime' ? 'callTime' : 'timestamp';
     const result = await queryReports({
       start: appliedStart,
       end: appliedEnd,
@@ -582,21 +587,22 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
       callId,
       customerName,
       afterCallWork: afterCallWorkValue,
+      callTimeMin: callTimeMinValue,
+      callTimeMax: callTimeMaxValue,
       transfers: transfersValue,
       conferences: conferencesValue,
       abandoned: abandonedValue,
       hasRecording: hasRecordingValue,
       limit: appliedLimit,
       offset: appliedOffset,
-      sort: sortDir
+      sort: sortDir,
+      sortBy: sortByValue
     });
       const hydratedRows = await hydrateReportRows(result.rows);
-      const returnedRange = hydratedRows && hydratedRows.length ? (
-        sortDir === 'asc'
-          ? { min: hydratedRows[0].timestamp || null, max: hydratedRows[hydratedRows.length - 1].timestamp || null }
-          : { max: hydratedRows[0].timestamp || null, min: hydratedRows[hydratedRows.length - 1].timestamp || null }
-      ) : { max: null, min: null };
-    console.log(`[API /api/reports] Applied range: start="${appliedStart}" end="${appliedEnd}" limit=${appliedLimit} offset=${appliedOffset} sort=${sortDir}`);
+      // Rows may be ordered by call time, so take the extremes rather than the first and last row.
+      const returnedTimestamps = (hydratedRows || []).map(row => row.timestamp).filter(Boolean).sort();
+      const returnedRange = { min: returnedTimestamps[0] || null, max: returnedTimestamps[returnedTimestamps.length - 1] || null };
+    console.log(`[API /api/reports] Applied range: start="${appliedStart}" end="${appliedEnd}" limit=${appliedLimit} offset=${appliedOffset} sortBy=${sortByValue} sort=${sortDir}`);
     console.log(`[API /api/reports] Returned range: min="${returnedRange.min}" max="${returnedRange.max}" total=${result.total}`);
 
     let legacyStats = null;
@@ -630,9 +636,11 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
             callType: callType || null,
             phone: phone || null
           },
-          pagination: { limit: appliedLimit, offset: appliedOffset, sort: sortDir },
+          pagination: { limit: appliedLimit, offset: appliedOffset, sort: sortDir, sortBy: sortByValue },
                     returned: hydratedRows ? hydratedRows.length : 0,
-          total: result.total || 0,
+          // null when the count was skipped (page 2+) — don't record that as a real zero
+          total: result.total ?? null,
+          totalCapped: result.totalCapped || false,
           appliedRange: { start: appliedStart, end: appliedEnd },
           returnedRange,
           legacyTotal: legacyStats ? legacyStats.total : undefined
@@ -656,9 +664,9 @@ app.get('/api/reports', requireAuth, ensureSession, async (req, res) => {
   }
 });
 
-app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+app.get('/api/reports/export', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
-    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, transfers, conferences, abandoned, hasRecording, sort } = req.query;
+    let { start, end, agent, agentName, agentSearchType, campaign, callType, disposition, phone, callId, customerName, afterCallWork, callTimeMin, callTimeMax, transfers, conferences, abandoned, hasRecording, sort, sortBy } = req.query;
 
     const cleanParam = (val) => (!val || val === 'undefined' || val === 'null') ? null : val;
     start = cleanParam(start);
@@ -674,6 +682,8 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     callId = cleanParam(callId);
     customerName = cleanParam(customerName);
     afterCallWork = cleanParam(afterCallWork);
+    callTimeMin = cleanParam(callTimeMin);
+    callTimeMax = cleanParam(callTimeMax);
     transfers = cleanParam(transfers);
     conferences = cleanParam(conferences);
     abandoned = cleanParam(abandoned);
@@ -721,12 +731,15 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     };
 
     const afterCallWorkValue = parseInteger(afterCallWork);
+    const callTimeMinValue = parseInteger(callTimeMin);
+    const callTimeMaxValue = parseInteger(callTimeMax);
     const transfersValue = parseBinary(transfers);
     const conferencesValue = parseBinary(conferences);
     const abandonedValue = parseBinary(abandoned);
     const hasRecordingValue = parseBinary(hasRecording);
 
     const sortDir = sort === 'asc' ? 'asc' : 'desc';
+    const sortByValue = sortBy === 'callTime' ? 'callTime' : 'timestamp';
     const exportResult = await exportReports({
       start: startFormatted || null,
       end: endFormatted || null,
@@ -739,11 +752,14 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
       callId,
       customerName,
       afterCallWork: afterCallWorkValue,
+      callTimeMin: callTimeMinValue,
+      callTimeMax: callTimeMaxValue,
       transfers: transfersValue,
       conferences: conferencesValue,
       abandoned: abandonedValue,
       hasRecording: hasRecordingValue,
-      sort: sortDir
+      sort: sortDir,
+      sortBy: sortByValue
     });
 
     if (exportResult.error) {
@@ -751,9 +767,10 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
     }
 
     if (exportResult.truncated) {
+      // The count stops at maxRows + 1, so we know it's over the limit but not by how much.
       return res.status(400).json({
-        error: `Too many matching report rows (${exportResult.total}). Narrow your filters to export fewer than ${exportResult.maxRows} rows.`,
-        total: exportResult.total,
+        error: `Too many matching report rows (more than ${exportResult.maxRows}). Narrow your filters to export fewer than ${exportResult.maxRows} rows.`,
+        total: null,
         maxRows: exportResult.maxRows
       });
     }
@@ -815,13 +832,16 @@ app.get('/api/reports/export', requireAuth, ensureSession, requireAdmin, async (
             callId: callId || null,
             customerName: customerName || null,
             afterCallWorkMin: afterCallWorkValue,
+            callTimeMin: callTimeMinValue,
+            callTimeMax: callTimeMaxValue,
             transfers: transfersValue,
             conferences: conferencesValue,
             abandoned: abandonedValue
           },
           exported: hydratedRows.length,
           total: exportResult.total,
-          sort: sortDir
+          sort: sortDir,
+          sortBy: sortByValue
         }
       );
     } catch (auditErr) {
@@ -880,7 +900,17 @@ app.get('/api/reports/summary', requireAuth, ensureSession, requireAdmin, async 
 // Public endpoint to get client configuration
 app.get('/api/config', (req, res) => {
   res.json({
-    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+    logtoEndpoint: process.env.LOGTO_ENDPOINT,
+    logtoAppId: process.env.LOGTO_APP_ID,
+    logtoApiResource: process.env.LOGTO_API_RESOURCE,
+    // scope -> role mapping, and the list of permission scopes the SPA should request
+    roleScopes: ROLE_SCOPES,
+    apiScopes: Object.values(ROLE_SCOPES),
+    // role-name -> app-role mapping (fallback source: token `roles` claim), and
+    // whether that fallback is enabled — the frontend gate must match the
+    // backend exactly or users pass the UI gate and then get 403 on every call.
+    roleNames: ROLE_NAMES,
+    useRoleNames: USE_ROLE_NAMES,
     allowedLoginConfig: {
       allowAll: allowedLoginConfig.allowAll,
       entries: Array.isArray(allowedLoginConfig.entries) ? [...allowedLoginConfig.entries] : []
@@ -916,27 +946,9 @@ async function ensureSession(req, res, next) {
         const idleExceeded = idleMinutes === null || idleMinutes > MAX_ACTIVE_WINDOW_MIN;
         if (idleExceeded) {
           try {
-            // Hard logout path
-            await logUserLogout(req.user.id);
-            await logAuditEvent(
-              req.user.id,
-              req.user.email,
-              'LOGOUT',
-              null,
-              null,
-              req.user.ipAddress,
-              req.user.userAgent,
-              openSession.id,
-              { reason: 'auto_expire_idle_hard', maxHours, idleMinutes, maxIdleMinutes: MAX_ACTIVE_WINDOW_MIN, login_time: openSession.login_time }
-            );
-          } catch (e) {
-            console.error('Error logging hard logout:', e);
-          }
-          return res.status(401).json({ error: 'Session expired due to inactivity threshold at renewal point' });
-        } else {
-          // Silent rotation path
-            try {
-              await logUserLogout(req.user.id);
+            // Hard logout path. Concurrent requests race to close this same
+            // session; only the one that actually closes it logs the LOGOUT.
+            if (await closeUserSession(openSession.id)) {
               await logAuditEvent(
                 req.user.id,
                 req.user.email,
@@ -946,21 +958,47 @@ async function ensureSession(req, res, next) {
                 req.user.ipAddress,
                 req.user.userAgent,
                 openSession.id,
-                { reason: 'auto_expire_rotate', maxHours, idleMinutes, maxIdleMinutes: MAX_ACTIVE_WINDOW_MIN, login_time: openSession.login_time }
+                { reason: 'auto_expire_idle_hard', maxHours, idleMinutes, maxIdleMinutes: MAX_ACTIVE_WINDOW_MIN, login_time: openSession.login_time }
               );
+            }
+          } catch (e) {
+            console.error('Error logging hard logout:', e);
+          }
+          return res.status(401).json({ error: 'Session expired due to inactivity threshold at renewal point' });
+        } else {
+          // Silent rotation path
+            try {
+              // Concurrent requests race to rotate this same session: only the
+              // one that closes it logs the LOGOUT, and only the one that opens
+              // the replacement logs the LOGIN.
+              if (await closeUserSession(openSession.id)) {
+                await logAuditEvent(
+                  req.user.id,
+                  req.user.email,
+                  'LOGOUT',
+                  null,
+                  null,
+                  req.user.ipAddress,
+                  req.user.userAgent,
+                  openSession.id,
+                  { reason: 'auto_expire_rotate', maxHours, idleMinutes, maxIdleMinutes: MAX_ACTIVE_WINDOW_MIN, login_time: openSession.login_time }
+                );
+              }
               const newSessionId = await logUserSession(req.user.id, req.user.email, req.user.ipAddress, req.user.userAgent);
-              await logAuditEvent(
-                req.user.id,
-                req.user.email,
-                'LOGIN',
-                null,
-                null,
-                req.user.ipAddress,
-                req.user.userAgent,
-                newSessionId,
-                { reason: 'rotated_session_after_active_expiry', previousSessionId: openSession.id }
-              );
-              req.currentSessionId = newSessionId;
+              if (newSessionId) {
+                await logAuditEvent(
+                  req.user.id,
+                  req.user.email,
+                  'LOGIN',
+                  null,
+                  null,
+                  req.user.ipAddress,
+                  req.user.userAgent,
+                  newSessionId,
+                  { reason: 'rotated_session_after_active_expiry', previousSessionId: openSession.id }
+                );
+              }
+              req.currentSessionId = newSessionId ?? await getOpenSessionId(req.user.id);
               return next();
             } catch (e) {
               console.error('Error rotating session:', e);
@@ -972,18 +1010,21 @@ async function ensureSession(req, res, next) {
   req.currentSessionId = openSession.id;
     } else {
       const sessionId = await logUserSession(req.user.id, req.user.email, req.user.ipAddress, req.user.userAgent);
-      await logAuditEvent(
-        req.user.id,
-        req.user.email,
-        'LOGIN',
-        null,
-        null,
-        req.user.ipAddress,
-        req.user.userAgent,
-        sessionId,
-        { reason: 'ensure_session_create' }
-      );
-      req.currentSessionId = sessionId;
+      // null: a concurrent request opened the session first and logged the LOGIN.
+      if (sessionId) {
+        await logAuditEvent(
+          req.user.id,
+          req.user.email,
+          'LOGIN',
+          null,
+          null,
+          req.user.ipAddress,
+          req.user.userAgent,
+          sessionId,
+          { reason: 'ensure_session_create' }
+        );
+      }
+      req.currentSessionId = sessionId ?? await getOpenSessionId(req.user.id);
     }
   } catch (e) {
     console.error('ensureSession error:', e);
@@ -1638,32 +1679,35 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
     // Email filtering - allow all users to view all files (no email filtering)
     let effectiveEmail = email?.trim() || null;
     
-    // All authenticated users can view all files
-    console.log(`📄 [VIEW_FILES] User ${req.user.email} viewing file list`);
-    try {
-      await logAuditEvent(
-        req.user.id,
-        req.user.email,
-        'VIEW_FILES',
-        null,
-        phone?.trim() || null,
-        req.user.ipAddress,
-        req.user.userAgent,
-        null,
-        {
-          userRole: req.user.role,
-          dateStart: dateStart || null,
-          dateEnd: dateEnd || null,
-          durationMin: durationMin ? parseInt(durationMin) : null,
-          timeStart: timeStart || null,
+    // Audit VIEW_FILES only on the initial page load/refresh (frontend sends
+    // logView=1 on its first fetch), not on every filter/sort/pagination fetch.
+    if (req.query.logView === '1') {
+      console.log(`📄 [VIEW_FILES] User ${req.user.email} viewing file list`);
+      try {
+        await logAuditEvent(
+          req.user.id,
+          req.user.email,
+          'VIEW_FILES',
+          null,
+          phone?.trim() || null,
+          req.user.ipAddress,
+          req.user.userAgent,
+          null,
+          {
+            userRole: req.user.role,
+            dateStart: dateStart || null,
+            dateEnd: dateEnd || null,
+            durationMin: durationMin ? parseInt(durationMin) : null,
+            timeStart: timeStart || null,
             timeEnd: timeEnd || null,
-          sort: `${sortColumn}:${sortDirection}`,
-          offset: parseInt(offset) || 0,
-          limit: parseInt(limit) || 25
-        }
-      );
-    } catch (auditErr) {
-      console.error('⚠️ [AUDIT] Failed to log view files event:', auditErr);
+            sort: `${sortColumn}:${sortDirection}`,
+            offset: parseInt(offset) || 0,
+            limit: parseInt(limit) || 25
+          }
+        );
+      } catch (auditErr) {
+        console.error('⚠️ [AUDIT] Failed to log view files event:', auditErr);
+      }
     }
     
     // Note: Download protection is handled at the audio streaming level
@@ -1679,6 +1723,12 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
       timeEnd,
       callId: req.query.callId ? req.query.callId.trim() : null,
       callDisposition: req.query.callDisposition?.trim() || null,
+      // Favorites views, "Only my calls" and single-recording links. The
+      // viewer's email always comes from the token, never the query string.
+      recordingPath: readRecordingPath(req.query.path),
+      favorites: ['mine', 'any'].includes(req.query.favorites) ? req.query.favorites : null,
+      mine: req.query.mine === '1',
+      viewerEmail: req.user.email.toLowerCase(),
       sortColumn,
       sortDirection,
       limit: parseInt(limit) || 25,
@@ -1695,7 +1745,13 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
         callId: f.call_id,
         callDisposition: f.call_disposition,
         durationMs: f.duration_ms,
-        size: f.file_size
+        size: f.file_size,
+        favoriteCount: f.favorite_count,
+        commentCount: f.comment_count,
+        favoritedByMe: f.favorited_by_me,
+        isMine: f.is_mine,
+        // Members may favorite only their own calls; anyone may remove their own favorite.
+        canFavorite: req.user.role !== 'member' || f.is_mine || f.favorited_by_me
       })),
       totalCount: result.totalCount,
       offset: parseInt(offset) || 0,
@@ -1717,6 +1773,260 @@ app.get('/api/wav-files/meta', requireAuth, ensureSession, requireAuthenticatedU
   } catch (err) {
     console.error('Error in /api/wav-files/meta:', err);
     res.json({ success: false, dispositions: [] });
+  }
+});
+
+// ============================================================
+// Recording favorites, comments & notifications
+// ============================================================
+const COMMENT_MAX_LENGTH = 2000;
+// One day — far longer than any call — keeps positions within INTEGER range.
+const COMMENT_MAX_POSITION_MS = 24 * 60 * 60 * 1000;
+
+// Recording paths are exact files.file_path keys, so they are not trimmed.
+function readRecordingPath(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 1024 && !value.includes('\u0000') ? value : null;
+}
+
+function isModerator(role) {
+  return role === 'manager' || role === 'admin';
+}
+
+// The signed-in user as stored on favorites, comments and notifications. The
+// access token rarely carries names, so the UI falls back to the email.
+function recordingActor(req) {
+  const { firstName, lastName } = req.user;
+  // firstName falls back to the full `name` claim, which may already end with the surname.
+  const name = firstName && lastName && !firstName.endsWith(lastName)
+    ? `${firstName} ${lastName}`
+    : (firstName || lastName || null);
+  return { id: req.user.id, email: req.user.email.toLowerCase(), name, role: req.user.role };
+}
+
+// `file` is the files row (or parsed filename metadata) so the audit row gets
+// phone/email/call id; the Admin audit table reads additional_data.callId.
+async function auditRecordingAction(req, actionType, recordingPath, file, extra = {}) {
+  await logAuditEvent(
+    req.user.id,
+    req.user.email,
+    actionType,
+    recordingPath,
+    file,
+    req.user.ipAddress,
+    req.user.userAgent,
+    req.currentSessionId || null,
+    { userRole: req.user.role, callId: file?.call_id || file?.callId || null, ...extra }
+  );
+}
+
+// Notifications are best-effort: never fail a favorite or comment that already saved.
+async function updateNotificationsSafely(update) {
+  try {
+    await update();
+  } catch (err) {
+    console.error('⚠️ [NOTIFY] Failed to update notifications:', err);
+  }
+}
+
+function toCommentResponse(comment, actor) {
+  return {
+    id: comment.id,
+    userEmail: comment.user_email,
+    userName: comment.user_name,
+    userRole: comment.user_role,
+    body: comment.body,
+    positionMs: comment.position_ms,
+    createdAt: comment.created_at,
+    canDelete: isModerator(actor.role) || comment.user_email === actor.email
+  };
+}
+
+// Side-panel data for one recording: who favorited it, and its comments.
+app.get('/api/recordings/activity', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.query.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+
+    const actor = recordingActor(req);
+    const { favorites, comments } = await getRecordingActivity(recordingPath);
+    const favoritedByMe = favorites.some(f => f.user_email === actor.email);
+    const isMine = context.ownerEmails.includes(actor.email);
+    res.json({
+      favoriteCount: favorites.length,
+      favoritedByMe,
+      isMine,
+      canFavorite: actor.role !== 'member' || isMine || favoritedByMe,
+      favorites: favorites.map(f => ({ userEmail: f.user_email, userName: f.user_name, userRole: f.user_role, createdAt: f.created_at })),
+      comments: comments.map(c => toCommentResponse(c, actor))
+    });
+  } catch (err) {
+    console.error('Error in /api/recordings/activity:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sets (rather than toggles) the caller's favorite, so retries and double-clicks are harmless.
+app.post('/api/recordings/favorite', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.body?.path);
+    const favorite = req.body?.favorite;
+    if (!recordingPath || typeof favorite !== 'boolean') {
+      return res.status(400).json({ error: 'path and favorite (true/false) are required' });
+    }
+
+    const actor = recordingActor(req);
+    const context = await getRecordingContext(recordingPath);
+
+    if (favorite) {
+      if (!context) return res.status(404).json({ error: 'Recording not found' });
+      // Members may favorite only their own calls; managers and admins any call.
+      if (actor.role === 'member' && !context.ownerEmails.includes(actor.email)) {
+        return res.status(403).json({ error: 'Forbidden', message: 'You can only favorite your own recordings.' });
+      }
+      if (await addFavorite(recordingPath, actor)) {
+        await auditRecordingAction(req, 'FAVORITE_ADD', recordingPath, context.file);
+        await updateNotificationsSafely(() => createNotifications(
+          context.ownerEmails.filter(email => email !== actor.email), 'favorite', recordingPath, actor
+        ));
+      }
+    } else if (await removeFavorite(recordingPath, actor.email)) {
+      // Removing is always allowed — even after a role change, or once the
+      // recording has dropped out of the index.
+      await auditRecordingAction(req, 'FAVORITE_REMOVE', recordingPath, context?.file || parseFileMetadata(recordingPath));
+      await updateNotificationsSafely(() => deleteUnreadFavoriteNotifications(recordingPath, actor.email));
+    }
+
+    const state = await getFavoriteState(recordingPath, actor.email);
+    const isMine = Boolean(context?.ownerEmails.includes(actor.email));
+    // e.g. a member who just removed a favorite on a call they don't own can't re-add it.
+    res.json({ ...state, canFavorite: actor.role !== 'member' || isMine || state.favoritedByMe });
+  } catch (err) {
+    console.error('Error in /api/recordings/favorite:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/recordings/comments', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.body?.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+
+    // Postgres TEXT rejects NUL bytes, so strip them before checking the length.
+    const rawBody = req.body?.body;
+    const body = typeof rawBody === 'string' ? rawBody.replace(/\u0000/g, '').trim() : '';
+    if (!body || body.length > COMMENT_MAX_LENGTH) {
+      return res.status(400).json({ error: `Comment must be 1-${COMMENT_MAX_LENGTH} characters` });
+    }
+
+    const rawPosition = req.body?.positionMs;
+    let positionMs = null;
+    if (rawPosition !== undefined && rawPosition !== null) {
+      if (typeof rawPosition !== 'number' || !Number.isFinite(rawPosition) || rawPosition < 0 || rawPosition > COMMENT_MAX_POSITION_MS) {
+        return res.status(400).json({ error: 'positionMs must be a number of milliseconds into the call' });
+      }
+      positionMs = Math.floor(rawPosition);
+    }
+
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+
+    const actor = recordingActor(req);
+    const comment = await addComment(recordingPath, actor, body, positionMs);
+    await auditRecordingAction(req, 'COMMENT_ADD', recordingPath, context.file, { commentId: comment.id, positionMs, bodyLength: body.length });
+    // Notify the call's owner(s) and everyone already in the thread, so a reply
+    // reaches the manager who started it.
+    await updateNotificationsSafely(async () => {
+      const commenters = await getCommenterEmails(recordingPath);
+      const recipients = new Set([...context.ownerEmails, ...commenters]);
+      recipients.delete(actor.email);
+      await createNotifications([...recipients], 'comment', recordingPath, actor, comment.id);
+    });
+
+    res.json({ comment: toCommentResponse(comment, actor) });
+  } catch (err) {
+    console.error('Error in /api/recordings/comments:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Authors delete their own comments; managers and admins can delete any.
+app.post('/api/recordings/comments/:id/delete', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    if (!/^\d{1,9}$/.test(req.params.id)) return res.status(400).json({ error: 'Invalid comment id' });
+    const commentId = Number(req.params.id);
+
+    const actor = recordingActor(req);
+    const deleted = await deleteComment(commentId, isModerator(actor.role) ? null : actor.email);
+    if (!deleted) {
+      return (await commentExists(commentId))
+        ? res.status(403).json({ error: 'Forbidden', message: 'You can only delete your own comments.' })
+        : res.status(404).json({ error: 'Comment not found' });
+    }
+
+    await updateNotificationsSafely(() => deleteCommentNotifications(deleted.file_path, commentId));
+    // Comments are hard-deleted, so the audit row keeps the only copy of what was removed.
+    const context = await getRecordingContext(deleted.file_path);
+    await auditRecordingAction(req, 'COMMENT_DELETE', deleted.file_path, context?.file || parseFileMetadata(deleted.file_path), {
+      commentId,
+      authorEmail: deleted.user_email,
+      body: deleted.body,
+      positionMs: deleted.position_ms,
+      createdAt: deleted.created_at
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting recording comment:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// The notification bell calls this only on user-driven events (page load,
+// navigation, opening the bell, tab focus) — never on a timer. requireAuth and
+// ensureSession count every request as activity, so polling would keep idle
+// sessions alive and log phantom LOGINs after they expire.
+app.get('/api/notifications', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 50);
+    const { notifications, unreadCount } = await getNotifications(req.user.email.toLowerCase(), limit);
+    res.json({
+      unreadCount,
+      notifications: notifications.map(n => ({
+        id: n.id,
+        type: n.type,
+        filePath: n.file_path,
+        actorEmail: n.actor_email,
+        actorName: n.actor_name,
+        commentExcerpt: n.comment_excerpt,
+        createdAt: n.created_at,
+        readAt: n.read_at,
+        callDate: n.call_date,
+        callTime: n.call_time,
+        phone: n.phone
+      }))
+    });
+  } catch (err) {
+    console.error('Error in /api/notifications:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Marks the caller's notifications read: the given ids, or all of them when ids is omitted.
+app.post('/api/notifications/read', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const ids = req.body?.ids;
+    const validIds = Array.isArray(ids) && ids.length > 0 && ids.length <= 500
+      && ids.every(id => Number.isInteger(id) && id > 0 && id <= 2147483647);
+    if (ids != null && !validIds) {
+      return res.status(400).json({ error: 'ids must be a non-empty array of notification ids' });
+    }
+    const unreadCount = await markNotificationsRead(req.user.email.toLowerCase(), ids ?? null);
+    res.json({ success: true, unreadCount });
+  } catch (err) {
+    console.error('Error in /api/notifications/read:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1929,7 +2239,7 @@ app.post('/api/backfill-audit-callids', requireAuth, ensureSession, requireAdmin
   }
 });
 
-app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const rows = await getUserUsageReport(startDate || null, endDate || null);
@@ -1998,7 +2308,7 @@ app.get('/api/reporting/user-usage', requireAuth, ensureSession, requireAdmin, a
   }
 });
 
-app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+app.get('/api/reporting/user-usage/export', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const exportResult = await exportUserUsageReport(startDate || null, endDate || null);
