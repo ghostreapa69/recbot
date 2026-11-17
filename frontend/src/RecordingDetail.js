@@ -151,9 +151,10 @@ function AnalysisPending({ transcription, analysis }) {
   return <Alert severity={transcription?.status === 'error' || analysis?.status === 'error' ? 'warning' : 'info'}>{message}</Alert>;
 }
 
+// Text-message style conversation: the agent on the right in blue, the
+// customer on the left. Each bubble plays the call from that moment.
 function Transcript({ utterances, agentSpeaker, currentMs, onSeek, focusMs }) {
   const [query, setQuery] = useState('');
-  const activeRef = useRef(null);
   const focusRef = useRef(null);
   let active = -1;
   utterances.forEach((u, i) => { if (u.start <= currentMs) active = i; });
@@ -161,31 +162,63 @@ function Transcript({ utterances, agentSpeaker, currentMs, onSeek, focusMs }) {
   useEffect(() => { focusRef.current?.scrollIntoView({ block: 'center' }); }, [focusIndex]);
   const q = query.trim().toLowerCase();
   const who = s => (agentSpeaker ? (s === agentSpeaker ? 'Agent' : 'Customer') : `Speaker ${s}`);
+  // Before the agent is known, Speaker A sits on the left and everyone else on the right.
+  const onRight = s => (agentSpeaker ? s === agentSpeaker : s !== 'A');
   if (!utterances.length) return <Typography color="text.secondary">No speech was detected in this call.</Typography>;
+
+  const shown = utterances.map((u, i) => ({ u, i })).filter(({ u }) => !q || u.text.toLowerCase().includes(q));
+  const highlighted = active !== -1 ? active : focusIndex;
+
   return (
     <>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, border: 1, borderColor: 'divider', borderRadius: 999, px: 1.5, py: 0.5, mb: 2, maxWidth: 360 }}>
         <SearchIcon fontSize="small" sx={{ color: 'text.secondary' }} />
         <InputBase fullWidth placeholder="Search this transcript" value={query} onChange={e => setQuery(e.target.value)} inputProps={{ 'aria-label': 'Search this transcript' }} />
       </Box>
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, maxWidth: 860 }}>
-        {utterances.map((u, i) => {
-          if (q && !u.text.toLowerCase().includes(q)) return null;
-          const isAgent = agentSpeaker && u.speaker === agentSpeaker;
+      <Box sx={{ bgcolor: 'background.default', borderRadius: 3, p: { xs: 1.5, sm: 2.5 }, display: 'flex', flexDirection: 'column' }}>
+        {q && !shown.length && <Typography color="text.secondary">No messages contain “{query.trim()}”.</Typography>}
+        {shown.map(({ u, i }, n) => {
+          const right = onRight(u.speaker);
+          const prev = shown[n - 1];
+          // A new turn starts when the speaker changes; filtered results always show who spoke.
+          const newTurn = q || !prev || prev.u.speaker !== u.speaker;
+          const label = `Play from ${formatMs(u.start)}`;
           return (
-            <ButtonBase
-              key={i}
-              ref={i === focusIndex ? focusRef : i === active ? activeRef : undefined}
-              onClick={() => onSeek(u.start)}
-              sx={{ display: 'grid', gridTemplateColumns: '52px minmax(0,1fr)', gap: 1.5, textAlign: 'left', p: 0.75, borderRadius: 3, alignItems: 'start', width: '100%',
-                bgcolor: i === active || (active === -1 && i === focusIndex) ? theme => softBg(theme, 'primary') : 'transparent', '&:hover': { bgcolor: 'subtle' } }}
-            >
-              <Typography variant="caption" color="text.secondary" sx={{ pt: 1.25, fontVariantNumeric: 'tabular-nums' }}>{formatMs(u.start)}</Typography>
-              <Box sx={{ px: 1.75, py: 1.25, borderRadius: 3.5, border: 1, borderColor: 'divider', bgcolor: isAgent ? 'background.paper' : 'subtle' }}>
-                <Typography variant="caption" sx={{ display: 'block', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', color: isAgent ? 'primary.main' : 'warning.main' }}>{who(u.speaker)}</Typography>
-                <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>{u.text}</Typography>
-              </Box>
-            </ButtonBase>
+            <Box key={i} sx={{
+              display: 'flex', flexDirection: 'column', alignItems: right ? 'flex-end' : 'flex-start', mt: n === 0 ? 0 : newTurn ? 2 : 0.5,
+              '&:hover .play-hint, &:has(.Mui-focusVisible) .play-hint': { opacity: 1 }
+            }}>
+              {newTurn && (
+                <Typography variant="caption" sx={{ fontWeight: 700, color: right ? 'primary.main' : 'text.secondary', px: 1.5, mb: 0.5 }}>{who(u.speaker)}</Typography>
+              )}
+              <ButtonBase
+                ref={i === focusIndex ? focusRef : undefined}
+                onClick={() => onSeek(u.start)}
+                title={label}
+                aria-label={`${label}: ${who(u.speaker)} said ${u.text}`}
+                aria-current={i === highlighted ? 'true' : undefined}
+                sx={{
+                  display: 'block', textAlign: 'left', maxWidth: { xs: '88%', sm: '75%' }, px: 1.75, py: 1.1,
+                  borderRadius: right ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
+                  bgcolor: right ? 'primary.main' : 'background.paper',
+                  // The dark theme's blue is light, so its bubbles take dark text.
+                  color: right ? (theme => (theme.palette.mode === 'dark' ? theme.palette.background.default : '#fff')) : 'text.primary',
+                  border: right ? 0 : 1, borderColor: 'divider',
+                  outline: i === highlighted ? '3px solid' : 'none',
+                  outlineColor: 'warning.main', outlineOffset: '2px',
+                  transition: 'filter .15s',
+                  '&:hover': { filter: 'brightness(0.96)' },
+                  '&.Mui-focusVisible': { outline: '3px solid', outlineColor: 'text.primary', outlineOffset: '2px' }
+                }}
+              >
+                <Typography variant="body2" component="span" sx={{ display: 'block', wordBreak: 'break-word', lineHeight: 1.45 }}>{u.text}</Typography>
+              </ButtonBase>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'flex', alignItems: 'center', gap: 0.25, px: 1.25, mt: 0.25, fontVariantNumeric: 'tabular-nums' }}>
+                {!right && <PlayArrowIcon className="play-hint" sx={{ fontSize: 14, opacity: i === highlighted ? 1 : 0, transition: 'opacity .15s' }} />}
+                {formatMs(u.start)}
+                {right && <PlayArrowIcon className="play-hint" sx={{ fontSize: 14, opacity: i === highlighted ? 1 : 0, transition: 'opacity .15s' }} />}
+              </Typography>
+            </Box>
           );
         })}
       </Box>
@@ -497,7 +530,7 @@ export default function RecordingDetail() {
             )}
 
             {tab === 'transcript' && (
-              <Card title="Transcript" action={<Typography variant="caption" color="text.secondary">Personal information is replaced with tags like [SSN]. Click a line to play from there.</Typography>}>
+              <Card title="Transcript" action={<Typography variant="caption" color="text.secondary">Personal information is replaced with tags like [SSN]. Click a message to play the call from that moment.</Typography>}>
                 {transcription?.status === 'completed'
                   ? <Transcript utterances={utterances} agentSpeaker={agentSpeaker} currentMs={player.ready ? player.time * 1000 : -1} onSeek={seekMs} focusMs={focusMs} />
                   : <AnalysisPending transcription={transcription} analysis={data.analysis} />}

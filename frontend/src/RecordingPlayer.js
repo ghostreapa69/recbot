@@ -16,6 +16,10 @@ const SPEEDS = [1, 1.25, 1.5, 2];
 export function useRecordingPlayer(path) {
   const { getToken } = useAuth();
   const audioRef = useRef(null);
+  // One shared promise, so quick clicks before the audio exists don't create two players.
+  const audioPromiseRef = useRef(null);
+  // A jump (in seconds) waiting until the audio can seek that far.
+  const pendingSeekRef = useRef(null);
   const [state, setState] = useState({ ready: false, loading: false, playing: false, time: 0, duration: 0, error: null });
   const [rate, setRate] = useState(1);
   const [waveform, setWaveform] = useState(null);
@@ -23,55 +27,80 @@ export function useRecordingPlayer(path) {
   useEffect(() => {
     setState({ ready: false, loading: false, playing: false, time: 0, duration: 0, error: null });
     setWaveform(null);
+    pendingSeekRef.current = null;
     return () => {
       audioRef.current?.pause();
       audioRef.current = null;
+      audioPromiseRef.current = null;
     };
   }, [path]);
 
-  const ensureAudio = useCallback(async () => {
-    if (audioRef.current) return audioRef.current;
-    setState(s => ({ ...s, loading: true, error: null }));
-    const token = await getToken();
-    const audio = new Audio();
-    audio.preload = 'auto';
-    audio.playbackRate = rate;
-    audio.addEventListener('loadedmetadata', () => setState(s => ({ ...s, duration: audio.duration, ready: true, loading: false })));
-    audio.addEventListener('timeupdate', () => setState(s => ({ ...s, time: audio.currentTime })));
-    audio.addEventListener('play', () => setState(s => ({ ...s, playing: true })));
-    audio.addEventListener('pause', () => setState(s => ({ ...s, playing: false })));
-    audio.addEventListener('ended', () => setState(s => ({ ...s, playing: false })));
-    audio.addEventListener('error', () => setState(s => ({ ...s, loading: false, playing: false, error: 'The recording could not be played.' })));
-    audio.src = `/api/audio/${encodeURIComponent(path)}?auth=${encodeURIComponent(token)}`;
-    audioRef.current = audio;
-    fetch(`/api/waveform/${encodeURIComponent(path)}`, { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => (res.ok ? res.json() : null))
-      .then(json => { if (json?.waveform && audioRef.current === audio) setWaveform(json.waveform); })
-      .catch(() => {});
-    return audio;
-  }, [path, getToken, rate]);
+  // Applies a pending jump once the browser can seek to it. While the server is
+  // still converting the recording, only the part loaded so far is seekable,
+  // so the jump waits instead of silently landing at 0:00.
+  const applyPendingSeek = useCallback((audio) => {
+    const target = pendingSeekRef.current;
+    if (target === null || audio.readyState < 1) return;
+    const duration = Number.isFinite(audio.duration) ? audio.duration : null;
+    const seekableEnd = audio.seekable.length ? audio.seekable.end(audio.seekable.length - 1) : 0;
+    const goal = duration !== null ? Math.min(target, Math.max(0, duration - 0.25)) : target;
+    if (seekableEnd < goal) return;
+    pendingSeekRef.current = null;
+    audio.currentTime = goal;
+    setState(s => ({ ...s, time: goal }));
+  }, []);
+
+  const ensureAudio = useCallback(() => {
+    if (audioPromiseRef.current) return audioPromiseRef.current;
+    audioPromiseRef.current = (async () => {
+      setState(s => ({ ...s, loading: true, error: null }));
+      const token = await getToken();
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audio.playbackRate = rate;
+      audio.addEventListener('loadedmetadata', () => setState(s => ({ ...s, duration: audio.duration, ready: true, loading: false })));
+      audio.addEventListener('timeupdate', () => setState(s => ({ ...s, time: audio.currentTime })));
+      audio.addEventListener('play', () => setState(s => ({ ...s, playing: true })));
+      audio.addEventListener('pause', () => setState(s => ({ ...s, playing: false })));
+      audio.addEventListener('ended', () => setState(s => ({ ...s, playing: false })));
+      audio.addEventListener('error', () => setState(s => ({ ...s, loading: false, playing: false, error: 'The recording could not be played.' })));
+      for (const event of ['loadedmetadata', 'durationchange', 'canplay', 'progress']) {
+        audio.addEventListener(event, () => applyPendingSeek(audio));
+      }
+      audio.src = `/api/audio/${encodeURIComponent(path)}?auth=${encodeURIComponent(token)}`;
+      audioRef.current = audio;
+      fetch(`/api/waveform/${encodeURIComponent(path)}`, { headers: { Authorization: `Bearer ${token}` } })
+        .then(res => (res.ok ? res.json() : null))
+        .then(json => { if (json?.waveform && audioRef.current === audio) setWaveform(json.waveform); })
+        .catch(() => {});
+      return audio;
+    })();
+    return audioPromiseRef.current;
+  }, [path, getToken, rate, applyPendingSeek]);
 
   const play = useCallback(async () => {
     const audio = await ensureAudio();
     try {
       await audio.play();
     } catch (err) {
+      // A newer play/pause or a jump interrupted this one; that isn't an error.
+      if (err?.name === 'AbortError') return;
       setState(s => ({ ...s, loading: false, error: 'The recording could not be played.' }));
     }
   }, [ensureAudio]);
 
   const pause = useCallback(() => audioRef.current?.pause(), []);
 
-  // Seeks to a moment (in seconds) and plays from there.
+  // Jumps to a moment (in seconds) and plays from there, whether the audio is
+  // not loaded yet, playing, or paused.
   const seek = useCallback(async (seconds) => {
+    const target = Math.max(0, seconds);
+    pendingSeekRef.current = target;
+    setState(s => ({ ...s, time: target }));
     const audio = await ensureAudio();
-    const go = () => {
-      audio.currentTime = Math.max(0, Math.min(seconds, audio.duration || seconds));
-      setState(s => ({ ...s, time: audio.currentTime }));
-    };
-    if (audio.readyState >= 1) go(); else audio.addEventListener('loadedmetadata', go, { once: true });
+    applyPendingSeek(audio);
     if (audio.paused) play();
-  }, [ensureAudio, play]);
+  }, [ensureAudio, applyPendingSeek, play]);
 
   const changeRate = useCallback((value) => {
     setRate(value);
