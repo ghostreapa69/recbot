@@ -108,9 +108,15 @@ function TranscriptSection({ file, reloadKey }) {
     const utterances = transcript.utterances || [];
     body = (
       <>
-        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-          {transcript.summary || 'No speech detected.'}
-        </Typography>
+        {transcript.summary ? (
+          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {transcript.summary}
+          </Typography>
+        ) : transcript.error ? (
+          <Alert severity="warning">Summary unavailable: {transcript.error}</Alert>
+        ) : (
+          <Typography variant="body2" color="text.secondary">No speech detected.</Typography>
+        )}
         {utterances.length > 0 && (
           <Button size="small" sx={{ mt: 1, px: 0 }} onClick={() => setExpanded(v => !v)}>
             {expanded ? 'Hide transcript' : `Show transcript (${utterances.length})`}

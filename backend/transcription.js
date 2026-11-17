@@ -26,25 +26,31 @@ const TRANSCRIBE_LOCK_KEY = 727001;
 const SUMMARY_MODEL = 'claude-haiku-5-5';
 const API_BASE = 'https://api.assemblyai.com/v2';
 const LLM_GATEWAY_URL = 'https://llm-gateway.assemblyai.com/v1/chat/completions';
+// Without timeouts one hung request would keep the tick, and the cross-container lock, held forever.
+const REQUEST_TIMEOUT_MS = 30 * 1000;
+const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 const SUMMARY_PROMPT = `Summarize this mortgage company phone call in 3-6 short bullet points: the purpose of the call, key details discussed, the outcome, and any next steps. Speakers are labelled by diarization (e.g. "Speaker A") and may be the agent or the customer. Some information has been redacted and appears as placeholders like [PHONE_NUMBER]; keep those placeholders as-is and never guess what they contain. Reply with only the bullet points.`;
 
 const headers = { authorization: API_KEY };
 
 function apiError(err) {
-  return err.response?.data?.error || err.message;
+  const error = err.response?.data?.error;
+  const message = typeof error === 'string' ? error : (error?.message || (error && JSON.stringify(error)) || err.message);
+  return err.response?.status ? `HTTP ${err.response.status}: ${message}` : message;
 }
 
 async function submitRecording(s3, bucket, filePath) {
   const key = filePath.startsWith('recordings/') ? filePath : `recordings/${filePath}`;
-  const object = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const object = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS) });
   const upload = await axios.post(`${API_BASE}/upload`, object.Body, {
     headers: {
       ...headers,
       'content-type': 'application/octet-stream',
       ...(object.ContentLength && { 'content-length': object.ContentLength })
     },
-    maxBodyLength: Infinity
+    maxBodyLength: Infinity,
+    signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS)
   });
   const { data } = await axios.post(`${API_BASE}/transcript`, {
     audio_url: upload.data.upload_url,
@@ -52,7 +58,7 @@ async function submitRecording(s3, bucket, filePath) {
     redact_pii: true,
     redact_pii_policies: PII_POLICIES,
     redact_pii_sub: 'entity_name'
-  }, { headers });
+  }, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   return data.id;
 }
 
@@ -63,30 +69,37 @@ async function summarize(utterances) {
     model: SUMMARY_MODEL,
     messages: [{ role: 'user', content: `${SUMMARY_PROMPT}\n\nTranscript:\n${transcript}` }],
     max_tokens: 1000
-  }, { headers });
+  }, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   console.log(`📝 [TRANSCRIBE] Summary generated request_id=${data.request_id}`);
   return data.choices[0].message.content.trim();
 }
 
 async function pollPending() {
   let completed = 0;
-  for (const row of await getPendingTranscriptions()) {
+  const pending = await getPendingTranscriptions();
+  console.log(`📝 [TRANSCRIBE] Tick start: pending=${pending.length}`);
+  for (const row of pending) {
     try {
-      const { data } = await axios.get(`${API_BASE}/transcript/${row.assemblyai_id}`, { headers });
+      const { data } = await axios.get(`${API_BASE}/transcript/${row.assemblyai_id}`, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (data.status === 'error') {
         await upsertTranscription(row.file_path, { status: 'error', error: data.error });
+        console.error(`❌ [TRANSCRIBE] AssemblyAI failed ${row.file_path} id=${row.assemblyai_id}:`, data.error);
         continue;
       }
       if (data.status !== 'completed') continue;
       const utterances = (data.utterances || []).map(({ speaker, start, end, text }) => ({ speaker, start, end, text }));
+      let summary = null;
+      let error = null;
       try {
-        const summary = utterances.length ? await summarize(utterances) : null;
-        await upsertTranscription(row.file_path, { status: 'completed', transcriptText: data.text, utterances, summary });
-        completed++;
+        summary = utterances.length ? await summarize(utterances) : null;
       } catch (err) {
-        // Stay 'processing' so the summary is retried next tick.
-        await upsertTranscription(row.file_path, { status: 'processing', error: `Summary failed: ${apiError(err)}` });
+        // Keep the transcript; a failed summary must not leave the row stuck in 'processing'.
+        error = `Summary failed: ${apiError(err)}`;
+        console.error(`❌ [TRANSCRIBE] ${error} (${row.file_path})`);
       }
+      await upsertTranscription(row.file_path, { status: 'completed', transcriptText: data.text, utterances, summary, error });
+      console.log(`📝 [TRANSCRIBE] Completed ${row.file_path} id=${row.assemblyai_id} summary=${summary ? 'yes' : 'no'}`);
+      completed++;
     } catch (err) {
       console.error(`❌ [TRANSCRIBE] Poll failed for ${row.file_path}:`, apiError(err));
     }
@@ -102,6 +115,7 @@ async function submitNew(s3, bucket) {
     try {
       const assemblyaiId = await submitRecording(s3, bucket, filePath);
       await upsertTranscription(filePath, { assemblyaiId, status: 'processing' });
+      console.log(`📝 [TRANSCRIBE] Submitted ${filePath} id=${assemblyaiId}`);
       submitted++;
     } catch (err) {
       // Not retried automatically, to avoid repeat charges; delete the row to retry.
