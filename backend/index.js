@@ -20,7 +20,8 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead } from './database.js';
+import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription } from './database.js';
+import { startTranscriptionWorker } from './transcription.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
@@ -1868,6 +1869,22 @@ app.get('/api/recordings/activity', requireAuth, ensureSession, requireAuthentic
   }
 });
 
+app.get('/api/recordings/transcript', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.query.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+
+    const transcription = await getTranscription(recordingPath);
+    res.json(transcription || { status: 'none' });
+  } catch (err) {
+    console.error('Error in /api/recordings/transcript:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Sets (rather than toggles) the caller's favorite, so retries and double-clicks are harmless.
 app.post('/api/recordings/favorite', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
   try {
@@ -2534,6 +2551,8 @@ initializeDatabase().then(() => {
     
     // Then run every 5 minutes
     setInterval(syncCurrentDay, 5 * 60 * 1000); // 5 minutes in milliseconds
+
+    startTranscriptionWorker({ s3, bucket: process.env.AWS_BUCKET });
   });
 }).catch(err => {
   console.error('❌ Failed to initialize database:', err);

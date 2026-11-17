@@ -94,6 +94,16 @@ services:
       - FIVE9_AUTO_INGEST_MINUTES=5
       - REPORT_TIME_DEBUG=true
 
+      # --- AssemblyAI Transcription & Summaries ---
+      # Leave ASSEMBLYAI_API_KEY unset to disable transcription entirely.
+      #- ASSEMBLYAI_API_KEY=your-assemblyai-api-key-here
+      # Only transcribe calls from the last N days...
+      - TRANSCRIBE_LOOKBACK_DAYS=7
+      # ...that are longer than this many seconds.
+      - TRANSCRIBE_MIN_DURATION_SECONDS=50
+      # Optional: comma-separated AssemblyAI redact_pii_policies (defaults shown).
+      #- TRANSCRIBE_PII_POLICIES=us_social_security_number,date_of_birth,credit_card_number,credit_card_cvv,credit_card_expiration,account_number,banking_information,drivers_license,passport_number,email_address,phone_number,location_address,location_address_street,password
+
       # --- Optional / Feature Flags ---
       #- EXTRA_LOGGING=true
       #- LOG_LEVEL=info

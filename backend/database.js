@@ -333,6 +333,22 @@ export async function initializeDatabase() {
     );
   `);
 
+  // AssemblyAI transcripts. Text, utterances and summary are PII-redacted.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS transcriptions (
+      file_path TEXT PRIMARY KEY REFERENCES files(file_path) ON DELETE CASCADE,
+      assemblyai_id TEXT,
+      status TEXT NOT NULL,
+      transcript_text TEXT,
+      utterances JSONB,
+      summary TEXT,
+      error TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transcriptions_status ON transcriptions(status);`);
+
   // Create indexes
   // Migration: add call_disposition column to existing files tables
   await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS call_disposition TEXT;`);
@@ -2106,6 +2122,47 @@ export async function markNotificationsRead(recipientEmail, ids) {
     WHERE recipient_email = $1 AND read_at IS NULL AND ($2::int[] IS NULL OR id = ANY($2::int[]))
   `, [recipientEmail, ids]);
   return countUnreadNotifications(recipientEmail);
+}
+
+// ============================================================
+// Transcriptions
+// ============================================================
+// call_date is stored as YYYY-MM-DD text, so string comparison is date order.
+export async function getFilesNeedingTranscription(cutoffDate, minDurationMs, limit) {
+  const { rows } = await pool.query(`
+    SELECT f.file_path
+    FROM files f
+    LEFT JOIN transcriptions t ON t.file_path = f.file_path
+    WHERE t.file_path IS NULL AND f.call_date >= $1 AND f.duration_ms > $2
+    ORDER BY f.call_date DESC, f.call_time DESC
+    LIMIT $3
+  `, [cutoffDate, minDurationMs, limit]);
+  return rows.map(r => r.file_path);
+}
+
+export async function getPendingTranscriptions() {
+  const { rows } = await pool.query(`SELECT file_path, assemblyai_id FROM transcriptions WHERE status = 'processing'`);
+  return rows;
+}
+
+export async function upsertTranscription(filePath, { assemblyaiId = null, status, transcriptText = null, utterances = null, summary = null, error = null }) {
+  await pool.query(`
+    INSERT INTO transcriptions (file_path, assemblyai_id, status, transcript_text, utterances, summary, error)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (file_path) DO UPDATE SET
+      assemblyai_id = COALESCE(EXCLUDED.assemblyai_id, transcriptions.assemblyai_id),
+      status = EXCLUDED.status,
+      transcript_text = EXCLUDED.transcript_text,
+      utterances = EXCLUDED.utterances,
+      summary = EXCLUDED.summary,
+      error = EXCLUDED.error,
+      updated_at = NOW()
+  `, [filePath, assemblyaiId, status, transcriptText, utterances ? JSON.stringify(utterances) : null, summary, error]);
+}
+
+export async function getTranscription(filePath) {
+  const { rows } = await pool.query(`SELECT status, summary, utterances, error FROM transcriptions WHERE file_path = $1`, [filePath]);
+  return rows[0] || null;
 }
 
 // ============================================================

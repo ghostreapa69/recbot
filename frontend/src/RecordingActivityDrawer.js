@@ -57,6 +57,87 @@ async function copyText(text) {
   return copied;
 }
 
+// AI summary and diarized transcript, both PII-redacted by the backend.
+function TranscriptSection({ file, reloadKey }) {
+  const { getToken } = useAuth();
+  const [transcript, setTranscript] = useState(null);
+  const [failed, setFailed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFailed(false);
+    (async () => {
+      try {
+        const token = await getToken();
+        const res = await fetch(`/api/recordings/transcript?path=${encodeURIComponent(file)}`, {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        if (!cancelled) setTranscript(json);
+      } catch (err) {
+        if (cancelled) return;
+        console.error('Failed to load transcript:', err);
+        setFailed(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [file, reloadKey, getToken]);
+
+  let body;
+  if (failed) {
+    body = <Alert severity="error">Could not load the transcript.</Alert>;
+  } else if (!transcript) {
+    body = <CircularProgress size={20} />;
+  } else if (transcript.status === 'none') {
+    body = (
+      <Typography variant="body2" color="text.secondary">
+        Not transcribed. Only recent calls above the minimum length are transcribed.
+      </Typography>
+    );
+  } else if (transcript.status === 'processing') {
+    body = <Typography variant="body2" color="text.secondary">Transcription in progress…</Typography>;
+  } else if (transcript.status === 'error') {
+    body = <Alert severity="warning">Transcription failed: {transcript.error}</Alert>;
+  } else {
+    const utterances = transcript.utterances || [];
+    body = (
+      <>
+        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+          {transcript.summary || 'No speech detected.'}
+        </Typography>
+        {utterances.length > 0 && (
+          <Button size="small" sx={{ mt: 1, px: 0 }} onClick={() => setExpanded(v => !v)}>
+            {expanded ? 'Hide transcript' : `Show transcript (${utterances.length})`}
+          </Button>
+        )}
+        {expanded && utterances.map((u, i) => (
+          <Box key={i} sx={{ mt: 1 }}>
+            <Typography variant="caption" color="text.secondary">
+              Speaker {u.speaker} · {formatPosition(u.start)}
+            </Typography>
+            <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>{u.text}</Typography>
+          </Box>
+        ))}
+      </>
+    );
+  }
+
+  return (
+    <Box sx={{ mb: 2 }}>
+      <Typography variant="subtitle2" gutterBottom>
+        Summary
+      </Typography>
+      {body}
+    </Box>
+  );
+}
+
 // Side panel for one recording: its favorites, comments (optionally pinned to
 // a moment in the call) and a shareable link. Persistent — no backdrop — so the
 // player at the bottom of the Recordings page stays usable while it is open.
@@ -285,6 +366,7 @@ function ActivityPanel({ recording, onClose, trackState, currentTime, onPlay, on
       <Divider />
 
       <Box sx={{ flex: 1, overflowY: 'auto', p: 2 }}>
+        {!notFound && <TranscriptSection file={file} reloadKey={reloadKey} />}
         {loadError ? (
           <Alert
             severity="error"
