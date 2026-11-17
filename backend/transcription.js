@@ -3,7 +3,7 @@ import dayjs from 'dayjs';
 import utcPlugin from 'dayjs/plugin/utc.js';
 import timezonePlugin from 'dayjs/plugin/timezone.js';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
-import { pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription } from './database.js';
+import { pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription, getTranscriptionsMissingSummary, updateTranscriptionSummary } from './database.js';
 
 dayjs.extend(utcPlugin);
 dayjs.extend(timezonePlugin);
@@ -34,9 +34,17 @@ const SUMMARY_PROMPT = `Summarize this mortgage company phone call in 3-6 short 
 
 const headers = { authorization: API_KEY };
 
+// AssemblyAI's transcript API returns { error }, the LLM Gateway { message, metadata: { errors }, request_id }.
 function apiError(err) {
-  const error = err.response?.data?.error;
-  const message = typeof error === 'string' ? error : (error?.message || (error && JSON.stringify(error)) || err.message);
+  const data = err.response?.data || {};
+  const { error } = data;
+  let message = typeof error === 'string' ? error : (error?.message || (error && JSON.stringify(error)));
+  if (!message && data.message) {
+    const details = Array.isArray(data.metadata?.errors) ? data.metadata.errors.join('; ') : '';
+    message = details ? `${data.message} — ${details}` : data.message;
+  }
+  message = message || err.message;
+  if (data.request_id) message += ` (request_id=${data.request_id})`;
   return err.response?.status ? `HTTP ${err.response.status}: ${message}` : message;
 }
 
@@ -107,6 +115,22 @@ async function pollPending() {
   return completed;
 }
 
+// Re-summarizes stored (redacted) transcripts whose summary failed, without transcribing again.
+async function retryMissingSummaries() {
+  let fixed = 0;
+  for (const row of await getTranscriptionsMissingSummary(MAX_SUBMISSIONS_PER_TICK)) {
+    try {
+      await updateTranscriptionSummary(row.file_path, await summarize(row.utterances), null);
+      fixed++;
+    } catch (err) {
+      const error = `Summary failed: ${apiError(err)}`;
+      await updateTranscriptionSummary(row.file_path, null, error);
+      console.error(`❌ [TRANSCRIBE] ${error} (${row.file_path})`);
+    }
+  }
+  return fixed;
+}
+
 async function submitNew(s3, bucket) {
   const cutoff = dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
   const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_SECONDS * 1000, MAX_SUBMISSIONS_PER_TICK);
@@ -145,8 +169,9 @@ export function startTranscriptionWorker({ s3, bucket }) {
       ({ rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [TRANSCRIBE_LOCK_KEY]));
       if (!locked) return;
       const completed = await pollPending();
+      const summariesRetried = await retryMissingSummaries();
       const { submitted, failed } = await submitNew(s3, bucket);
-      console.log(`📝 [TRANSCRIBE] completed=${completed} submitted=${submitted} failed=${failed}`);
+      console.log(`📝 [TRANSCRIBE] completed=${completed} summariesRetried=${summariesRetried} submitted=${submitted} failed=${failed}`);
     } catch (err) {
       console.error('❌ [TRANSCRIBE] Tick failed:', err.message);
     } finally {

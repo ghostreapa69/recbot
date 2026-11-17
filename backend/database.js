@@ -2160,6 +2160,21 @@ export async function upsertTranscription(filePath, { assemblyaiId = null, statu
   `, [filePath, assemblyaiId, status, transcriptText, utterances ? JSON.stringify(utterances) : null, summary, error]);
 }
 
+export async function getTranscriptionsMissingSummary(limit) {
+  const { rows } = await pool.query(`
+    SELECT file_path, utterances FROM transcriptions
+    WHERE status = 'completed' AND summary IS NULL AND error LIKE 'Summary failed%'
+      AND jsonb_array_length(utterances) > 0
+    ORDER BY updated_at
+    LIMIT $1
+  `, [limit]);
+  return rows;
+}
+
+export async function updateTranscriptionSummary(filePath, summary, error) {
+  await pool.query(`UPDATE transcriptions SET summary = $2, error = $3, updated_at = NOW() WHERE file_path = $1`, [filePath, summary, error]);
+}
+
 export async function getTranscription(filePath) {
   const { rows } = await pool.query(`SELECT status, summary, utterances, error FROM transcriptions WHERE file_path = $1`, [filePath]);
   return rows[0] || null;
