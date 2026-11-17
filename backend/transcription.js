@@ -23,7 +23,9 @@ const INTERVAL_MS = 5 * 60 * 1000;
 const MAX_SUBMISSIONS_PER_TICK = 10;
 // Postgres advisory lock key: only one container runs a tick at a time.
 const TRANSCRIBE_LOCK_KEY = 727001;
-const SUMMARY_MODEL = 'claude-haiku-5-5';
+const SUMMARY_MODEL = process.env.TRANSCRIBE_SUMMARY_MODEL || 'qwen3.5-4b-32k-fast';
+// qwen3.5-4b-32k-fast has a 32k-token context; ~80k chars (~20k tokens) leaves room for the prompt and reply.
+const MAX_SUMMARY_TRANSCRIPT_CHARS = 80000;
 const API_BASE = 'https://api.assemblyai.com/v2';
 const LLM_GATEWAY_URL = 'https://llm-gateway.assemblyai.com/v1/chat/completions';
 // Without timeouts one hung request would keep the tick, and the cross-container lock, held forever.
@@ -72,14 +74,18 @@ async function submitRecording(s3, bucket, filePath) {
 
 // Summarizes the already-redacted transcript, so the summary never sees PII.
 async function summarize(utterances) {
-  const transcript = utterances.map(u => `Speaker ${u.speaker}: ${u.text}`).join('\n');
+  let transcript = utterances.map(u => `Speaker ${u.speaker}: ${u.text}`).join('\n');
+  if (transcript.length > MAX_SUMMARY_TRANSCRIPT_CHARS) {
+    transcript = `${transcript.slice(0, MAX_SUMMARY_TRANSCRIPT_CHARS)}\n[transcript truncated]`;
+  }
   const { data } = await axios.post(LLM_GATEWAY_URL, {
     model: SUMMARY_MODEL,
     messages: [{ role: 'user', content: `${SUMMARY_PROMPT}\n\nTranscript:\n${transcript}` }],
     max_tokens: 1000
   }, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   console.log(`📝 [TRANSCRIBE] Summary generated request_id=${data.request_id}`);
-  return data.choices[0].message.content.trim();
+  // Drop any reasoning block the model emits before its answer.
+  return data.choices[0].message.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 }
 
 async function pollPending() {
@@ -155,7 +161,7 @@ export function startTranscriptionWorker({ s3, bucket }) {
     console.log('📝 [TRANSCRIBE] ASSEMBLYAI_API_KEY not set; transcription disabled');
     return;
   }
-  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s piiPolicies=${PII_POLICIES.length}`);
+  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s piiPolicies=${PII_POLICIES.length} summaryModel=${SUMMARY_MODEL}`);
   let isRunning = false;
   const tick = async () => {
     if (isRunning) return;

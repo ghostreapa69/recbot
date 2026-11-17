@@ -102,6 +102,8 @@ services:
       # ...that are longer than this many seconds.
       - TRANSCRIBE_MIN_DURATION_SECONDS=50
       # Optional: comma-separated AssemblyAI redact_pii_policies (defaults shown).
+      # Optional: LLM Gateway model for summaries; must be one your AssemblyAI account has access to.
+      #- TRANSCRIBE_SUMMARY_MODEL=qwen3.5-4b-32k-fast
       #- TRANSCRIBE_PII_POLICIES=us_social_security_number,date_of_birth,credit_card_number,credit_card_cvv,credit_card_expiration,account_number,banking_information,drivers_license,passport_number,email_address,phone_number,location_address,location_address_street,password
 
       # --- Optional / Feature Flags ---
