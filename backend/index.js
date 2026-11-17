@@ -1399,25 +1399,14 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
 });
 
 // Waveform endpoint - returns waveform data for an audio file
-app.get('/api/waveform/*', async (req, res) => {
+// Same access rule as /api/audio: a verified, allow-listed user with an app role
+// and an active session may load any recording's waveform.
+app.get('/api/waveform/*', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
   try {
     const filename = decodeURIComponent(req.params[0]);
     const BUCKET_NAME = process.env.AWS_BUCKET;
-    
-    // Handle authentication
-    let token = null;
-    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
-      token = req.headers.authorization.substring(7);
-    } else if (req.query.auth) {
-      token = req.query.auth;
-    }
-    
-    if (!token) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
 
-    // TODO: Add proper JWT verification and domain checking for waveform endpoint
-    console.log(`📊 [WAVEFORM AUTH] Token provided for: ${filename}`);
+    console.log(`📊 [WAVEFORM AUTH] User ${req.user.email} (${req.user.role}) loading waveform: ${filename}`);
 
     const s3Key = filename.startsWith('recordings/') ? filename : `recordings/${filename}`;
     const waveformCacheKey = 'cache/waveform/' + crypto.createHash('md5').update(s3Key).digest('hex') + '.json';
