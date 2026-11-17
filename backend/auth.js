@@ -342,7 +342,6 @@ export const requireAuth = async (req, res, next) => {
       });
     }
 
-    console.log(`✅ [AUTH ACCESS] User ${userEmail} granted access (role=${role}, scope="${payload.scope ?? ''}", roles=${JSON.stringify(payload.roles ?? null)})`);
 
     // Relink any historical logs (old Clerk user IDs) to this Logto user ID.
     // Idempotent and cheap after the first successful link per user.
@@ -356,7 +355,6 @@ export const requireAuth = async (req, res, next) => {
     const ipAddress = req.realClientIP || req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
     const userAgent = req.headers['user-agent'] || 'unknown';
 
-    console.log(`🔐 [AUTH] Client IP: ${ipAddress}, User Agent: ${userAgent.substring(0, 50)}...`);
 
     // Determine if there is an existing open session (logout_time NULL); if not, create one & log LOGIN
     let openSessionExists = false;

@@ -32,7 +32,8 @@ const AUTO_INGEST_INTERVAL_MINUTES = parsePositiveInt(process.env.FIVE9_AUTO_ING
 const REPORT_LOOKBACK_PADDING_MINUTES = parsePositiveInt(process.env.FIVE9_LOOKBACK_PADDING_MINUTES ?? 5, 5);
 const MIN_REPORT_WINDOW_MINUTES = parsePositiveInt(process.env.FIVE9_MIN_REPORT_WINDOW_MINUTES ?? 15, 15);
 
-if (!FIVE9_USERNAME || !FIVE9_PASSWORD) {
+export const five9Configured = Boolean(FIVE9_USERNAME && FIVE9_PASSWORD);
+if (!five9Configured) {
   console.warn('⚠️  Five9 credentials not set. Reporting ingestion disabled.');
 }
 
@@ -106,16 +107,9 @@ async function soapRequest(action, bodyFragment) {
   throw lastError || new Error(`Five9 SOAP request failed for ${action}`);
 }
 
+// Scheduled ingestion: the last AUTO_INGEST_INTERVAL_MINUTES (+ padding) of calls.
 export async function fetchLastHourCallLog({ auditUser=null } = {}) {
-  if (!FIVE9_USERNAME || !FIVE9_PASSWORD) return { inserted:0, total:0, disabled:true };
-
-  // Establish session via WSDL fetch (mimics PHP SoapClient auth) before performing operations
-  try {
-    await establishFive9Session();
-  } catch (e) {
-    console.error('❌ [Five9] Failed to establish session via WSDL:', e.message);
-    return { inserted:0, total:0, error: 'session_init_failed', detail: e.message };
-  }
+  if (!five9Configured) return { inserted:0, total:0, disabled:true };
 
   // Use Five9's timezone for the report request window
   // Get current time in Five9's timezone
@@ -128,7 +122,32 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
   }
   const end = now;
   const start = now.subtract(windowMinutes, 'minute');
-  
+  console.log('   Interval minutes:', intervalMinutes, 'Padding minutes:', REPORT_LOOKBACK_PADDING_MINUTES, 'Window minutes (raw/applied):', rawWindowMinutes, '/', windowMinutes);
+  return fetchCallLog({ start: start.toDate(), end: end.toDate(), auditUser });
+}
+
+// Five9 accepts one report at a time from us: every fetch (scheduled, manual,
+// or triggered by the recording scan) queues behind the previous one.
+let five9Queue = Promise.resolve();
+
+// Fetches Five9's Call Log for [start, end] (Dates) and upserts it into reporting.
+export function fetchCallLog({ start, end, auditUser = null }) {
+  if (!five9Configured) return Promise.resolve({ inserted:0, total:0, disabled:true });
+  const run = () => runCallLogReport({ start: dayjs.tz(start, FIVE9_TIMEZONE), end: dayjs.tz(end, FIVE9_TIMEZONE), auditUser });
+  const result = five9Queue.then(run, run);
+  five9Queue = result.catch(() => {});
+  return result;
+}
+
+async function runCallLogReport({ start, end, auditUser }) {
+  // Establish session via WSDL fetch (mimics PHP SoapClient auth) before performing operations
+  try {
+    await establishFive9Session();
+  } catch (e) {
+    console.error('❌ [Five9] Failed to establish session via WSDL:', e.message);
+    return { inserted:0, total:0, error: 'session_init_failed', detail: e.message };
+  }
+
   // Format for Five9 API: ISO 8601 with timezone offset
   function fmt(dt) {
     const off = dt.format('Z'); // +05:00 or -05:00
@@ -139,7 +158,6 @@ export async function fetchLastHourCallLog({ auditUser=null } = {}) {
 
   console.log('🕘 [Five9] Requesting report for window (Five9 timezone:', FIVE9_TIMEZONE + ')');
   console.log('   Current UTC:', dayjs.utc().format('YYYY-MM-DD HH:mm:ss'));
-  console.log('   Interval minutes:', intervalMinutes, 'Padding minutes:', REPORT_LOOKBACK_PADDING_MINUTES, 'Window minutes (raw/applied):', rawWindowMinutes, '/', windowMinutes);
   console.log('   Start (Five9 local):', start.format('YYYY-MM-DD HH:mm:ss'));
   console.log('   End (Five9 local):', end.format('YYYY-MM-DD HH:mm:ss'));
   console.log('   Start (ISO with offset):', startStr);

@@ -417,6 +417,15 @@ export async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_composite ON files(call_date, phone, email);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_files_call_id ON files(call_id);`);
+  // The call's Five9 agent and customer, copied onto the recording by the scan
+  // (fillFileAgents) so agent pages can filter on an indexed column instead of
+  // joining reporting. Adding nullable columns is instant on any table size.
+  await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS agent_email TEXT;`);
+  await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS agent_name TEXT;`);
+  await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS customer_name TEXT;`);
+  await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS five9_synced_at TIMESTAMP;`);
+  // Small key/value store for one-time jobs (e.g. the agent backfill).
+  await pool.query(`CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMP DEFAULT NOW());`);
 
   // No DESC twin for idx_reporting_timestamp — a b-tree scans backward natively,
   // so the duplicate only cost write throughput on every ingest batch.
@@ -624,6 +633,116 @@ export async function indexFile(filePath, fileSize = 0) {
   }
 }
 
+// Inserts recordings not yet indexed, in one statement per 1,000 files, and
+// leaves existing rows untouched. Returns how many were new. Used by the
+// 5-minute scan, which used to rewrite every one of the day's rows.
+export async function insertNewFiles(filePaths) {
+  let inserted = 0;
+  for (let i = 0; i < filePaths.length; i += 1000) {
+    const batch = filePaths.slice(i, i + 1000).map(parseFileMetadata).filter(Boolean);
+    if (!batch.length) continue;
+    const { rowCount } = await pool.query(`
+      INSERT INTO files (file_path, phone, email, call_date, call_time, call_id, call_disposition, duration_ms, file_size)
+      SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::int[], $9::int[])
+      ON CONFLICT (file_path) DO NOTHING
+    `, [
+      batch.map(m => m.filePath), batch.map(m => m.phone), batch.map(m => m.email), batch.map(m => m.callDate),
+      batch.map(m => m.callTime), batch.map(m => m.callId || null), batch.map(m => m.callDisposition || null),
+      batch.map(m => m.durationMs || 0), batch.map(() => 0)
+    ]);
+    inserted += rowCount;
+  }
+  return inserted;
+}
+
+// Copies the Five9 agent email/name and customer name onto recordings whose
+// call log row has arrived, then falls back to the filename's email for
+// recordings with no Five9 match yet. Pass { sinceDate } (YYYY-MM-DD) for the
+// scan, or { fromId, toId } for the backfill.
+export async function fillFileAgents({ sinceDate = null, fromId = null, toId = null } = {}) {
+  const byId = fromId !== null;
+  const range = byId ? 'f.id >= $1 AND f.id < $2' : 'f.call_date >= $1';
+  const params = byId ? [fromId, toId] : [sinceDate];
+  const matched = await pool.query(`
+    UPDATE files f SET
+      agent_email = lower(r.agent),
+      agent_name = COALESCE(NULLIF(trim(r.agent_name), ''), f.agent_name),
+      customer_name = COALESCE(NULLIF(trim(r.customer_name), ''), f.customer_name),
+      five9_synced_at = NOW()
+    FROM reporting r
+    WHERE r.call_id = f.call_id AND f.five9_synced_at IS NULL AND r.agent LIKE '%@%' AND ${range}
+  `, params);
+  const fallback = await pool.query(`
+    UPDATE files f SET agent_email = lower(f.email)
+    WHERE f.agent_email IS NULL AND f.email LIKE '%@%' AND ${range}
+  `, params);
+  return { matched: matched.rowCount, fallback: fallback.rowCount };
+}
+
+// Recordings added in the last `hours` whose Five9 call log row hasn't arrived.
+// `earliest` is when the oldest of those calls started (insert time minus its
+// length), as a Date, for the Five9 report window.
+export async function getRecentFilesMissingFive9(hours = 6) {
+  const { rows: [row] } = await pool.query(`
+    SELECT COUNT(*)::int AS count,
+      (MIN(f.created_at - make_interval(secs => COALESCE(f.duration_ms, 0) / 1000.0)) AT TIME ZONE current_setting('TimeZone')) AS earliest
+    FROM files f
+    WHERE f.call_id IS NOT NULL AND f.five9_synced_at IS NULL
+      AND f.created_at >= NOW() - make_interval(hours => $1)
+      AND NOT EXISTS (SELECT 1 FROM reporting r WHERE r.call_id = f.call_id)
+  `, [hours]);
+  return row;
+}
+
+const FILE_AGENT_BACKFILL_KEY = 'files_agent_backfill_v1';
+const FILE_AGENT_BACKFILL_LOCK = 727002;
+const FILE_AGENT_BACKFILL_BATCH = 5000;
+
+// One-time job: builds the agent index without locking writes, then fills the
+// agent columns for every existing recording in id batches. Only one container
+// runs it (advisory lock) and it records completion in app_state. `force`
+// re-runs the fill (e.g. after an admin bulk import of older recordings).
+export async function runFileAgentBackfill({ force = false } = {}) {
+  const client = await pool.connect();
+  let locked = false;
+  try {
+    ({ rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [FILE_AGENT_BACKFILL_LOCK]));
+    if (!locked) return { skipped: 'another container is running it' };
+
+    // An interrupted CONCURRENTLY build leaves an INVALID index that IF NOT EXISTS would keep forever.
+    const { rows: invalid } = await client.query(`
+      SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE c.relname = 'idx_files_agent_email_date' AND NOT i.indisvalid
+    `);
+    if (invalid.length) await client.query('DROP INDEX CONCURRENTLY IF EXISTS idx_files_agent_email_date');
+    const started = Date.now();
+    await client.query('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_files_agent_email_date ON files (agent_email, call_date)');
+    console.log(`👥 [AGENT BACKFILL] Agent index ready (${Date.now() - started}ms)`);
+
+    const { rows: done } = await client.query('SELECT value FROM app_state WHERE key = $1', [FILE_AGENT_BACKFILL_KEY]);
+    if (done.length && !force) return { skipped: 'already done' };
+
+    const { rows: [{ min_id: minId, max_id: maxId }] } = await client.query('SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM files');
+    let matched = 0;
+    let fallback = 0;
+    let batches = 0;
+    for (let from = Number(minId ?? 0); maxId !== null && from <= Number(maxId); from += FILE_AGENT_BACKFILL_BATCH) {
+      const result = await fillFileAgents({ fromId: from, toId: from + FILE_AGENT_BACKFILL_BATCH });
+      matched += result.matched;
+      fallback += result.fallback;
+      if (++batches % 20 === 0) console.log(`👥 [AGENT BACKFILL] Up to id ${from + FILE_AGENT_BACKFILL_BATCH} of ${maxId}: ${matched} matched to Five9, ${fallback} from filename`);
+    }
+    await client.query('ANALYZE files');
+    await client.query(`INSERT INTO app_state (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [FILE_AGENT_BACKFILL_KEY, JSON.stringify({ matched, fallback })]);
+    console.log(`✅ [AGENT BACKFILL] Done in ${Math.round((Date.now() - started) / 1000)}s: ${matched} matched to Five9, ${fallback} from filename`);
+    return { matched, fallback };
+  } finally {
+    if (locked) await client.query('SELECT pg_advisory_unlock($1)', [FILE_AGENT_BACKFILL_LOCK]).catch(() => {});
+    client.release();
+  }
+}
+
 export async function backfillFileMetadata(batchSize = 500) {
   let processed = 0;
   let updated = 0;
@@ -743,15 +862,11 @@ export async function indexFiles(files) {
 // File queries
 // ============================================================
 
-// A user owns a recording when their sign-in email matches the call's agent:
-// the email embedded in legacy filenames ("{phone} by {email} @ ..."), or the
-// Five9 agent username on the call's reporting row (the newest filename format
-// only carries a display name). getRecordingContext() applies the same rule in
-// JS — keep the two in lockstep. `emailParam` must bind a lowercased email.
-// lower(r.agent) is served by idx_reporting_agent_lower_call_id, built by
-// scripts/optimize-reporting-indexes.mjs; changing the expression disables it.
-const ownedBySql = (emailParam) =>
-  `(lower(f.email) = ${emailParam} OR EXISTS (SELECT 1 FROM reporting r WHERE r.call_id = f.call_id AND lower(r.agent) = ${emailParam}))`;
+// A user owns a recording when their sign-in email is the call's agent:
+// files.agent_email, which the recording scan fills from the call's Five9
+// reporting row (else from the email in legacy filenames). Served by
+// idx_files_agent_email_date. `emailParam` must bind a lowercased email.
+const ownedBySql = (emailParam) => `f.agent_email = ${emailParam}`;
 
 export async function queryFiles(filters = {}) {
   const {
@@ -2328,15 +2443,16 @@ export async function getCallAnalysis(filePath) {
 // ============================================================
 // Agents, dashboard, search, trends, coaching
 // ============================================================
-// An agent is the reporting row's agent email when there is one, else the filename's email.
-const AGENT_SQL = `lower(COALESCE(CASE WHEN r.agent LIKE '%@%' THEN r.agent END, NULLIF(f.email, '')))`;
+// A call's agent, stored on the recording by the scan (see fillFileAgents).
+const AGENT_SQL = `f.agent_email`;
 const CALLS_FROM = `files f LEFT JOIN reporting r ON r.call_id = f.call_id
   LEFT JOIN call_analyses ca ON ca.file_path = f.file_path AND ca.status = 'completed'`;
 
 // Columns for a call row in lists (recent, best, worst, search, coaching).
-const CALL_ROW_SQL = `f.file_path, f.call_date, f.call_time, f.phone, f.call_id, f.duration_ms,
-  COALESCE(r.disposition, f.call_disposition) AS disposition, r.customer_name, r.campaign,
-  ${AGENT_SQL} AS agent_email, r.agent_name, ca.overall_score::float AS overall_score`;
+const callRowSql = (scoreExpr = 'ca.overall_score') => `f.file_path, f.call_date, f.call_time, f.phone, f.call_id, f.duration_ms,
+  COALESCE(r.disposition, f.call_disposition) AS disposition, COALESCE(f.customer_name, r.customer_name) AS customer_name,
+  ${AGENT_SQL} AS agent_email, COALESCE(f.agent_name, r.agent_name) AS agent_name, ${scoreExpr}::float AS overall_score`;
+const CALL_ROW_SQL = callRowSql();
 
 export async function getRecordingReport(callId) {
   if (!callId) return null;
@@ -2350,23 +2466,46 @@ export async function getRecordingReport(callId) {
 
 const SCORE_COLUMNS = ['intro', 'retention', 'info', 'sentiment', 'objection', 'control'];
 
-// Aggregates for one agent between two YYYY-MM-DD dates (inclusive).
-async function periodKpis(email, start, end) {
-  const { rows } = await pool.query(`
-    SELECT COUNT(*)::int AS calls,
-      COUNT(ca.overall_score)::int AS scored,
-      AVG(ca.overall_score)::float AS avg_score,
-      AVG(NULLIF(COALESCE(r.talk_time, 0) + COALESCE(r.hold_time, 0) + COALESCE(r.after_call_work_time, 0), 0))::float AS avg_handle_ms,
-      AVG((ca.stats->>'agentTalkShare')::float) AS avg_talk_share,
-      ${SCORE_COLUMNS.map(c => `AVG(ca.${c}_score)::float AS ${c}`).join(', ')}
+// Aggregates for one agent for the current period ($2..$3) and the previous one ($4..$5), in one pass.
+async function periodKpis(email, start, end, prevStart, prevEnd) {
+  const columns = (alias, from, to) => {
+    const f = `FILTER (WHERE f.call_date >= ${from} AND f.call_date <= ${to})`;
+    return [
+      `COUNT(*) ${f}::int AS ${alias}_calls`,
+      `COUNT(ca.overall_score) ${f}::int AS ${alias}_scored`,
+      `AVG(ca.overall_score) ${f}::float AS ${alias}_avg_score`,
+      `AVG(NULLIF(COALESCE(r.talk_time, 0) + COALESCE(r.hold_time, 0) + COALESCE(r.after_call_work_time, 0), 0)) ${f}::float AS ${alias}_avg_handle_ms`,
+      `AVG((ca.stats->>'agentTalkShare')::float) ${f} AS ${alias}_avg_talk_share`,
+      ...SCORE_COLUMNS.map(c => `AVG(ca.${c}_score) ${f}::float AS ${alias}_${c}`)
+    ].join(',\n      ');
+  };
+  const { rows: [row] } = await pool.query(`
+    SELECT ${columns('cur', '$2', '$3')},
+      ${columns('prev', '$4', '$5')}
     FROM ${CALLS_FROM}
-    WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
-  `, [email, start, end]);
-  return rows[0];
+    WHERE ${AGENT_SQL} = $1 AND f.call_date >= $4 AND f.call_date <= $3
+  `, [email, start, end, prevStart, prevEnd]);
+  const pick = prefix => Object.fromEntries(Object.entries(row)
+    .filter(([k]) => k.startsWith(`${prefix}_`))
+    .map(([k, v]) => [k.slice(prefix.length + 1), v]));
+  return { current: pick('cur'), previous: pick('prev') };
 }
 
+// Lowest or highest scored calls for one agent. The agent's scored calls are
+// collected first (MATERIALIZED); otherwise Postgres may walk every scored call
+// in the company in score order and probe each one, which takes seconds.
+const scoredCallsSql = (direction) => `
+  WITH f AS MATERIALIZED (
+    SELECT fi.*, ca.overall_score AS score
+    FROM files fi JOIN call_analyses ca ON ca.file_path = fi.file_path AND ca.status = 'completed'
+    WHERE fi.agent_email = $1 AND fi.call_date >= $2 AND fi.call_date <= $3 AND ca.overall_score IS NOT NULL
+  )
+  SELECT ${callRowSql('f.score')}
+  FROM f LEFT JOIN reporting r ON r.call_id = f.call_id
+  ORDER BY f.score ${direction}, f.call_date DESC LIMIT 5`;
+
 export async function getAgentDashboard(email, { start, end, prevStart, prevEnd, bucket }) {
-  const [current, previous] = await Promise.all([periodKpis(email, start, end), periodKpis(email, prevStart, prevEnd)]);
+  const { current, previous } = await periodKpis(email, start, end, prevStart, prevEnd);
   const trunc = { day: 'day', week: 'week', month: 'month' }[bucket] || 'day';
   const [trend, dispositions, recent, worst, best] = await Promise.all([
     pool.query(`
@@ -2387,16 +2526,8 @@ export async function getAgentDashboard(email, { start, end, prevStart, prevEnd,
       WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
       ORDER BY f.call_date DESC, f.call_time DESC LIMIT 8
     `, [email, start, end]),
-    pool.query(`
-      SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
-      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3 AND ca.overall_score IS NOT NULL
-      ORDER BY ca.overall_score ASC, f.call_date DESC LIMIT 5
-    `, [email, start, end]),
-    pool.query(`
-      SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
-      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3 AND ca.overall_score IS NOT NULL
-      ORDER BY ca.overall_score DESC, f.call_date DESC LIMIT 5
-    `, [email, start, end])
+    pool.query(scoredCallsSql('ASC'), [email, start, end]),
+    pool.query(scoredCallsSql('DESC'), [email, start, end])
   ]);
   return {
     current,

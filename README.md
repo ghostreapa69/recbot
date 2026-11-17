@@ -52,6 +52,13 @@ RecBot is a production-focused web platform for browsing, filtering, auditing, a
 - **Topics & keywords**: what customers call about, company-wide or for one agent, with change from the previous period
 - **Coaching queue** (managers and admins only): queue calls for one-on-one review, with suggestions for low-scoring calls
 
+### ⚡ Recording Scan & Five9 Matching
+- **Every 5 minutes** the backend lists today's recordings in S3 and inserts only the new ones (existing rows are left alone)
+- **Five9 lookup during the scan**: recordings from the last 6 hours that have a call ID but no Five9 call log row trigger one Five9 Call Log report covering just those calls (at most one every 10 minutes); the regular scheduled Five9 ingestion still runs for the Reports page
+- **Agent and customer on each recording**: the call's Five9 agent email, agent name and customer name are copied onto the recording (falling back to the email in the filename until Five9 has the call), so agent pages filter on an indexed column instead of joining the call log
+- **One-time backfill**: on first start after upgrading, a background job builds the agent index (without locking writes) and fills these columns for existing recordings in batches; it runs again after an admin bulk sync
+- **Slow requests** (500 ms or more) are logged as `⏱️ [SLOW] GET /api/... 812ms`
+
 ## Architecture
 
 ### Backend (Node.js / Express)

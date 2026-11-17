@@ -62,7 +62,7 @@ export function CallRow({ row, extra }) {
       <Box sx={{ minWidth: 0 }}>
         <Typography fontWeight={600} noWrap>{row.customer_name || row.phone || 'Unknown caller'}</Typography>
         <Typography variant="caption" color="text.secondary" noWrap component="div">
-          {[extra, row.campaign, row.disposition, row.duration_ms ? formatMs(row.duration_ms) : null].filter(Boolean).join(' · ')}
+          {[extra, row.disposition, row.duration_ms ? formatMs(row.duration_ms) : null].filter(Boolean).join(' · ')}
         </Typography>
       </Box>
       <ScoreChip score={row.overall_score} pending />

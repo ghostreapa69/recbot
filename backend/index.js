@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import { spawn } from 'child_process';
 import crypto from 'crypto';
 import dayjs from 'dayjs';
@@ -20,11 +21,12 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription, getCallAnalysis, deleteCallAnalysis, getRecordingReport, getAgentDashboard, getAgentScoreHistory, getTeamScoreChange, searchTranscripts, getTrends, listCoachingItems, getCoachingCounts, getCoachingItemForFile, addCoachingItem, updateCoachingItem, getSuggestedCoaching } from './database.js';
+import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription, getCallAnalysis, deleteCallAnalysis, getRecordingReport, insertNewFiles, fillFileAgents, getRecentFilesMissingFive9, runFileAgentBackfill, getAgentDashboard, getAgentScoreHistory, getTeamScoreChange, searchTranscripts, getTrends, listCoachingItems, getCoachingCounts, getCoachingItemForFile, addCoachingItem, updateCoachingItem, getSuggestedCoaching } from './database.js';
 import { computeBadges } from './badges.js';
 import { createAgentDirectory } from './agentDirectory.js';
+import { createRecordingScan } from './recordingScan.js';
 import { startTranscriptionWorker } from './transcription.js';
-import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
+import { fetchLastHourCallLog, fetchCallLog, five9Configured, scheduleRecurringIngestion } from './five9.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -40,6 +42,22 @@ const WAV_DIR = '/data/wav/recordings'; // For reference, not used with S3
 const REPORT_FILTER_FALLBACK_TIMEZONE = process.env.REPORTS_QUERY_TIMEZONE || process.env.FIVE9_TIMEZONE || 'UTC';
 
 app.use(cors());
+// Gzip JSON, HTML, JS and CSS. Audio (audio/wav) isn't compressible, so streams are untouched.
+app.use(compression());
+
+// Logs API requests that take 500ms or more, so slow spots show up in the logs.
+const SLOW_REQUEST_MS = 500;
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  const started = process.hrtime.bigint();
+  res.on('finish', () => {
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    if (ms >= SLOW_REQUEST_MS && !req.path.startsWith('/api/audio/') && !req.path.startsWith('/api/download/')) {
+      console.log(`⏱️ [SLOW] ${req.method} ${req.path} ${res.statusCode} ${Math.round(ms)}ms`);
+    }
+  });
+  next();
+});
 app.use(express.json()); // Parse JSON request bodies
 
 // Configure Express to trust proxies for proper IP extraction
@@ -65,8 +83,6 @@ app.use((req, res, next) => {
   req.realClientIP = candidate;
   req.forwardedChain = xForwardedFor || null; // keep chain for potential later auditing
 
-  // Only verbose-log once per request path for now
-  console.log('🌐 [IP] resolved=%s cf=%s x-real=%s x-forwarded-for=%s node-ip=%s', candidate, cf || '-', xReal || '-', xForwardedFor || '-', req.ip);
   next();
 });
 
@@ -923,6 +939,10 @@ app.get('/api/config', (req, res) => {
 
 // Logout endpoint to track user logout events
 // Middleware to ensure session row exists after requireAuth sets req.user
+// Inactivity timeouts are measured in minutes, so a once-a-minute touch is enough.
+const SESSION_TOUCH_INTERVAL_MS = 60 * 1000;
+const sessionTouchedAt = new Map();
+
 async function ensureSession(req, res, next) {
   try {
     if (!req.user) return next();
@@ -1009,7 +1029,11 @@ async function ensureSession(req, res, next) {
         }
       }
   // Touch activity timestamp for active session
-  await touchUserSession(req.user.id);
+  // At most one last_activity write per user per minute, not one per request.
+  if (Date.now() - (sessionTouchedAt.get(req.user.id) || 0) >= SESSION_TOUCH_INTERVAL_MS) {
+    sessionTouchedAt.set(req.user.id, Date.now());
+    await touchUserSession(req.user.id);
+  }
   req.currentSessionId = openSession.id;
     } else {
       const sessionId = await logUserSession(req.user.id, req.user.email, req.user.ipAddress, req.user.userAgent);
@@ -2328,7 +2352,10 @@ app.post('/api/sync-database', requireAuth, ensureSession, requireAdmin, async (
 
     const endTime = Date.now();
     const duration = (endTime - startTime) / 1000;
-    
+
+    // Copy Five9 agent/customer onto the newly imported recordings, in the background.
+    runFileAgentBackfill({ force: true }).catch(err => console.error('❌ [AGENT BACKFILL] Failed after sync:', err.message));
+
     const stats = await getDatabaseStats();
     
     res.json({
@@ -2729,36 +2756,33 @@ app.get('/api/audit-users', requireAuth, ensureSession, requireAdmin, async (req
 });
 
 // Serve React static files
-app.use(express.static(BUILD_DIR));
+// Hashed bundles under /static never change, so browsers keep them for a year;
+// index.html is always revalidated so a deploy shows up on the next load.
+app.use(express.static(BUILD_DIR, {
+  setHeaders: (res, filePath) => {
+    if (filePath.includes(`${path.sep}static${path.sep}`)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    else if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache');
+  }
+}));
 
 // Fallback: serve index.html for any non-API route
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api/')) {
+    res.setHeader('Cache-Control', 'no-cache');
     res.sendFile(path.join(BUILD_DIR, 'index.html'));
   }
 });
 
-// Auto-sync function for current day
-async function syncCurrentDay() {
-  try {
-    const BUCKET_NAME = process.env.AWS_BUCKET;
-    const today = dayjs().format("M_D_YYYY");
-    const dayPrefix = `recordings/${today}/`;
-    
-    console.log(`🔄 [AUTO-SYNC] Checking current day: ${today}`);
-    
-    const dayFiles = await listWavFilesFromS3(BUCKET_NAME, dayPrefix);
-    
-    if (dayFiles.length > 0) {
-      const indexedCount = await indexFiles(dayFiles);
-      console.log(`✅ [AUTO-SYNC] Indexed ${indexedCount}/${dayFiles.length} files for ${today}`);
-    } else {
-      console.log(`📁 [AUTO-SYNC] No files found for ${today}`);
-    }
-  } catch (error) {
-    console.error(`❌ [AUTO-SYNC] Error during current day sync:`, error.message);
-  }
-}
+// Every 5 minutes: index today's new recordings, fetch their Five9 call log
+// rows if missing, and copy the agent and customer onto each recording.
+const syncCurrentDay = createRecordingScan({
+  listDayFiles: day => listWavFilesFromS3(process.env.AWS_BUCKET, `recordings/${day}/`),
+  insertNewFiles,
+  fillFileAgents,
+  getRecentFilesMissingFive9,
+  fetchCallLog,
+  five9Configured
+});
 
 // Initialize PostgreSQL database and start server
 initializeDatabase().then(() => {
@@ -2778,6 +2802,9 @@ initializeDatabase().then(() => {
     setInterval(syncCurrentDay, 5 * 60 * 1000); // 5 minutes in milliseconds
 
     startTranscriptionWorker({ s3, bucket: process.env.AWS_BUCKET });
+
+    // One-time: index and fill agent columns on existing recordings (no-op once done).
+    runFileAgentBackfill().catch(err => console.error('❌ [AGENT BACKFILL] Failed:', err.message));
 
     // Load the agent list now so the first dropdown doesn't wait for it.
     agentDirectory.refresh().catch(err => console.error('❌ [AGENTS] Initial load failed:', err.message));

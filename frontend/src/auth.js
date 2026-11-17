@@ -10,6 +10,7 @@
 // User info (email + roles) is fetched once via AuthProvider and shared through
 // context so the three components don't each hit the userinfo endpoint.
 
+import { shouldReauthorize } from './reauth';
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { useLogto } from '@logto/react';
 
@@ -148,9 +149,18 @@ function installApiFetchInterceptor() {
 // sessionStorage keys for the re-authorization round-trip (see AuthProvider).
 const REAUTH_DONE_KEY = 'logto_reauthed';
 const REAUTH_PATH_KEY = 'logto_return_path';
+// localStorage: when this browser last re-authorized against Logto.
+const REAUTH_AT_KEY = 'logto_reauth_at';
+function readLastReauth() {
+  try { return Number(localStorage.getItem(REAUTH_AT_KEY)) || null; } catch (e) { return null; }
+}
+
+function writeLastReauth(time) {
+  try { localStorage.setItem(REAUTH_AT_KEY, String(time)); } catch (e) { /* storage unavailable */ }
+}
 
 export function AuthProvider({ children }) {
-  const { isAuthenticated, isLoading, fetchUserInfo, getAccessToken, getIdToken, signIn } = useLogto();
+  const { isAuthenticated, isLoading, fetchUserInfo, getIdTokenClaims, getAccessToken, getIdToken, signIn } = useLogto();
   const [user, setUser] = useState(null);
   const [infoLoaded, setInfoLoaded] = useState(false);
   // Whether the role lookup has completed — gates the unauthorized check so a
@@ -160,8 +170,8 @@ export function AuthProvider({ children }) {
   // Keep the SDK functions in a ref so the effect below can call them without
   // listing them as deps — their identities change every render, and depending
   // on them would re-run the effect (and re-hit /oidc/me + /oidc/token) in a loop.
-  const logtoRef = useRef({ fetchUserInfo, getAccessToken, getIdToken, signIn });
-  logtoRef.current = { fetchUserInfo, getAccessToken, getIdToken, signIn };
+  const logtoRef = useRef({ fetchUserInfo, getIdTokenClaims, getAccessToken, getIdToken, signIn });
+  logtoRef.current = { fetchUserInfo, getIdTokenClaims, getAccessToken, getIdToken, signIn };
 
   // Expose the current ID token to the fetch interceptor and install it once.
   useEffect(() => {
@@ -195,49 +205,55 @@ export function AuthProvider({ children }) {
     if (fetchedRef.current) return;
     fetchedRef.current = true;
 
-    // Re-authorize against Logto once per page load to obtain a token with the
-    // user's CURRENT scopes. A plain refresh can't add scopes granted after
-    // login, so we go through the authorization endpoint — Logto reuses the
-    // active session, making this a fast redirect with no login prompt. Guarded
-    // by a sessionStorage flag so it runs once (not in a loop), and returns to
-    // the same page.
-    if (sessionStorage.getItem(REAUTH_DONE_KEY) !== '1') {
-      try {
-        sessionStorage.setItem(REAUTH_PATH_KEY, window.location.pathname + window.location.search);
-        logtoRef.current.signIn(`${window.location.origin}/callback`);
-        return; // redirecting to Logto for a fresh-scope token
-      } catch (e) {
-        console.warn('Re-authorization failed; continuing with current token', e);
-      }
-    }
-    sessionStorage.removeItem(REAUTH_DONE_KEY);
-
     (async () => {
-      // 1) Load email from userinfo (reliable in the browser) and mark loaded.
-      //    Role is resolved separately below so it can't block rendering.
-      try {
-        const info = await logtoRef.current.fetchUserInfo();
-        setUser(shapeUser(info, undefined));
-      } catch (e) {
-        console.error('Failed to fetch user info from Logto', e);
-        setUser(null);
-      } finally {
-        setInfoLoaded(true);
-      }
-
-      // 2) Resolve role from the fresh access token's `scope` claim. Always
-      //    mark roleResolved so the gate can decide authorized vs. unauthorized.
+      // 1) The access token's role. Usually served from the SDK's cache; at most
+      //    a refresh-token call, never a page reload.
       let role;
       const resource = getApiResource();
       if (resource) {
         try {
-          const token = await logtoRef.current.getAccessToken(resource);
-          role = roleFromAccessToken(token);
+          role = roleFromAccessToken(await logtoRef.current.getAccessToken(resource));
         } catch (e) {
           console.warn('Could not read role from access token', e);
         }
       }
-      setUser(prev => (prev ? { ...prev, publicMetadata: { role } } : prev));
+
+      // 2) Re-authorize against Logto (a redirect that reuses the Logto session,
+      //    no login prompt) only when the token has no role or the last
+      //    re-authorization is over 12 hours old, so role changes still apply.
+      //    Previously this ran on every page load, costing two app loads.
+      const justReauthed = sessionStorage.getItem(REAUTH_DONE_KEY) === '1';
+      sessionStorage.removeItem(REAUTH_DONE_KEY);
+      if (justReauthed) {
+        writeLastReauth(Date.now());
+      } else if (shouldReauthorize({ role, lastReauthAt: readLastReauth() })) {
+        try {
+          sessionStorage.setItem(REAUTH_PATH_KEY, window.location.pathname + window.location.search);
+          logtoRef.current.signIn(`${window.location.origin}/callback`);
+          return; // redirecting to Logto for a fresh-scope token
+        } catch (e) {
+          console.warn('Re-authorization failed; continuing with current token', e);
+        }
+      }
+
+      // 3) Email and name from the ID token's claims (read locally), falling
+      //    back to Logto's userinfo endpoint only if the claims lack an email.
+      let info = null;
+      try {
+        info = await logtoRef.current.getIdTokenClaims();
+      } catch (e) {
+        console.warn('Could not read ID token claims', e);
+      }
+      if (!info?.email) {
+        try {
+          info = await logtoRef.current.fetchUserInfo();
+        } catch (e) {
+          console.error('Failed to fetch user info from Logto', e);
+          info = null;
+        }
+      }
+      setUser(info ? shapeUser(info, role) : null);
+      setInfoLoaded(true);
       setRoleResolved(true);
     })();
     // Intentionally only re-run when auth state changes, not on SDK fn identity.

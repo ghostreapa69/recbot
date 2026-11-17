@@ -451,7 +451,7 @@ export default function RecordingDetail() {
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, minWidth: 0 }}>
                   <Card title="Call details">
                     <KeyValues items={[
-                      ['Campaign', report?.campaign], ['Call type', report?.call_type],
+                      ['Call type', report?.call_type],
                       ['Agent', agentFullName], ['Disposition', report?.disposition || file.call_disposition],
                       ['Duration', durationMs ? formatMs(durationMs) : null], ['Phone', formatPhone(file.phone)],
                       ['DNIS', report?.dnis], ['Call ID', file.call_id]
