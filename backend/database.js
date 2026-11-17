@@ -348,6 +348,62 @@ export async function initializeDatabase() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transcriptions_status ON transcriptions(status);`);
+  // Scriberr replaced AssemblyAI; assemblyai_id stays so older rows remain readable.
+  await pool.query(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS scriberr_id TEXT;`);
+  await pool.query(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;`);
+  // Full-text search over the (already redacted) transcript text.
+  await pool.query(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(transcript_text, ''))) STORED;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transcriptions_search ON transcriptions USING gin (search_tsv);`);
+
+  // AI scorecard for each transcribed call. Scores run -10..10; objection_score is
+  // NULL when the call had no objection, and overall_score averages the rest.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS call_analyses (
+      file_path TEXT PRIMARY KEY REFERENCES transcriptions(file_path) ON DELETE CASCADE,
+      status TEXT NOT NULL,
+      model TEXT,
+      error TEXT,
+      overall_score NUMERIC(4,1),
+      intro_score SMALLINT,
+      retention_score SMALLINT,
+      info_score SMALLINT,
+      sentiment_score SMALLINT,
+      objection_score SMALLINT,
+      control_score SMALLINT,
+      analysis JSONB,
+      stats JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_analyses_overall ON call_analyses(overall_score);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_analyses_created ON call_analyses(created_at);`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS call_topics (
+      file_path TEXT NOT NULL REFERENCES transcriptions(file_path) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      value TEXT NOT NULL,
+      PRIMARY KEY (file_path, kind, value)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_topics_kind_value ON call_topics(kind, value);`);
+
+  // Manager-only coaching queue. Agents are keyed by lowercased email like the other recording tables.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS coaching_items (
+      id SERIAL PRIMARY KEY,
+      file_path TEXT NOT NULL UNIQUE,
+      agent_email TEXT,
+      created_by TEXT NOT NULL,
+      created_by_name TEXT,
+      note TEXT,
+      status TEXT NOT NULL DEFAULT 'to_review',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_coaching_items_status ON coaching_items(status);`);
 
   // Create indexes
   // Migration: add call_disposition column to existing files tables
@@ -709,6 +765,7 @@ export async function queryFiles(filters = {}) {
     callId,
     callDisposition,
     recordingPath,
+    scoreMax,
     favorites,
     mine,
     viewerEmail,
@@ -736,6 +793,10 @@ export async function queryFiles(filters = {}) {
   if (callId) { conditions.push(`call_id LIKE '%' || $${paramIdx++} || '%'`); params.push(callId); }
   if (callDisposition) { conditions.push(`call_disposition = $${paramIdx++}`); params.push(callDisposition); }
   if (recordingPath) { conditions.push(`f.file_path = $${paramIdx++}`); params.push(recordingPath); }
+  if (scoreMax !== undefined && scoreMax !== null && scoreMax !== '' && Number.isFinite(Number(scoreMax))) {
+    conditions.push(`EXISTS (SELECT 1 FROM call_analyses ca WHERE ca.file_path = f.file_path AND ca.overall_score <= $${paramIdx++})`);
+    params.push(Number(scoreMax));
+  }
   if (favorites === 'mine') {
     conditions.push(`EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path AND rf.user_email = $${paramIdx++})`);
     params.push(viewerEmail || null);
@@ -757,11 +818,13 @@ export async function queryFiles(filters = {}) {
     durationMs: 'duration_ms',
     callId: 'call_id',
     callDisposition: 'call_disposition',
-    favoriteCount: 'favorite_count'
+    favoriteCount: 'favorite_count',
+    score: 'overall_score'
   };
   const sortCol = sortMap[sortColumn] || 'call_date';
   const sortDir = sortDirection === 'asc' ? 'ASC' : 'DESC';
-  const orderBy = `ORDER BY ${sortCol} ${sortDir}, call_date DESC, call_time DESC`;
+  // Unscored calls sort after scored ones in either direction.
+  const orderBy = `ORDER BY ${sortCol} ${sortDir}${sortCol === 'overall_score' ? ' NULLS LAST' : ''}, call_date DESC, call_time DESC`;
 
   // Per-viewer columns, bound after the WHERE params so only the data query uses them.
   const viewerParam = `$${paramIdx++}`;
@@ -777,6 +840,7 @@ export async function queryFiles(filters = {}) {
     SELECT file_path, phone, email, call_date, call_time, call_id, call_disposition, duration_ms, file_size,
       (SELECT COUNT(*) FROM recording_favorites rf WHERE rf.file_path = f.file_path)::int AS favorite_count,
       (SELECT COUNT(*) FROM recording_comments rc WHERE rc.file_path = f.file_path)::int AS comment_count,
+      (SELECT ca.overall_score FROM call_analyses ca WHERE ca.file_path = f.file_path AND ca.status = 'completed')::float AS overall_score,
       EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path AND rf.user_email = ${viewerParam}) AS favorited_by_me,
       ${ownedBySql(viewerParam)} AS is_mine
     FROM files f ${whereClause}
@@ -809,6 +873,7 @@ export async function queryFiles(filters = {}) {
       favorite_count: f.favorite_count,
       comment_count: f.comment_count,
       favorited_by_me: f.favorited_by_me,
+      overall_score: f.overall_score ?? null,
       // NULL when files.email is NULL and no reporting row matches.
       is_mine: f.is_mine === true
     })),
@@ -2140,44 +2205,362 @@ export async function getFilesNeedingTranscription(cutoffDate, minDurationMs, li
   return rows.map(r => r.file_path);
 }
 
+// Scriberr jobs still running, plus ones whose redaction failed and should be retried.
 export async function getPendingTranscriptions() {
-  const { rows } = await pool.query(`SELECT file_path, assemblyai_id FROM transcriptions WHERE status = 'processing'`);
+  const { rows } = await pool.query(`
+    SELECT file_path, scriberr_id, attempts FROM transcriptions
+    WHERE status IN ('processing', 'redaction_failed') AND scriberr_id IS NOT NULL
+    ORDER BY updated_at
+  `);
   return rows;
 }
 
-export async function upsertTranscription(filePath, { assemblyaiId = null, status, transcriptText = null, utterances = null, summary = null, error = null }) {
+export async function upsertTranscription(filePath, { scriberrId = null, status, transcriptText = null, utterances = null, summary = null, error = null }) {
   await pool.query(`
-    INSERT INTO transcriptions (file_path, assemblyai_id, status, transcript_text, utterances, summary, error)
+    INSERT INTO transcriptions (file_path, scriberr_id, status, transcript_text, utterances, summary, error)
     VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT (file_path) DO UPDATE SET
-      assemblyai_id = COALESCE(EXCLUDED.assemblyai_id, transcriptions.assemblyai_id),
+      scriberr_id = COALESCE(EXCLUDED.scriberr_id, transcriptions.scriberr_id),
       status = EXCLUDED.status,
       transcript_text = EXCLUDED.transcript_text,
       utterances = EXCLUDED.utterances,
       summary = EXCLUDED.summary,
       error = EXCLUDED.error,
       updated_at = NOW()
-  `, [filePath, assemblyaiId, status, transcriptText, utterances ? JSON.stringify(utterances) : null, summary, error]);
+  `, [filePath, scriberrId, status, transcriptText, utterances ? JSON.stringify(utterances) : null, summary, error]);
 }
 
-export async function getTranscriptionsMissingSummary(limit) {
+// Records a failed redaction without storing any transcript text; returns the attempt count.
+export async function markRedactionFailed(filePath, error, maxAttempts) {
   const { rows } = await pool.query(`
-    SELECT file_path, utterances FROM transcriptions
-    WHERE status = 'completed' AND summary IS NULL AND error LIKE 'Summary failed%'
-      AND jsonb_array_length(utterances) > 0
-    ORDER BY updated_at
+    UPDATE transcriptions
+    SET attempts = attempts + 1,
+        status = CASE WHEN attempts + 1 >= $3 THEN 'error' ELSE 'redaction_failed' END,
+        error = $2, transcript_text = NULL, utterances = NULL, updated_at = NOW()
+    WHERE file_path = $1
+    RETURNING attempts
+  `, [filePath, error, maxAttempts]);
+  return rows[0]?.attempts ?? 0;
+}
+
+// Completed transcripts (Scriberr or older AssemblyAI ones) that have not been scored yet.
+export async function getTranscriptionsNeedingAnalysis(limit) {
+  const { rows } = await pool.query(`
+    SELECT t.file_path, t.scriberr_id, t.utterances FROM transcriptions t
+    LEFT JOIN call_analyses ca ON ca.file_path = t.file_path
+    WHERE t.status = 'completed' AND ca.file_path IS NULL
+      AND t.utterances IS NOT NULL AND jsonb_array_length(t.utterances) > 0
+    ORDER BY t.updated_at DESC
     LIMIT $1
   `, [limit]);
   return rows;
 }
 
-export async function updateTranscriptionSummary(filePath, summary, error) {
-  await pool.query(`UPDATE transcriptions SET summary = $2, error = $3, updated_at = NOW() WHERE file_path = $1`, [filePath, summary, error]);
+export async function saveCallAnalysis(filePath, result, model) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const s = result.scores;
+    await client.query(`
+      INSERT INTO call_analyses (file_path, status, model, error, overall_score, intro_score, retention_score, info_score,
+        sentiment_score, objection_score, control_score, analysis, stats)
+      VALUES ($1, 'completed', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ON CONFLICT (file_path) DO UPDATE SET
+        status = 'completed', model = EXCLUDED.model, error = NULL, overall_score = EXCLUDED.overall_score,
+        intro_score = EXCLUDED.intro_score, retention_score = EXCLUDED.retention_score, info_score = EXCLUDED.info_score,
+        sentiment_score = EXCLUDED.sentiment_score, objection_score = EXCLUDED.objection_score,
+        control_score = EXCLUDED.control_score, analysis = EXCLUDED.analysis, stats = EXCLUDED.stats, updated_at = NOW()
+    `, [filePath, model, result.overall, s.intro, s.retention, s.info, s.sentiment, s.objection, s.control,
+      JSON.stringify(result.analysis), JSON.stringify(result.stats)]);
+    await client.query('DELETE FROM call_topics WHERE file_path = $1', [filePath]);
+    for (const [kind, values] of [['topic', result.topics], ['keyword', result.keywords]]) {
+      for (const value of values) {
+        await client.query('INSERT INTO call_topics (file_path, kind, value) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [filePath, kind, value]);
+      }
+    }
+    // Older AssemblyAI rows keep their summary; new Scriberr rows get it from the analysis.
+    if (result.summary) {
+      await client.query('UPDATE transcriptions SET summary = COALESCE(summary, $2), updated_at = NOW() WHERE file_path = $1', [filePath, result.summary]);
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Failed analyses are not retried automatically; an admin re-score deletes the row.
+export async function saveCallAnalysisError(filePath, error, model) {
+  await pool.query(`
+    INSERT INTO call_analyses (file_path, status, model, error) VALUES ($1, 'error', $2, $3)
+    ON CONFLICT (file_path) DO UPDATE SET status = 'error', model = EXCLUDED.model, error = EXCLUDED.error, updated_at = NOW()
+  `, [filePath, model, error]);
+}
+
+export async function deleteCallAnalysis(filePath) {
+  const { rowCount } = await pool.query('DELETE FROM call_analyses WHERE file_path = $1', [filePath]);
+  await pool.query('DELETE FROM call_topics WHERE file_path = $1', [filePath]);
+  return rowCount > 0;
 }
 
 export async function getTranscription(filePath) {
   const { rows } = await pool.query(`SELECT status, summary, utterances, error FROM transcriptions WHERE file_path = $1`, [filePath]);
   return rows[0] || null;
+}
+
+export async function getCallAnalysis(filePath) {
+  const { rows } = await pool.query(`
+    SELECT status, error, overall_score::float AS overall_score, intro_score, retention_score, info_score, sentiment_score,
+      objection_score, control_score, analysis, stats, updated_at
+    FROM call_analyses WHERE file_path = $1
+  `, [filePath]);
+  if (!rows.length) return null;
+  const { rows: topicRows } = await pool.query('SELECT kind, value FROM call_topics WHERE file_path = $1 ORDER BY kind, value', [filePath]);
+  return {
+    ...rows[0],
+    topics: topicRows.filter(r => r.kind === 'topic').map(r => r.value),
+    keywords: topicRows.filter(r => r.kind === 'keyword').map(r => r.value)
+  };
+}
+
+// ============================================================
+// Agents, dashboard, search, trends, coaching
+// ============================================================
+// An agent is the reporting row's agent email when there is one, else the filename's email.
+const AGENT_SQL = `lower(COALESCE(CASE WHEN r.agent LIKE '%@%' THEN r.agent END, NULLIF(f.email, '')))`;
+const CALLS_FROM = `files f LEFT JOIN reporting r ON r.call_id = f.call_id
+  LEFT JOIN call_analyses ca ON ca.file_path = f.file_path AND ca.status = 'completed'`;
+
+// Columns for a call row in lists (recent, best, worst, search, coaching).
+const CALL_ROW_SQL = `f.file_path, f.call_date, f.call_time, f.phone, f.call_id, f.duration_ms,
+  COALESCE(r.disposition, f.call_disposition) AS disposition, r.customer_name, r.campaign,
+  ${AGENT_SQL} AS agent_email, r.agent_name, ca.overall_score::float AS overall_score`;
+
+export async function getRecordingReport(callId) {
+  if (!callId) return null;
+  const { rows } = await pool.query(`
+    SELECT timestamp, campaign, call_type, agent, agent_name, disposition, ani, customer_name, dnis, call_time,
+      ivr_time, queue_wait_time, ring_time, talk_time, hold_time, park_time, after_call_work_time, transfers, conferences, holds, abandoned
+    FROM reporting WHERE call_id = $1
+  `, [callId]);
+  return rows[0] || null;
+}
+
+export async function listAgents(search = null, limit = 200) {
+  const { rows } = await pool.query(`
+    SELECT ${AGENT_SQL} AS email, MAX(r.agent_name) AS name, COUNT(*)::int AS calls
+    FROM files f LEFT JOIN reporting r ON r.call_id = f.call_id
+    WHERE f.call_date >= to_char(NOW() - INTERVAL '180 days', 'YYYY-MM-DD')
+      AND ${AGENT_SQL} IS NOT NULL
+      AND ($1::text IS NULL OR ${AGENT_SQL} LIKE '%' || lower($1) || '%' OR lower(r.agent_name) LIKE '%' || lower($1) || '%')
+    GROUP BY 1
+    ORDER BY calls DESC
+    LIMIT $2
+  `, [search || null, limit]);
+  return rows;
+}
+
+const SCORE_COLUMNS = ['intro', 'retention', 'info', 'sentiment', 'objection', 'control'];
+
+// Aggregates for one agent between two YYYY-MM-DD dates (inclusive).
+async function periodKpis(email, start, end) {
+  const { rows } = await pool.query(`
+    SELECT COUNT(*)::int AS calls,
+      COUNT(ca.overall_score)::int AS scored,
+      AVG(ca.overall_score)::float AS avg_score,
+      AVG(NULLIF(COALESCE(r.talk_time, 0) + COALESCE(r.hold_time, 0) + COALESCE(r.after_call_work_time, 0), 0))::float AS avg_handle_ms,
+      AVG((ca.stats->>'agentTalkShare')::float) AS avg_talk_share,
+      ${SCORE_COLUMNS.map(c => `AVG(ca.${c}_score)::float AS ${c}`).join(', ')}
+    FROM ${CALLS_FROM}
+    WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
+  `, [email, start, end]);
+  return rows[0];
+}
+
+export async function getAgentDashboard(email, { start, end, prevStart, prevEnd, bucket }) {
+  const [current, previous] = await Promise.all([periodKpis(email, start, end), periodKpis(email, prevStart, prevEnd)]);
+  const trunc = { day: 'day', week: 'week', month: 'month' }[bucket] || 'day';
+  const [trend, dispositions, recent, worst, best] = await Promise.all([
+    pool.query(`
+      SELECT to_char(date_trunc('${trunc}', f.call_date::date), 'YYYY-MM-DD') AS bucket,
+        AVG(ca.overall_score)::float AS avg_score, COUNT(*)::int AS calls
+      FROM ${CALLS_FROM}
+      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
+      GROUP BY 1 ORDER BY 1
+    `, [email, start, end]),
+    pool.query(`
+      SELECT COALESCE(r.disposition, f.call_disposition, 'Unknown') AS disposition, COUNT(*)::int AS calls
+      FROM ${CALLS_FROM}
+      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
+      GROUP BY 1 ORDER BY calls DESC LIMIT 6
+    `, [email, start, end]),
+    pool.query(`
+      SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
+      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
+      ORDER BY f.call_date DESC, f.call_time DESC LIMIT 8
+    `, [email, start, end]),
+    pool.query(`
+      SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
+      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3 AND ca.overall_score IS NOT NULL
+      ORDER BY ca.overall_score ASC, f.call_date DESC LIMIT 5
+    `, [email, start, end]),
+    pool.query(`
+      SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
+      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3 AND ca.overall_score IS NOT NULL
+      ORDER BY ca.overall_score DESC, f.call_date DESC LIMIT 5
+    `, [email, start, end])
+  ]);
+  return {
+    current,
+    previous,
+    trend: trend.rows,
+    dispositions: dispositions.rows,
+    recent: recent.rows,
+    worst: worst.rows,
+    best: best.rows
+  };
+}
+
+// Every scored call for an agent, oldest first, for badge and streak rules.
+export async function getAgentScoreHistory(email) {
+  const { rows } = await pool.query(`
+    SELECT f.call_date, f.call_time, ca.overall_score::float AS overall, ${SCORE_COLUMNS.map(c => `ca.${c}_score AS ${c}`).join(', ')}
+    FROM ${CALLS_FROM}
+    WHERE ${AGENT_SQL} = $1 AND ca.overall_score IS NOT NULL
+    ORDER BY f.call_date, f.call_time
+  `, [email]);
+  return rows;
+}
+
+// Average score per agent for two periods, for the "Most improved" badge.
+export async function getTeamScoreChange(start, end, prevStart, prevEnd) {
+  const { rows } = await pool.query(`
+    SELECT ${AGENT_SQL} AS email,
+      AVG(ca.overall_score) FILTER (WHERE f.call_date >= $1 AND f.call_date <= $2)::float AS current,
+      AVG(ca.overall_score) FILTER (WHERE f.call_date >= $3 AND f.call_date <= $4)::float AS previous
+    FROM ${CALLS_FROM}
+    WHERE ca.overall_score IS NOT NULL AND f.call_date >= $3 AND f.call_date <= $2
+    GROUP BY 1
+  `, [start, end, prevStart, prevEnd]);
+  return rows;
+}
+
+// Full-text search over redacted transcripts. Returns the ms offset of the first
+// matching utterance so the call file can open at that moment.
+export async function searchTranscripts({ q, agent = null, dateStart = null, dateEnd = null, limit = 50, offset = 0 }) {
+  const { rows } = await pool.query(`
+    WITH query AS (SELECT websearch_to_tsquery('english', $1) AS tsq)
+    SELECT ${CALL_ROW_SQL},
+      ts_rank(t.search_tsv, query.tsq) AS rank,
+      ts_headline('english', t.transcript_text, query.tsq,
+        'StartSel=<mark>, StopSel=</mark>, MaxWords=30, MinWords=12, MaxFragments=1') AS snippet,
+      (SELECT (u->>'start')::int FROM jsonb_array_elements(t.utterances) u
+        WHERE to_tsvector('english', u->>'text') @@ query.tsq ORDER BY (u->>'start')::int LIMIT 1) AS match_ms,
+      COUNT(*) OVER()::int AS total
+    FROM transcriptions t
+    JOIN files f ON f.file_path = t.file_path
+    LEFT JOIN reporting r ON r.call_id = f.call_id
+    LEFT JOIN call_analyses ca ON ca.file_path = f.file_path AND ca.status = 'completed'
+    CROSS JOIN query
+    WHERE t.status = 'completed' AND t.search_tsv @@ query.tsq
+      AND ($2::text IS NULL OR ${AGENT_SQL} = lower($2))
+      AND ($3::text IS NULL OR f.call_date >= $3)
+      AND ($4::text IS NULL OR f.call_date <= $4)
+    ORDER BY rank DESC, f.call_date DESC
+    LIMIT $5 OFFSET $6
+  `, [q, agent, dateStart, dateEnd, limit, offset]);
+  return { results: rows.map(({ total, rank, ...row }) => row), total: rows[0]?.total ?? 0 };
+}
+
+export async function getTrends({ email = null, start, end, prevStart, prevEnd, bucket }) {
+  const trunc = { day: 'day', week: 'week', month: 'month' }[bucket] || 'day';
+  const agentFilter = `($5::text IS NULL OR ${AGENT_SQL} = $5)`;
+  const base = `FROM call_topics ct
+    JOIN files f ON f.file_path = ct.file_path
+    LEFT JOIN reporting r ON r.call_id = f.call_id
+    LEFT JOIN call_analyses ca ON ca.file_path = f.file_path AND ca.status = 'completed'`;
+  const counts = kind => pool.query(`
+    SELECT ct.value,
+      COUNT(*) FILTER (WHERE f.call_date >= $1 AND f.call_date <= $2)::int AS calls,
+      COUNT(*) FILTER (WHERE f.call_date >= $3 AND f.call_date <= $4)::int AS prev_calls,
+      AVG(ca.overall_score) FILTER (WHERE f.call_date >= $1 AND f.call_date <= $2)::float AS avg_score
+    ${base}
+    WHERE ct.kind = '${kind}' AND f.call_date >= $3 AND f.call_date <= $2 AND ${agentFilter}
+    GROUP BY ct.value
+    HAVING COUNT(*) FILTER (WHERE f.call_date >= $1 AND f.call_date <= $2) > 0
+    ORDER BY calls DESC
+    LIMIT ${kind === 'topic' ? 20 : 15}
+  `, [start, end, prevStart, prevEnd, email]);
+  const [topics, keywords, overTime] = await Promise.all([
+    counts('topic'),
+    counts('keyword'),
+    pool.query(`
+      SELECT to_char(date_trunc('${trunc}', f.call_date::date), 'YYYY-MM-DD') AS bucket, ct.value, COUNT(*)::int AS calls
+      ${base}
+      WHERE ct.kind = 'topic' AND f.call_date >= $1 AND f.call_date <= $2 AND ($3::text IS NULL OR ${AGENT_SQL} = $3)
+      GROUP BY 1, 2 ORDER BY 1
+    `, [start, end, email])
+  ]);
+  return { topics: topics.rows, keywords: keywords.rows, overTime: overTime.rows };
+}
+
+export async function listCoachingItems({ status = null, agent = null } = {}) {
+  const { rows } = await pool.query(`
+    SELECT ci.id, ci.status, ci.note, ci.created_by, ci.created_by_name, ci.created_at, ci.updated_at, ${CALL_ROW_SQL}
+    FROM coaching_items ci
+    JOIN files f ON f.file_path = ci.file_path
+    LEFT JOIN reporting r ON r.call_id = f.call_id
+    LEFT JOIN call_analyses ca ON ca.file_path = f.file_path AND ca.status = 'completed'
+    WHERE ($1::text IS NULL OR ci.status = $1) AND ($2::text IS NULL OR ci.agent_email = lower($2))
+    ORDER BY ci.updated_at DESC
+  `, [status, agent]);
+  return rows;
+}
+
+export async function getCoachingCounts() {
+  const { rows } = await pool.query(`SELECT status, COUNT(*)::int AS count FROM coaching_items GROUP BY status`);
+  return Object.fromEntries(rows.map(r => [r.status, r.count]));
+}
+
+export async function getCoachingItemForFile(filePath) {
+  const { rows } = await pool.query('SELECT id, status, note FROM coaching_items WHERE file_path = $1', [filePath]);
+  return rows[0] || null;
+}
+
+// Adds a call to the queue (or reopens it); returns the item, or null if the call doesn't exist.
+export async function addCoachingItem(filePath, actor, note) {
+  const { rows } = await pool.query(`
+    INSERT INTO coaching_items (file_path, agent_email, created_by, created_by_name, note)
+    SELECT f.file_path, ${AGENT_SQL}, $2, $3, $4
+    FROM files f LEFT JOIN reporting r ON r.call_id = f.call_id
+    WHERE f.file_path = $1
+    ON CONFLICT (file_path) DO UPDATE SET status = 'to_review', note = COALESCE(EXCLUDED.note, coaching_items.note), updated_at = NOW()
+    RETURNING id, status, note, agent_email
+  `, [filePath, actor.email, actor.name, note]);
+  return rows[0] || null;
+}
+
+export async function updateCoachingItem(id, { status, note }) {
+  const { rows } = await pool.query(`
+    UPDATE coaching_items
+    SET status = COALESCE($2, status), note = COALESCE($3, note), updated_at = NOW()
+    WHERE id = $1
+    RETURNING id, status, note, file_path, agent_email
+  `, [id, status ?? null, note ?? null]);
+  return rows[0] || null;
+}
+
+export async function getSuggestedCoaching(maxScore, sinceDate, limit = 20) {
+  const { rows } = await pool.query(`
+    SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
+    WHERE ca.overall_score <= $1 AND f.call_date >= $2
+      AND NOT EXISTS (SELECT 1 FROM coaching_items ci WHERE ci.file_path = f.file_path)
+    ORDER BY ca.overall_score ASC, f.call_date DESC
+    LIMIT $3
+  `, [maxScore, sinceDate, limit]);
+  return rows;
 }
 
 // ============================================================

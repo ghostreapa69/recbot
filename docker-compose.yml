@@ -94,17 +94,23 @@ services:
       - FIVE9_AUTO_INGEST_MINUTES=5
       - REPORT_TIME_DEBUG=true
 
-      # --- AssemblyAI Transcription & Summaries ---
-      # Leave ASSEMBLYAI_API_KEY unset to disable transcription entirely.
-      #- ASSEMBLYAI_API_KEY=your-assemblyai-api-key-here
+      # --- Scriberr: transcription, PII redaction, summaries and call scores ---
+      # Leave SCRIBERR_URL unset to disable transcription entirely.
+      #- SCRIBERR_URL=https://scriberr.your-domain-here
+      #- SCRIBERR_API_KEY=your-scriberr-api-key-here
+      # Transcription model and language Scriberr should use (blank = Scriberr's default model).
+      #- SCRIBERR_TRANSCRIBE_MODEL=
+      #- SCRIBERR_LANGUAGE=en
+      # LLM configured in Scriberr for redaction, summaries and scoring.
+      #- SCRIBERR_LLM_MODEL=
+      # Optional: how long to wait for one LLM reply (ms); local models can be slow.
+      #- SCRIBERR_LLM_TIMEOUT_MS=600000
       # Only transcribe calls from the last N days...
       - TRANSCRIBE_LOOKBACK_DAYS=7
       # ...that are longer than this many seconds.
       - TRANSCRIBE_MIN_DURATION_SECONDS=50
-      # Optional: comma-separated AssemblyAI redact_pii_policies (defaults shown).
-      # Optional: LLM Gateway model for summaries; must be one your AssemblyAI account has access to.
-      #- TRANSCRIBE_SUMMARY_MODEL=qwen3.5-4b-32k-fast
-      #- TRANSCRIBE_PII_POLICIES=us_social_security_number,date_of_birth,credit_card_number,credit_card_cvv,credit_card_expiration,account_number,banking_information,drivers_license,passport_number,email_address,phone_number,location_address,location_address_street,password
+      # Max recordings submitted, redacted and scored per 5-minute tick (sets the load on the Scriberr GPU).
+      #- TRANSCRIBE_MAX_PER_TICK=10
 
       # --- Optional / Feature Flags ---
       #- EXTRA_LOGGING=true

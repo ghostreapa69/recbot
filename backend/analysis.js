@@ -1,0 +1,290 @@
+// PII redaction, call scoring and transcript stats. The LLM call is passed in
+// (Scriberr's llm()), so everything here can be tested with a fake.
+
+export const CATEGORIES = ['intro', 'retention', 'info', 'sentiment', 'objection', 'control'];
+export const TOPICS = ['Refinance', 'Purchase', 'HELOC', 'Rate shopping', 'Closing costs', 'Document status', 'Payment / escrow', 'Credit', 'Complaint', 'Other'];
+
+const REDACT_CHUNK_LINES = 40;
+const REDACT_CHUNK_CHARS = 12000;
+const MAX_ANALYSIS_TRANSCRIPT_CHARS = parseInt(process.env.ANALYSIS_MAX_TRANSCRIPT_CHARS || '60000', 10);
+
+export const mmss = ms => {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+};
+
+function parseTimestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.round(value));
+  const m = /^\s*(?:(\d+):)?(\d+):(\d{1,2})\s*$/.exec(String(value ?? ''));
+  if (!m) return null;
+  return ((Number(m[1] || 0) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000;
+}
+
+// Pulls the first JSON object out of a model reply (which may wrap it in prose or ``` fences).
+export function extractJson(text) {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end <= start) throw new Error('Reply contained no JSON object');
+  return JSON.parse(text.slice(start, end + 1));
+}
+
+// ------------------------------------------------------------------
+// PII redaction
+// ------------------------------------------------------------------
+const REDACT_PROMPT = `You redact personal information from a mortgage company phone call transcript.
+Replace each piece of personal information with a tag in square brackets:
+[PERSON_NAME] for any person's full or last name (keep the agent's and customer's first names only if they are used alone),
+[SSN], [DATE_OF_BIRTH], [ACCOUNT_NUMBER] (loan, bank, routing, account numbers), [CARD_NUMBER], [CARD_CVV], [CARD_EXPIRATION],
+[PHONE_NUMBER], [EMAIL_ADDRESS], [ADDRESS] (street addresses, unit numbers, zip codes), [DRIVERS_LICENSE], [PASSPORT_NUMBER], [PASSWORD].
+Numbers spoken as words or digit by digit are still personal information.
+Do not change anything else: keep loan amounts, interest rates, dates of appointments, company names and all other words exactly as they are.
+Keep any existing [TAG] placeholders.
+Reply with only JSON in this exact shape, one entry for every input line, using the same "i" numbers:
+{"lines":[{"i":0,"text":"..."}]}
+
+Lines:
+`;
+
+function chunkUtterances(utterances) {
+  const chunks = [];
+  let current = [];
+  let chars = 0;
+  utterances.forEach((u, i) => {
+    if (current.length && (current.length >= REDACT_CHUNK_LINES || chars + u.text.length > REDACT_CHUNK_CHARS)) {
+      chunks.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(i);
+    chars += u.text.length;
+  });
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+// Checks one chunk's reply covers exactly the requested lines; returns { index: text }.
+export function validateRedaction(reply, indexes) {
+  const json = extractJson(reply);
+  if (!Array.isArray(json.lines)) throw new Error('Redaction reply has no "lines" array');
+  const byIndex = new Map();
+  for (const line of json.lines) {
+    if (!Number.isInteger(line?.i) || typeof line.text !== 'string') throw new Error('Redaction reply has a malformed line');
+    byIndex.set(line.i, line.text.trim());
+  }
+  for (const i of indexes) {
+    if (!byIndex.has(i)) throw new Error(`Redaction reply is missing line ${i}`);
+  }
+  if (byIndex.size !== indexes.length) throw new Error(`Redaction reply has ${byIndex.size} lines, expected ${indexes.length}`);
+  return byIndex;
+}
+
+// Returns a redacted copy of the utterances. Timings and speakers come from the input,
+// never from the model. Throws if any chunk can't be redacted, so nothing unredacted is kept.
+export async function redactUtterances(utterances, llm) {
+  const redacted = utterances.map(u => ({ ...u }));
+  for (const indexes of chunkUtterances(utterances)) {
+    const lines = indexes.map(i => JSON.stringify({ i, text: utterances[i].text })).join('\n');
+    let byIndex;
+    try {
+      byIndex = validateRedaction(await llm(REDACT_PROMPT + lines), indexes);
+    } catch (err) {
+      // One retry: small local models sometimes break the JSON format.
+      byIndex = validateRedaction(await llm(REDACT_PROMPT + lines), indexes);
+    }
+    for (const i of indexes) redacted[i].text = byIndex.get(i);
+  }
+  return redacted;
+}
+
+// ------------------------------------------------------------------
+// Transcript stats (no LLM)
+// ------------------------------------------------------------------
+const wordCount = text => (text.match(/\S+/g) || []).length;
+
+// agentSpeaker may be null when it isn't known yet; agent-specific fields are then null.
+export function computeTranscriptStats(utterances, agentSpeaker = null) {
+  const sorted = [...utterances].sort((a, b) => a.start - b.start);
+  const talkMs = {};
+  const words = {};
+  let interruptions = {};
+  let deadAirMs = 0;
+  let longestSilenceMs = 0;
+  let longestMonologueMs = 0;
+  let longestMonologueSpeaker = null;
+  let coveredUntil = sorted.length ? sorted[0].start : 0;
+
+  sorted.forEach((u, idx) => {
+    const dur = Math.max(0, u.end - u.start);
+    talkMs[u.speaker] = (talkMs[u.speaker] || 0) + dur;
+    words[u.speaker] = (words[u.speaker] || 0) + wordCount(u.text);
+    if (dur > longestMonologueMs) {
+      longestMonologueMs = dur;
+      longestMonologueSpeaker = u.speaker;
+    }
+    if (idx > 0) {
+      const gap = u.start - coveredUntil;
+      if (gap > 0) {
+        // Pauses under 2s are normal turn-taking, not dead air.
+        if (gap >= 2000) deadAirMs += gap;
+        longestSilenceMs = Math.max(longestSilenceMs, gap);
+      } else if (gap < 0 && sorted[idx - 1].speaker !== u.speaker) {
+        // Started speaking before the other speaker finished.
+        interruptions[u.speaker] = (interruptions[u.speaker] || 0) + 1;
+      }
+    }
+    coveredUntil = Math.max(coveredUntil, u.end);
+  });
+
+  const callMs = sorted.length ? coveredUntil - sorted[0].start : 0;
+  const totalTalk = Object.values(talkMs).reduce((a, b) => a + b, 0) || 1;
+  const share = {};
+  const wpm = {};
+  for (const speaker of Object.keys(talkMs)) {
+    share[speaker] = Math.round((talkMs[speaker] / totalTalk) * 100);
+    wpm[speaker] = talkMs[speaker] ? Math.round(words[speaker] / (talkMs[speaker] / 60000)) : 0;
+  }
+  const customer = agentSpeaker ? Object.keys(talkMs).find(s => s !== agentSpeaker) || null : null;
+  return {
+    callMs,
+    turns: sorted.length,
+    talkShare: share,
+    wordsPerMinute: wpm,
+    interruptions,
+    deadAirMs,
+    longestSilenceMs,
+    longestMonologueMs,
+    longestMonologueSpeaker,
+    agentSpeaker,
+    agentTalkShare: agentSpeaker ? share[agentSpeaker] ?? 0 : null,
+    customerTalkShare: customer ? share[customer] ?? 0 : null,
+    silenceShare: callMs ? Math.max(0, Math.round(((callMs - Math.min(callMs, totalTalk)) / callMs) * 100)) : 0,
+    agentWpm: agentSpeaker ? wpm[agentSpeaker] ?? 0 : null,
+    agentInterruptions: agentSpeaker ? interruptions[agentSpeaker] || 0 : null
+  };
+}
+
+// ------------------------------------------------------------------
+// Call analysis (summary + scores in one request)
+// ------------------------------------------------------------------
+const ANALYSIS_PROMPT = `You review phone calls for a mortgage company's quality team. Speakers are labelled by diarization ("Speaker A", "Speaker B"); one is the company's agent (loan officer or processor) and one is the customer. Personal information has been replaced with placeholders like [PHONE_NUMBER]; keep them as-is and never guess what they contain.
+
+Score the AGENT's performance from -10 (worst) to +10 (best) in each category. 0 means average or mixed.
+- intro (Introduction): +10 = greets warmly, gives full name and company, NMLS ID if applicable, recording disclosure, asks the customer's name, states the purpose. -10 = no name, no company, no disclosure, rude or abrupt opening.
+- retention (Client retention): +10 = keeps the customer engaged, builds trust, sets a concrete next step (appointment, application, documents). -10 = customer leaves unhappy or goes elsewhere and the agent makes no attempt to keep them.
+- info (Information gathered): +10 = collects the details needed (purpose, occupancy, balance, rate, income, credit, timeline, contact preference) before advising. -10 = asks nothing useful or gives advice blind.
+- sentiment (Average client sentiment): the customer's mood across the whole call. +10 = consistently positive, grateful. -10 = angry or distressed throughout.
+- objection (Objection handling): only if the customer raised a concern, doubt or pushback. +10 = acknowledges it, answers it with facts, confirms it is resolved. -10 = ignores, dismisses or argues. If there was no objection, set "present": false and "score": 0.
+- control (Call control & professionalism): +10 = leads the call with clear questions, polite and professional language, good hold etiquette, little dead air, no talking over the customer. -10 = rambling, unprofessional language, long dead air, constant interrupting. Use the measured stats below as evidence.
+
+For each category give a one-sentence reason and a short exact quote from the transcript with its timestamp.
+
+Also give:
+- agent_speaker: the letter of the agent's speaker label
+- summary: 3-6 short bullet points (purpose, key details, outcome, next steps)
+- call_reason and outcome: one short phrase each
+- topics: 1-3 values chosen ONLY from this list: ${TOPICS.join(', ')}
+- keywords: up to 5 short lowercase phrases that characterise the call (e.g. "rate lock", "break-even")
+- key_moments: up to 6 {"at":"m:ss","label":"..."}
+- objections: [{"at":"m:ss","text":"...","handled":true|false}]
+- action_items: short strings
+- sentiment_timeline: about 8-10 points spread across the call, {"at":"m:ss","score":-1.0..1.0} for the customer's sentiment
+- coaching_tips: 2-3 short, specific tips for the agent
+
+Reply with only JSON in this exact shape:
+{"agent_speaker":"A","summary":["..."],"call_reason":"...","outcome":"...",
+"scores":{"intro":{"score":0,"reason":"...","quote":"...","at":"0:00"},"retention":{...},"info":{...},"sentiment":{...},"objection":{"present":true,"score":0,"reason":"...","quote":"...","at":"0:00"},"control":{...}},
+"topics":["..."],"keywords":["..."],"key_moments":[],"objections":[],"action_items":[],"sentiment_timeline":[],"coaching_tips":[]}
+`;
+
+export function buildAnalysisPrompt(utterances) {
+  const stats = computeTranscriptStats(utterances);
+  let transcript = utterances.map(u => `[${mmss(u.start)}] Speaker ${u.speaker}: ${u.text}`).join('\n');
+  if (transcript.length > MAX_ANALYSIS_TRANSCRIPT_CHARS) {
+    transcript = `${transcript.slice(0, MAX_ANALYSIS_TRANSCRIPT_CHARS)}\n[transcript truncated]`;
+  }
+  const measured = [
+    `Call length ${mmss(stats.callMs)}, ${stats.turns} turns`,
+    `Talk share by speaker: ${Object.entries(stats.talkShare).map(([s, p]) => `${s} ${p}%`).join(', ')}`,
+    `Words per minute: ${Object.entries(stats.wordsPerMinute).map(([s, w]) => `${s} ${w}`).join(', ')}`,
+    `Interruptions (started before the other finished): ${Object.entries(stats.interruptions).map(([s, n]) => `${s} ${n}`).join(', ') || 'none'}`,
+    `Dead air (pauses of 2s or more): ${mmss(stats.deadAirMs)} total, longest silence ${mmss(stats.longestSilenceMs)}`
+  ].join('\n');
+  return `${ANALYSIS_PROMPT}\nMeasured stats:\n${measured}\n\nTranscript:\n${transcript}`;
+}
+
+const clampScore = value => {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) throw new Error(`Score is not a number: ${value}`);
+  return Math.max(-10, Math.min(10, n));
+};
+const str = (value, max = 500) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
+const strList = (value, maxItems, maxLen = 300) => (Array.isArray(value) ? value.map(v => str(v, maxLen)).filter(Boolean).slice(0, maxItems) : []);
+
+// Validates and normalises the model's JSON. Scores are clamped to -10..10 and the
+// overall score is computed here as the plain average of the categories that apply.
+export function validateAnalysis(json, utterances) {
+  const speakers = new Set(utterances.map(u => u.speaker));
+  const agentSpeaker = speakers.has(String(json.agent_speaker || '').trim().toUpperCase())
+    ? String(json.agent_speaker).trim().toUpperCase()
+    : utterances[0]?.speaker || null; // the agent usually speaks first on a recorded line
+
+  if (!json.scores || typeof json.scores !== 'object') throw new Error('Analysis has no "scores" object');
+  const scores = {};
+  const categories = {};
+  for (const key of CATEGORIES) {
+    const raw = json.scores[key];
+    if (!raw || typeof raw !== 'object') throw new Error(`Analysis is missing the "${key}" score`);
+    const present = key === 'objection' ? raw.present !== false : true;
+    scores[key] = present ? clampScore(raw.score) : null;
+    categories[key] = {
+      score: scores[key],
+      reason: str(raw.reason),
+      quote: str(raw.quote, 300),
+      atMs: parseTimestamp(raw.at),
+      ...(key === 'objection' ? { present } : {})
+    };
+  }
+  const applicable = CATEGORIES.map(k => scores[k]).filter(v => v !== null);
+  const overall = Math.round((applicable.reduce((a, b) => a + b, 0) / applicable.length) * 10) / 10;
+
+  const timed = (list, max, fields) => (Array.isArray(list) ? list : [])
+    .map(item => ({ atMs: parseTimestamp(item?.at), ...fields(item || {}) }))
+    .filter(item => item.atMs !== null)
+    .slice(0, max);
+
+  const summaryList = Array.isArray(json.summary) ? strList(json.summary, 8) : strList([json.summary], 1, 2000);
+  const allowedTopics = new Map(TOPICS.map(t => [t.toLowerCase(), t]));
+  const topics = [...new Set(strList(json.topics, 3).map(t => allowedTopics.get(t.toLowerCase())).filter(Boolean))];
+
+  return {
+    overall,
+    scores,
+    summary: summaryList.length ? summaryList.map(s => `- ${s.replace(/^[-•*]\s*/, '')}`).join('\n') : null,
+    topics: topics.length ? topics : ['Other'],
+    keywords: [...new Set(strList(json.keywords, 5, 60).map(k => k.toLowerCase()))],
+    agentSpeaker,
+    analysis: {
+      agentSpeaker,
+      callReason: str(json.call_reason, 200),
+      outcome: str(json.outcome, 200),
+      categories,
+      keyMoments: timed(json.key_moments, 6, m => ({ label: str(m.label, 120) })).filter(m => m.label),
+      objections: timed(json.objections, 10, o => ({ text: str(o.text, 300), handled: Boolean(o.handled) })).filter(o => o.text),
+      actionItems: strList(json.action_items, 10),
+      sentimentTimeline: timed(json.sentiment_timeline, 12, p => ({ score: Math.max(-1, Math.min(1, Number(p.score) || 0)) })),
+      coachingTips: strList(json.coaching_tips, 3)
+    }
+  };
+}
+
+// Runs the analysis request, retrying once if the reply can't be parsed or validated.
+export async function analyzeCall(utterances, llm) {
+  const prompt = buildAnalysisPrompt(utterances);
+  let result;
+  try {
+    result = validateAnalysis(extractJson(await llm(prompt)), utterances);
+  } catch (err) {
+    result = validateAnalysis(extractJson(await llm(prompt)), utterances);
+  }
+  return { ...result, stats: computeTranscriptStats(utterances, result.agentSpeaker) };
+}

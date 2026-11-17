@@ -20,7 +20,8 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription } from './database.js';
+import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription, getCallAnalysis, deleteCallAnalysis, getRecordingReport, listAgents, getAgentDashboard, getAgentScoreHistory, getTeamScoreChange, searchTranscripts, getTrends, listCoachingItems, getCoachingCounts, getCoachingItemForFile, addCoachingItem, updateCoachingItem, getSuggestedCoaching } from './database.js';
+import { computeBadges } from './badges.js';
 import { startTranscriptionWorker } from './transcription.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
@@ -1724,6 +1725,7 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
       timeEnd,
       callId: req.query.callId ? req.query.callId.trim() : null,
       callDisposition: req.query.callDisposition?.trim() || null,
+      scoreMax: req.query.scoreMax ?? null,
       // Favorites views, "Only my calls" and single-recording links. The
       // viewer's email always comes from the token, never the query string.
       recordingPath: readRecordingPath(req.query.path),
@@ -1750,6 +1752,7 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
         favoriteCount: f.favorite_count,
         commentCount: f.comment_count,
         favoritedByMe: f.favorited_by_me,
+        overallScore: f.overall_score,
         isMine: f.is_mine,
         // Members may favorite only their own calls; anyone may remove their own favorite.
         canFavorite: req.user.role !== 'member' || f.is_mine || f.favorited_by_me
@@ -1881,6 +1884,218 @@ app.get('/api/recordings/transcript', requireAuth, ensureSession, requireAuthent
     res.json(transcription || { status: 'none' });
   } catch (err) {
     console.error('Error in /api/recordings/transcript:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Everything the call file page shows, in one request.
+app.get('/api/recordings/detail', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.query.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+
+    const actor = recordingActor(req);
+    const [report, transcription, analysis, activity, coaching] = await Promise.all([
+      getRecordingReport(context.file.call_id),
+      getTranscription(recordingPath),
+      getCallAnalysis(recordingPath),
+      getRecordingActivity(recordingPath),
+      isModerator(actor.role) ? getCoachingItemForFile(recordingPath) : null
+    ]);
+    const isMine = context.ownerEmails.includes(actor.email);
+    const favoritedByMe = activity.favorites.some(f => f.user_email === actor.email);
+    await auditRecordingAction(req, 'VIEW_RECORDING', recordingPath, context.file);
+    res.json({
+      file: context.file,
+      report,
+      transcription: transcription || { status: 'none' },
+      analysis,
+      activity: {
+        favoriteCount: activity.favorites.length,
+        favoritedByMe,
+        isMine,
+        canFavorite: actor.role !== 'member' || isMine || favoritedByMe,
+        favorites: activity.favorites.map(f => ({ userEmail: f.user_email, userName: f.user_name, userRole: f.user_role, createdAt: f.created_at })),
+        comments: activity.comments.map(c => toCommentResponse(c, actor))
+      },
+      // Only managers and admins learn whether a call is in the coaching queue.
+      coaching: isModerator(actor.role) ? coaching : undefined
+    });
+  } catch (err) {
+    console.error('Error in /api/recordings/detail:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Deletes the call's scorecard so the transcription worker scores it again on its next tick.
+app.post('/api/recordings/analysis/rescore', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.body?.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+    const deleted = await deleteCallAnalysis(recordingPath);
+    await auditRecordingAction(req, 'RESCORE_RECORDING', recordingPath, context.file);
+    res.json({ queued: deleted });
+  } catch (err) {
+    console.error('Error in /api/recordings/analysis/rescore:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// Agent home, search, trends, coaching
+// ============================================================
+const APP_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
+
+// Current and previous period for a Week/Month/Year toggle, as YYYY-MM-DD strings.
+// Week: last 7 days by day; Month: last 5 weeks by week; Year: last 12 months by month.
+function periodFor(range) {
+  const today = dayjs().tz(APP_TIMEZONE).startOf('day');
+  let start;
+  let bucket;
+  if (range === 'year') {
+    start = today.startOf('month').subtract(11, 'month');
+    bucket = 'month';
+  } else if (range === 'month') {
+    start = today.subtract(34, 'day');
+    bucket = 'week';
+  } else {
+    start = today.subtract(6, 'day');
+    bucket = 'day';
+  }
+  const days = today.diff(start, 'day') + 1;
+  const prevEnd = start.subtract(1, 'day');
+  const prevStart = prevEnd.subtract(days - 1, 'day');
+  const fmt = d => d.format('YYYY-MM-DD');
+  return { start: fmt(start), end: fmt(today), prevStart: fmt(prevStart), prevEnd: fmt(prevEnd), bucket, range: ['week', 'month', 'year'].includes(range) ? range : 'week' };
+}
+
+const readEmail = value => (typeof value === 'string' && value.includes('@') && value.length <= 320 ? value.trim().toLowerCase() : null);
+const readDate = value => (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null);
+
+app.get('/api/agents', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const search = typeof req.query.search === 'string' && req.query.search.trim() ? req.query.search.trim().slice(0, 100) : null;
+    res.json({ agents: await listAgents(search) });
+  } catch (err) {
+    console.error('Error in /api/agents:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Everyone may view any agent's home page; it defaults to the signed-in user.
+app.get('/api/agents/dashboard', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const email = readEmail(req.query.email) || req.user.email.toLowerCase();
+    const period = periodFor(req.query.range);
+    const week = periodFor('week');
+    const [dashboard, history, teamChange] = await Promise.all([
+      getAgentDashboard(email, period),
+      getAgentScoreHistory(email),
+      getTeamScoreChange(week.start, week.end, week.prevStart, week.prevEnd)
+    ]);
+    res.json({ email, period, ...dashboard, ...computeBadges({ email, history, teamChange }) });
+  } catch (err) {
+    console.error('Error in /api/agents/dashboard:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/search/transcripts', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 200) : '';
+    if (!q) return res.json({ results: [], total: 0 });
+    const result = await searchTranscripts({
+      q,
+      agent: readEmail(req.query.agent),
+      dateStart: readDate(req.query.dateStart),
+      dateEnd: readDate(req.query.dateEnd),
+      limit: Math.min(parseInt(req.query.limit, 10) || 50, 100),
+      offset: Math.max(parseInt(req.query.offset, 10) || 0, 0)
+    });
+    await logAuditEvent(req.user.id, req.user.email, 'SEARCH_TRANSCRIPTS', null, null, req.user.ipAddress, req.user.userAgent,
+      req.currentSessionId || null, { userRole: req.user.role, query: q, total: result.total });
+    res.json(result);
+  } catch (err) {
+    console.error('Error in /api/search/transcripts:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/trends', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const period = periodFor(req.query.range);
+    const email = req.query.scope === 'agent' ? (readEmail(req.query.email) || req.user.email.toLowerCase()) : null;
+    res.json({ period, email, ...(await getTrends({ email, ...period })) });
+  } catch (err) {
+    console.error('Error in /api/trends:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const COACHING_STATUSES = ['to_review', 'coached', 'dismissed'];
+const COACHING_NOTE_MAX_LENGTH = 2000;
+const COACHING_SUGGEST_MAX_SCORE = -3;
+const COACHING_SUGGEST_DAYS = 14;
+
+app.get('/api/coaching', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const status = COACHING_STATUSES.includes(req.query.status) ? req.query.status : null;
+    const [items, counts] = await Promise.all([
+      listCoachingItems({ status, agent: readEmail(req.query.agent) }),
+      getCoachingCounts()
+    ]);
+    res.json({ items, counts });
+  } catch (err) {
+    console.error('Error in /api/coaching:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/coaching/suggested', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const since = dayjs().tz(APP_TIMEZONE).subtract(COACHING_SUGGEST_DAYS, 'day').format('YYYY-MM-DD');
+    res.json({ items: await getSuggestedCoaching(COACHING_SUGGEST_MAX_SCORE, since), maxScore: COACHING_SUGGEST_MAX_SCORE, days: COACHING_SUGGEST_DAYS });
+  } catch (err) {
+    console.error('Error in /api/coaching/suggested:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/coaching', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.body?.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, COACHING_NOTE_MAX_LENGTH) || null : null;
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+    const item = await addCoachingItem(recordingPath, recordingActor(req), note);
+    await auditRecordingAction(req, 'COACHING_ADD', recordingPath, context.file, { coachingId: item.id });
+    res.json({ item });
+  } catch (err) {
+    console.error('Error in POST /api/coaching:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/coaching/:id', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+    const status = req.body?.status === undefined ? undefined : req.body.status;
+    if (status !== undefined && !COACHING_STATUSES.includes(status)) return res.status(400).json({ error: `status must be one of ${COACHING_STATUSES.join(', ')}` });
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, COACHING_NOTE_MAX_LENGTH) : undefined;
+    const item = await updateCoachingItem(id, { status, note });
+    if (!item) return res.status(404).json({ error: 'Coaching item not found' });
+    const context = await getRecordingContext(item.file_path);
+    await auditRecordingAction(req, 'COACHING_UPDATE', item.file_path, context?.file || null, { coachingId: id, status: item.status });
+    res.json({ item });
+  } catch (err) {
+    console.error('Error in POST /api/coaching/:id:', err);
     res.status(500).json({ error: err.message });
   }
 });
