@@ -3,7 +3,7 @@ import dayjs from 'dayjs';
 import utcPlugin from 'dayjs/plugin/utc.js';
 import timezonePlugin from 'dayjs/plugin/timezone.js';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
-import { getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription } from './database.js';
+import { pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription } from './database.js';
 
 dayjs.extend(utcPlugin);
 dayjs.extend(timezonePlugin);
@@ -21,6 +21,8 @@ const TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
 
 const INTERVAL_MS = 5 * 60 * 1000;
 const MAX_SUBMISSIONS_PER_TICK = 10;
+// Postgres advisory lock key: only one container runs a tick at a time.
+const TRANSCRIBE_LOCK_KEY = 727001;
 const SUMMARY_MODEL = 'claude-haiku-5-5';
 const API_BASE = 'https://api.assemblyai.com/v2';
 const LLM_GATEWAY_URL = 'https://llm-gateway.assemblyai.com/v1/chat/completions';
@@ -120,13 +122,22 @@ export function startTranscriptionWorker({ s3, bucket }) {
   const tick = async () => {
     if (isRunning) return;
     isRunning = true;
+    let client;
+    let locked = false;
     try {
+      // Every container runs this worker. The lock stops two of them submitting
+      // the same recording; it's freed automatically if this connection dies.
+      client = await pool.connect();
+      ({ rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [TRANSCRIBE_LOCK_KEY]));
+      if (!locked) return;
       const completed = await pollPending();
       const { submitted, failed } = await submitNew(s3, bucket);
       console.log(`📝 [TRANSCRIBE] completed=${completed} submitted=${submitted} failed=${failed}`);
     } catch (err) {
       console.error('❌ [TRANSCRIBE] Tick failed:', err.message);
     } finally {
+      if (locked) await client.query('SELECT pg_advisory_unlock($1)', [TRANSCRIBE_LOCK_KEY]).catch(() => {});
+      client?.release();
       isRunning = false;
     }
   };
