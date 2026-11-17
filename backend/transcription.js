@@ -72,17 +72,68 @@ async function submitRecording(s3, bucket, filePath) {
   return data.id;
 }
 
+// LLM Gateway tokens-per-minute limit, learned from its X-RateLimit-* headers. Each request
+// reserves its prompt tokens + max_tokens, so we pause instead of bursting into 429s.
+const SUMMARY_MAX_TOKENS = 400;
+const RATE_LIMITED_ERROR = 'Summary failed: rate limited, will retry';
+const rateLimit = { pausedUntil: 0, limitTokens: null, remainingTokens: null, resetAt: 0 };
+
+class RateLimitedError extends Error {}
+
+const estimateTokens = text => Math.ceil(text.length / 4) + SUMMARY_MAX_TOKENS;
+
+function readRateHeaders(responseHeaders = {}) {
+  const limit = parseInt(responseHeaders['x-ratelimit-limit-tokens'], 10);
+  const remaining = parseInt(responseHeaders['x-ratelimit-remaining-tokens'], 10);
+  const resetSeconds = parseFloat(responseHeaders['x-ratelimit-reset-tokens']);
+  if (!isNaN(limit)) rateLimit.limitTokens = limit;
+  rateLimit.remainingTokens = isNaN(remaining) ? null : remaining;
+  rateLimit.resetAt = Date.now() + (isNaN(resetSeconds) ? 60 : resetSeconds) * 1000;
+}
+
+function pauseSummaries(seconds, reason) {
+  rateLimit.pausedUntil = Date.now() + seconds * 1000;
+  console.warn(`⏸️ [TRANSCRIBE] Summaries ${reason} (limit=${rateLimit.limitTokens ?? 'unknown'} tokens/min), pausing ${Math.ceil(seconds)}s`);
+}
+
 // Summarizes the already-redacted transcript, so the summary never sees PII.
 async function summarize(utterances) {
+  if (Date.now() < rateLimit.pausedUntil) throw new RateLimitedError();
   let transcript = utterances.map(u => `Speaker ${u.speaker}: ${u.text}`).join('\n');
-  if (transcript.length > MAX_SUMMARY_TRANSCRIPT_CHARS) {
-    transcript = `${transcript.slice(0, MAX_SUMMARY_TRANSCRIPT_CHARS)}\n[transcript truncated]`;
+  // Cap to the model's context and, once known, to 80% of the per-minute budget,
+  // so one long call can't exceed the whole limit and fail forever.
+  let maxChars = MAX_SUMMARY_TRANSCRIPT_CHARS;
+  if (rateLimit.limitTokens) {
+    maxChars = Math.min(maxChars, Math.max(0, (Math.floor(rateLimit.limitTokens * 0.8) - estimateTokens(SUMMARY_PROMPT)) * 4));
   }
-  const { data } = await axios.post(LLM_GATEWAY_URL, {
-    model: SUMMARY_MODEL,
-    messages: [{ role: 'user', content: `${SUMMARY_PROMPT}\n\nTranscript:\n${transcript}` }],
-    max_tokens: 1000
-  }, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  if (transcript.length > maxChars) {
+    transcript = `${transcript.slice(0, maxChars)}\n[transcript truncated]`;
+  }
+  const content = `${SUMMARY_PROMPT}\n\nTranscript:\n${transcript}`;
+  if (rateLimit.remainingTokens != null && Date.now() < rateLimit.resetAt
+      && rateLimit.remainingTokens < estimateTokens(content)) {
+    // Not enough budget left in this window: wait for it to reset.
+    pauseSummaries((rateLimit.resetAt - Date.now()) / 1000, 'near token limit');
+    throw new RateLimitedError();
+  }
+  let response;
+  try {
+    response = await axios.post(LLM_GATEWAY_URL, {
+      model: SUMMARY_MODEL,
+      messages: [{ role: 'user', content }],
+      max_tokens: SUMMARY_MAX_TOKENS
+    }, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  } catch (err) {
+    if (err.response?.status === 429) {
+      readRateHeaders(err.response.headers);
+      const retryAfter = parseFloat(err.response.headers?.['retry-after']);
+      pauseSummaries(isNaN(retryAfter) ? 60 : retryAfter, 'rate limited');
+      throw new RateLimitedError();
+    }
+    throw err;
+  }
+  const { data } = response;
+  readRateHeaders(response.headers);
   console.log(`📝 [TRANSCRIBE] Summary generated request_id=${data.request_id}`);
   // Drop any reasoning block the model emits before its answer.
   return data.choices[0].message.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
@@ -108,8 +159,9 @@ async function pollPending() {
         summary = utterances.length ? await summarize(utterances) : null;
       } catch (err) {
         // Keep the transcript; a failed summary must not leave the row stuck in 'processing'.
-        error = `Summary failed: ${apiError(err)}`;
-        console.error(`❌ [TRANSCRIBE] ${error} (${row.file_path})`);
+        // Rate-limited ones are picked up later by retryMissingSummaries.
+        error = err instanceof RateLimitedError ? RATE_LIMITED_ERROR : `Summary failed: ${apiError(err)}`;
+        if (!(err instanceof RateLimitedError)) console.error(`❌ [TRANSCRIBE] ${error} (${row.file_path})`);
       }
       await upsertTranscription(row.file_path, { status: 'completed', transcriptText: data.text, utterances, summary, error });
       console.log(`📝 [TRANSCRIBE] Completed ${row.file_path} id=${row.assemblyai_id} summary=${summary ? 'yes' : 'no'}`);
@@ -125,10 +177,12 @@ async function pollPending() {
 async function retryMissingSummaries() {
   let fixed = 0;
   for (const row of await getTranscriptionsMissingSummary(MAX_SUBMISSIONS_PER_TICK)) {
+    if (Date.now() < rateLimit.pausedUntil) break; // leave the rest as-is until the window resets
     try {
       await updateTranscriptionSummary(row.file_path, await summarize(row.utterances), null);
       fixed++;
     } catch (err) {
+      if (err instanceof RateLimitedError) break;
       const error = `Summary failed: ${apiError(err)}`;
       await updateTranscriptionSummary(row.file_path, null, error);
       console.error(`❌ [TRANSCRIBE] ${error} (${row.file_path})`);
