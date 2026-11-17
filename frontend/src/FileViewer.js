@@ -40,7 +40,6 @@ import StopIcon from "@mui/icons-material/Stop";
 import VolumeUpIcon from "@mui/icons-material/VolumeUp";
 import FastForwardIcon from "@mui/icons-material/FastForward";
 import FastRewindIcon from "@mui/icons-material/FastRewind";
-import DownloadIcon from "@mui/icons-material/Download";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import StarIcon from "@mui/icons-material/Star";
 import StarBorderIcon from "@mui/icons-material/StarBorder";
@@ -49,10 +48,11 @@ import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
 import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { TimePicker } from "@mui/x-date-pickers/TimePicker";
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import dayjs from "dayjs";
 import customParseFormat from 'dayjs/plugin/customParseFormat';
-import RecordingActivityDrawer, { ACTIVITY_DRAWER_WIDTH } from './RecordingActivityDrawer';
+import { rememberCallQueue } from './RecordingDetail';
+import { ScoreChip, recordingUrl } from './ui';
 import { requestNotificationsRefresh } from './NotificationBell';
 
 dayjs.extend(customParseFormat);
@@ -72,7 +72,8 @@ function normalizeFile(rec) {
     favoriteCount: Number(rec.favoriteCount) || 0,
     commentCount: Number(rec.commentCount) || 0,
     favoritedByMe: Boolean(rec.favoritedByMe),
-    canFavorite: Boolean(rec.canFavorite)
+    canFavorite: Boolean(rec.canFavorite),
+    overallScore: rec.overallScore ?? null
   };
 }
 
@@ -85,7 +86,9 @@ function formatDuration(ms) {
 
 const DATE_PARAM_FORMATS = ['M_D_YYYY', 'M-D-YYYY', 'MM-DD-YYYY', 'YYYY-MM-DD', 'M/D/YYYY', 'MM/DD/YYYY'];
 const TIME_PARAM_FORMATS = ['h:mm A', 'hh:mm A', 'H:mm', 'HH:mm'];
-const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId', 'callDisposition', 'favoriteCount']);
+const ALLOWED_SORT_COLUMNS = new Set(['date', 'time', 'phone', 'email', 'durationMs', 'size', 'callId', 'callDisposition', 'favoriteCount', 'score']);
+// "Low scores" shows calls at or below this overall score.
+const LOW_SCORE_MAX = -3;
 const PLAYBACK_RATE_OPTIONS = [0.5, 1, 1.25, 1.5, 2];
 // Views besides the default 'all': the viewer's own favorites, and every favorited call ranked by count.
 const VIEW_VALUES = new Set(['favorites', 'top']);
@@ -141,6 +144,7 @@ function FileViewer({ darkMode }) {
   const { user, isLoaded } = useUser();
   const { getToken } = useAuth();
   const location = useLocation();
+  const navigate = useNavigate();
   const [files, setFiles] = useState([]);
   const [playing, setPlaying] = useState(null);
   const [currentTrack, setCurrentTrack] = useState(null);
@@ -184,15 +188,13 @@ function FileViewer({ darkMode }) {
   // 'all' recordings, the viewer's 'favorites', or the 'top' (most favorited) calls.
   const [view, setView] = useState('all');
   const [onlyMine, setOnlyMine] = useState(false);
+  const [lowScoreOnly, setLowScoreOnly] = useState(false);
   // fetchFiles reads the view from this ref, so every call site — including
   // debounced timers holding stale closures — uses the current one. Change the
   // view only through updateView().
-  const viewRef = React.useRef({ view: 'all', onlyMine: false });
+  const viewRef = React.useRef({ view: 'all', onlyMine: false, lowScoreOnly: false });
   // Recording shown by a ?recording= link. It is a one-off lookup: any other fetch clears it.
   const [focusedPath, setFocusedPath] = useState(null);
-  // Row shown in the comments side panel, which is open whenever this is set.
-  const [activityTarget, setActivityTarget] = useState(null);
-  const [activityReloadKey, setActivityReloadKey] = useState(0);
   const fetchSeqRef = React.useRef(0);
   const savedAllDatesRef = React.useRef(null);
   const filterDebounceRef = React.useRef(null);
@@ -204,20 +206,16 @@ function FileViewer({ darkMode }) {
     viewRef.current = { ...viewRef.current, ...patch };
     if ('view' in patch) setView(patch.view);
     if ('onlyMine' in patch) setOnlyMine(patch.onlyMine);
+    if ('lowScoreOnly' in patch) setLowScoreOnly(patch.lowScoreOnly);
   };
 
-  // Get user role for admin features
-  const userRole = user?.publicMetadata?.role;
-  const isAdmin = userRole === 'admin';
-  const isManager = userRole === 'manager';
-  const canDownload = isAdmin || isManager;
   const userEmail = user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
 
   // Fetch files only when a date is selected or changed (dates are optional in
   // the favorites views). options.path fetches exactly one recording — a
   // shared link — and ignores the filters.
   const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null, customDisposition = null, options = {}) => {
-    const { view: viewValue, onlyMine: onlyMineValue } = viewRef.current;
+    const { view: viewValue, onlyMine: onlyMineValue, lowScoreOnly: lowScoreValue } = viewRef.current;
     const pathValue = options.path || null;
     if (!pathValue && !start && viewValue === 'all') return;
     // The date pickers emit invalid dates while a date is half-typed.
@@ -281,6 +279,7 @@ function FileViewer({ darkMode }) {
       if (viewValue === 'favorites') url += `&favorites=mine`;
       if (viewValue === 'top') url += `&favorites=any`;
       if (onlyMineValue) url += `&mine=1`;
+      if (lowScoreValue) url += `&scoreMax=${LOW_SCORE_MAX}`;
     }
 
     // Audit VIEW_FILES only on the first fetch after a page load/refresh,
@@ -325,7 +324,10 @@ function FileViewer({ darkMode }) {
       })
       .then((data) => {
         if (!data || isStale()) return;
-        setFiles((data.files || []).map(normalizeFile));
+        const loaded = (data.files || []).map(normalizeFile);
+        setFiles(loaded);
+        // Prev/Next on the call file page walks this page of results.
+        rememberCallQueue(loaded.map(f => f.file));
         setTotalCount(Number(data.totalCount) || 0);
         setHasMore(Boolean(data.hasMore));
         setCurrentOffset(offset);
@@ -566,11 +568,8 @@ function FileViewer({ darkMode }) {
     }
 
     if (recordingParam) {
-      fetchFiles(null, null, 0, limitValue, sortColumnValue, sortDirectionValue, null, null, null, null, null, null, null, null, { path: recordingParam });
-      // Open the side panel (or reload it, so a repeat notification shows the
-      // new comment). Never auto-play.
-      setActivityTarget(prev => (prev?.file === recordingParam ? prev : { file: recordingParam }));
-      setActivityReloadKey(key => key + 1);
+      // Older links (?recording=) open the recording's call file page.
+      navigate(recordingUrl(recordingParam, '&tab=activity'), { replace: true });
     } else {
       fetchFiles(
         startFromQuery,
@@ -654,6 +653,13 @@ function FileViewer({ darkMode }) {
     fetchFiles(start, end, 0, filesPerPage, column, direction);
   };
 
+  const handleLowScoreChange = (event) => {
+    cancelPendingFilterFetches();
+    removeUrlParam('recording');
+    updateView({ lowScoreOnly: event.target.checked });
+    fetchFiles(calendarDateStart, calendarDateEnd, 0);
+  };
+
   const handleOnlyMineChange = (event) => {
     cancelPendingFilterFetches();
     removeUrlParam('recording');
@@ -670,7 +676,6 @@ function FileViewer({ darkMode }) {
   // Keeps a recording's table row and the side panel in step.
   const patchRow = React.useCallback((file, patch) => {
     setFiles(prev => prev.map(f => (f.file === file ? { ...f, ...patch } : f)));
-    setActivityTarget(prev => (prev && prev.file === file ? { ...prev, ...patch } : prev));
   }, []);
 
   const toggleFavorite = async (row) => {
@@ -701,8 +706,6 @@ function FileViewer({ darkMode }) {
         favoriteCount: Number(json.favoriteCount) || 0,
         canFavorite: Boolean(json.canFavorite)
       });
-      // The side panel lists who favorited the call.
-      if (activityTarget?.file === row.file) setActivityReloadKey(key => key + 1);
       requestNotificationsRefresh();
     } catch (error) {
       console.error('Failed to update favorite:', error);
@@ -718,30 +721,7 @@ function FileViewer({ darkMode }) {
     return row.favoritedByMe ? 'Remove from favorites' : 'Add to favorites';
   };
 
-  const closeActivity = () => {
-    setActivityTarget(null);
-    removeUrlParam('recording');
-  };
-
-  const handleCommentsClick = (row) => {
-    if (activityTarget?.file === row.file) {
-      closeActivity();
-    } else {
-      setActivityTarget(row);
-      // The closed panel may still hold this recording from earlier; reload it.
-      setActivityReloadKey(key => key + 1);
-    }
-  };
-
-  // Jumps to a moment in a recording, loading it first unless it is the one playing.
-  const seekRecording = (file, seconds) => {
-    if (currentTrack === file && playing) {
-      seekTo(seconds);
-      if (!isPlaying) resumeAudio();
-    } else {
-      playAudio(file, seconds);
-    }
-  };
+  const openCallFile = (row, tab = 'overview') => navigate(recordingUrl(row.file, `&tab=${tab}`));
 
   // Optimized waveform generation with chunked processing
   // Legacy waveform generation function (deprecated - now using backend API)
@@ -1168,44 +1148,6 @@ function FileViewer({ darkMode }) {
     }
   };
 
-  const downloadFile = async (filename) => {
-    if (!canDownload) {
-      return;
-    }
-
-    try {
-      const token = await getToken();
-      const response = await fetch(`/api/download/${encodeURIComponent(filename)}`, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      });
-
-      if (!response.ok) {
-        if (response.status === 403) {
-          return;
-        } else {
-          alert('Failed to download file. Please try again.');
-        }
-        return;
-      }
-
-      // Create download link
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename.split('/').pop();
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-    } catch (error) {
-      console.error('Download error:', error);
-      alert('Failed to download file. Please try again.');
-    }
-  };
-
   const handleFilesPerPageChange = (event) => {
     const newLimit = event.target.value;
     setFilesPerPage(newLimit);
@@ -1298,11 +1240,6 @@ function FileViewer({ darkMode }) {
     );
   }
 
-  const activityOpen = Boolean(activityTarget);
-  // The side panel shows the live table row when it's on this page, otherwise
-  // the snapshot it was opened with (e.g. a link, before its row has loaded).
-  const activityRecording = activityTarget ? (files.find(f => f.file === activityTarget.file) || activityTarget) : null;
-  const activityTrackState = !activityRecording || currentTrack !== activityRecording.file ? 'none' : (playing ? 'loaded' : 'loading');
 
   const formatRange = (start, end) => {
     if (start && end) return `${dayjs(start).format("MMM D")} - ${dayjs(end).format("MMM D, YYYY")}`;
@@ -1326,16 +1263,12 @@ function FileViewer({ darkMode }) {
 
   return (
     <LocalizationProvider dateAdapter={AdapterDayjs}>
-      <Container
-        maxWidth="xl"
-        sx={{
-          py: 4,
-          // Make room for the side panel on wide screens; it covers the page on small ones.
-          ...(activityOpen && { width: { md: 'auto' }, mr: { md: `${ACTIVITY_DRAWER_WIDTH}px` } })
-        }}
-      >
-        <Typography variant="h4" gutterBottom>
-          MTGPros Five9 Recordings {isAdmin && '(Admin View)'}
+      <Container maxWidth={false} disableGutters sx={{ pb: 4 }}>
+        <Typography variant="h4" component="h1" sx={{ fontSize: { xs: 22, md: 26 }, mb: 0.5 }}>
+          Recordings
+        </Typography>
+        <Typography color="text.secondary" sx={{ mb: 2.5 }}>
+          Every call recording. Click a row to open its call file with the transcript and scorecard.
         </Typography>
 
         {/* Audio Player */}
@@ -1345,8 +1278,7 @@ function FileViewer({ darkMode }) {
             sx={{
               position: 'fixed',
               bottom: 20,
-              // Centered in the space left of the side panel when it is open.
-              left: { xs: '50%', md: activityOpen ? `calc((100% - ${ACTIVITY_DRAWER_WIDTH}px) / 2)` : '50%' },
+              left: '50%',
               transform: 'translateX(-50%)',
               p: 2, 
               zIndex: 1000,
@@ -1612,6 +1544,10 @@ function FileViewer({ darkMode }) {
           <FormControlLabel
             control={<Switch checked={onlyMine} onChange={handleOnlyMineChange} />}
             label="Only my calls"
+          />
+          <FormControlLabel
+            control={<Switch checked={lowScoreOnly} onChange={handleLowScoreChange} />}
+            label={`Low scores (≤ ${LOW_SCORE_MAX})`}
           />
         </Box>
 
@@ -1896,6 +1832,15 @@ function FileViewer({ darkMode }) {
                     </TableCell>
                     <TableCell>
                       <TableSortLabel
+                        active={sortColumn === 'score'}
+                        direction={sortColumn === 'score' ? sortDirection : 'asc'}
+                        onClick={() => handleSort('score')}
+                      >
+                        Score
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell>
+                      <TableSortLabel
                         active={sortColumn === 'favoriteCount'}
                         direction={sortColumn === 'favoriteCount' ? sortDirection : 'desc'}
                         onClick={() => handleSort('favoriteCount')}
@@ -1908,7 +1853,17 @@ function FileViewer({ darkMode }) {
                 </TableHead>
                 <TableBody>
                   {files.map((fileInfo) => (
-                    <TableRow key={fileInfo.file} hover selected={activityTarget?.file === fileInfo.file}>
+                    <TableRow
+                      key={fileInfo.file}
+                      hover
+                      selected={currentTrack === fileInfo.file}
+                      onClick={(e) => {
+                        // Buttons in the row (play, favorite, comments) handle their own clicks.
+                        if (e.target.closest('button, a, input')) return;
+                        openCallFile(fileInfo);
+                      }}
+                      sx={{ cursor: 'pointer' }}
+                    >
                       <TableCell>{fileInfo.date}</TableCell>
                       <TableCell>{fileInfo.time}</TableCell>
                       <TableCell>{fileInfo.callId || '-'}</TableCell>
@@ -1916,6 +1871,7 @@ function FileViewer({ darkMode }) {
                       <TableCell>{fileInfo.email}</TableCell>
                       <TableCell>{formatDuration(fileInfo.durationMs)}</TableCell>
                       <TableCell>{fileInfo.callDisposition || '-'}</TableCell>
+                      <TableCell><ScoreChip score={fileInfo.overallScore} /></TableCell>
                       <TableCell>
                         <Box display="flex" alignItems="center">
                           {/* The span lets the tooltip explain a disabled star. */}
@@ -1947,7 +1903,7 @@ function FileViewer({ darkMode }) {
                           <PlayArrowIcon />
                         </IconButton>
                         <IconButton
-                          onClick={() => handleCommentsClick(fileInfo)}
+                          onClick={() => openCallFile(fileInfo, 'activity')}
                           size="small"
                           title="Comments"
                           aria-label={`Comments (${fileInfo.commentCount})`}
@@ -1957,17 +1913,6 @@ function FileViewer({ darkMode }) {
                             <ChatBubbleOutlineIcon fontSize="small" />
                           </Badge>
                         </IconButton>
-                        {canDownload && (
-                          <IconButton 
-                            color="secondary" 
-                            onClick={() => downloadFile(fileInfo.file)}
-                            size="small"
-                            title="Download"
-                            sx={{ ml: 1 }}
-                          >
-                            <DownloadIcon />
-                          </IconButton>
-                        )}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1989,18 +1934,6 @@ function FileViewer({ darkMode }) {
         )}
       </Container>
 
-      <RecordingActivityDrawer
-        open={activityOpen}
-        recording={activityRecording}
-        onClose={closeActivity}
-        trackState={activityTrackState}
-        currentTime={activityTrackState === 'loaded' ? currentTime : 0}
-        onPlay={() => playAudio(activityRecording.file)}
-        onSeek={(seconds) => seekRecording(activityRecording.file, seconds)}
-        onToggleFavorite={() => toggleFavorite(activityRecording)}
-        onRowPatch={patchRow}
-        reloadKey={activityReloadKey}
-      />
     </LocalizationProvider>
   );
 }

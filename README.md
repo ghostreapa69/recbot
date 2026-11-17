@@ -42,6 +42,16 @@ RecBot is a production-focused web platform for browsing, filtering, auditing, a
 - **On-Demand Transcoding**: FFmpeg WAV normalization (caching layer possible)
 - (Legacy references to B2/SFTP removed for current deployment scope)
 
+### 🧠 Transcription, Call Scores & Coaching
+- **Self-hosted transcription**: recent calls are sent to a [Scriberr](https://github.com/rishikanthc/scriberr) server for transcription with two-speaker diarization
+- **PII redaction**: an LLM pass (through Scriberr) replaces SSNs, account and card numbers, dates of birth, phone numbers, emails, addresses and full names with tags like `[SSN]`; only the redacted text is stored
+- **Call scorecard**: each call is scored from −10 (worst) to +10 (best) in six categories — Introduction, Client retention, Information gathered, Client sentiment, Objection handling, and Call control & professionalism. The overall score is the plain average; Objection handling is left out when the call had no objection. Each score comes with a reason and a quote you can click to play
+- **Call analysis**: summary, sentiment over the call, key moments, objections, next steps, coaching tips, and measured talk share, dead air, interruptions and talking speed
+- **Agent home page**: score and call stats for any agent by week, month or year, score trend, category breakdown, best and lowest-scored calls, badges and streaks (rules in `backend/badges.js`)
+- **Transcript search**: full-text search across every redacted transcript, opening the call at the matching moment
+- **Topics & keywords**: what customers call about, company-wide or for one agent, with change from the previous period
+- **Coaching queue** (managers and admins only): queue calls for one-on-one review, with suggestions for low-scoring calls
+
 ## Architecture
 
 ### Backend (Node.js / Express)
@@ -113,6 +123,17 @@ MAX_INACTIVITY_MINUTES=30
 
 # File Storage
 WAV_DIR=/data/wav
+
+# Scriberr (transcription, PII redaction, summaries and call scores). Unset SCRIBERR_URL to disable.
+SCRIBERR_URL=https://scriberr.yourcompany.com
+SCRIBERR_API_KEY=your_scriberr_api_key
+# SCRIBERR_TRANSCRIBE_MODEL=        # blank = Scriberr's default model
+# SCRIBERR_LANGUAGE=en
+# SCRIBERR_LLM_MODEL=               # LLM configured in Scriberr
+# SCRIBERR_LLM_TIMEOUT_MS=600000
+# TRANSCRIBE_LOOKBACK_DAYS=7
+# TRANSCRIBE_MIN_DURATION_SECONDS=50
+# TRANSCRIBE_MAX_PER_TICK=10        # recordings submitted, redacted and scored per 5-minute pass
 ```
 
 ### Quick Start

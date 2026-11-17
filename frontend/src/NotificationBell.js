@@ -146,7 +146,7 @@ function NotificationBell() {
     handleClose();
     if (!notification.readAt) markRead([notification.id]);
     // Opens the recording with its comments panel on the Recordings page.
-    navigate(`/?recording=${encodeURIComponent(notification.filePath)}`);
+    navigate(`/recordings/view?path=${encodeURIComponent(notification.filePath)}&tab=activity`);
   };
 
   return (

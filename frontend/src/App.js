@@ -1,27 +1,29 @@
 import React, { useState, useEffect } from "react";
 import { LogtoProvider, useLogto, useHandleSignInCallback, UserScope } from '@logto/react';
-import { BrowserRouter as Router, Routes, Route, Navigate, Link } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import {
-  AppBar,
-  Toolbar,
   Typography,
   Box,
-  Switch,
-  FormControlLabel,
   CssBaseline,
   Button,
   Container,
   Paper,
   Alert,
 } from "@mui/material";
-import { ThemeProvider, createTheme } from "@mui/material/styles";
+import { ThemeProvider } from "@mui/material/styles";
 import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
 import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import FileViewer from './FileViewer';
 import AdminPage from './AdminPage';
 import ReportsPage from './ReportsPage';
-import NotificationBell from './NotificationBell';
-import { AuthProvider, useUser, useAuth } from './auth';
+import { AuthProvider, useUser } from './auth';
+import Layout from './Layout';
+import AgentHome from './AgentHome';
+import RecordingDetail from './RecordingDetail';
+import SearchPage from './SearchPage';
+import TrendsPage from './TrendsPage';
+import CoachingPage from './CoachingPage';
+import { buildTheme } from './theme';
 
 // Build-time env fallbacks; runtime values come from /api/config.
 const ENV_LOGTO_ENDPOINT = process.env.REACT_APP_LOGTO_ENDPOINT;
@@ -274,68 +276,19 @@ function DomainValidator({ children, allowedLoginConfig }) {
   return children;
 }
 
-function Navigation({ darkMode, setDarkMode }) {
+// Links shared before the redesign point at /?recording=<path>; send them to the call file.
+function HomeOrLegacyLink() {
+  const location = useLocation();
+  const recording = new URLSearchParams(location.search).get('recording');
+  if (recording) return <Navigate to={`/recordings/view?path=${encodeURIComponent(recording)}`} replace />;
+  return <AgentHome />;
+}
+
+function ManagerOnly({ children }) {
   const { user } = useUser();
-  const { signOut } = useLogto();
-  const { getToken } = useAuth();
-  const isAdmin = user?.publicMetadata?.role === 'admin';
-  const isManager = user?.publicMetadata?.role === 'manager';
-
-  const handleLogout = async () => {
-    try {
-      const token = await getToken();
-      await fetch('/api/logout', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {})
-        }
-      });
-    } catch (e) {
-      console.error('Failed to record logout', e);
-    } finally {
-      signOut(POST_SIGN_OUT_REDIRECT_URI);
-    }
-  };
-
-  return (
-    <AppBar position="static" color="default" elevation={1}>
-      <Toolbar>
-        <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-          MTGPros Five9 Recordings
-        </Typography>
-
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-          {isAdmin && (
-            <Button component={Link} to="/admin" variant="outlined" size="small">
-              Admin Dashboard
-            </Button>
-          )}
-          {!isAdmin && isManager && (
-            <Button component={Link} to="/admin" variant="outlined" size="small">
-              Reporting
-            </Button>
-          )}
-
-          <Button component={Link} to="/" variant="text" size="small">
-            Recordings
-          </Button>
-          <Button component={Link} to="/reports" variant="text" size="small">
-            Reports
-          </Button>
-
-          <NotificationBell />
-
-          <FormControlLabel
-            control={<Switch checked={darkMode} onChange={(e) => setDarkMode(e.target.checked)} />}
-            label="Dark Mode"
-          />
-
-          <Button variant="outlined" size="small" color="error" onClick={handleLogout}>Logout</Button>
-        </Box>
-      </Toolbar>
-    </AppBar>
-  );
+  const role = user?.publicMetadata?.role;
+  if (role !== 'admin' && role !== 'manager') return <Navigate to="/" replace />;
+  return children;
 }
 
 function LoadingScreen({ text = 'Loading...' }) {
@@ -408,9 +361,7 @@ function AppContent({ allowedLoginConfig }) {
     localStorage.setItem('darkMode', darkMode);
   }, [darkMode]);
 
-  const theme = createTheme({
-    palette: { mode: darkMode ? "dark" : "light" },
-  });
+  const theme = React.useMemo(() => buildTheme(darkMode), [darkMode]);
 
   // Handle the OIDC callback before any auth gating.
   const isCallback = typeof window !== 'undefined' && window.location.pathname === '/callback';
@@ -426,13 +377,19 @@ function AppContent({ allowedLoginConfig }) {
     body = (
       <Router>
         <DomainValidator allowedLoginConfig={allowedLoginConfig}>
-          <Navigation darkMode={darkMode} setDarkMode={setDarkMode} />
-          <Routes>
-            <Route path="/" element={<FileViewer darkMode={darkMode} />} />
-            <Route path="/admin" element={<AdminPage darkMode={darkMode} />} />
-            <Route path="/reports" element={<ReportsPage />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <Layout darkMode={darkMode} setDarkMode={setDarkMode}>
+            <Routes>
+              <Route path="/" element={<HomeOrLegacyLink />} />
+              <Route path="/recordings" element={<FileViewer darkMode={darkMode} />} />
+              <Route path="/recordings/view" element={<RecordingDetail />} />
+              <Route path="/search" element={<SearchPage />} />
+              <Route path="/trends" element={<TrendsPage />} />
+              <Route path="/coaching" element={<ManagerOnly><CoachingPage /></ManagerOnly>} />
+              <Route path="/admin" element={<AdminPage darkMode={darkMode} />} />
+              <Route path="/reports" element={<ReportsPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </Layout>
         </DomainValidator>
       </Router>
     );
