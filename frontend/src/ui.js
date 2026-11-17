@@ -118,5 +118,5 @@ export function Loadable({ loading, error, children, onRetry }) {
 }
 
 export function agentLabel(row) {
-  return row?.agent_name || row?.agent_email || 'Unknown agent';
+  return row?.agent_display_name || row?.agent_name || row?.agent_email || 'Unknown agent';
 }

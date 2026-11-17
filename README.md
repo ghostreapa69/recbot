@@ -115,6 +115,11 @@ LOGTO_API_RESOURCE=https://recbot.api
 # LOGTO_SCOPE_ADMIN=recbot:admin
 # LOGTO_SCOPE_MANAGER=recbot:manage
 # LOGTO_SCOPE_MEMBER=recbot:read
+# Optional: agent full names from Logto (M2M app with Management API access; see LOGTO_SETUP.md)
+# LOGTO_M2M_APP_ID=your_m2m_app_id
+# LOGTO_M2M_APP_SECRET=your_m2m_app_secret
+# LOGTO_MANAGEMENT_API_RESOURCE=https://default.logto.app/api
+# AGENT_LIST_DAYS=90   # agents with calls in the last N days appear in the agent dropdowns
 # Comma-separated domains or exact email addresses (e.g. company.com,@partners.io,admin@vendor.com)
 ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com
 REACT_APP_ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com

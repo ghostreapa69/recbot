@@ -73,6 +73,13 @@ services:
       #- LOGTO_SCOPE_ADMIN=recbot:admin
       #- LOGTO_SCOPE_MANAGER=recbot:manage
       #- LOGTO_SCOPE_MEMBER=recbot:read
+      # Optional: read agent full names from Logto (machine-to-machine app with Management API access).
+      # Without these, agent names come from Five9. See LOGTO_SETUP.md.
+      #- LOGTO_M2M_APP_ID=your-logto-m2m-app-id
+      #- LOGTO_M2M_APP_SECRET=your-logto-m2m-app-secret
+      #- LOGTO_MANAGEMENT_API_RESOURCE=https://default.logto.app/api
+      # Agents with calls in the last N days appear in the agent dropdowns.
+      #- AGENT_LIST_DAYS=90
       - ALLOWED_LOGIN_IDENTIFIERS=mtgpros.com
       # Frontend reads Logto config at runtime from /api/config, so the
       # REACT_APP_LOGTO_* vars below are only build-time fallbacks (baked into

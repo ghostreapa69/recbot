@@ -375,6 +375,7 @@ export default function RecordingDetail() {
   const utterances = transcription?.utterances || [];
   const agentSpeaker = details.agentSpeaker || stats.agentSpeaker || null;
   const durationMs = file?.duration_ms || 0;
+  const agentFullName = data?.agentName || report?.agent_display_name || report?.agent_name || file?.email || null;
 
   const markers = [
     ...(data?.activity?.comments || []).filter(c => c.positionMs !== null && c.positionMs !== undefined).map(c => ({ atMs: c.positionMs, label: `Comment: ${c.body.slice(0, 60)}`, color: theme.palette.primary.main })),
@@ -416,7 +417,7 @@ export default function RecordingDetail() {
               <Box sx={{ flex: '1 1 260px', minWidth: 0 }}>
                 <Typography variant="h4" component="h1" sx={{ fontSize: { xs: 22, md: 26 } }}>{title}</Typography>
                 <Typography color="text.secondary" sx={{ fontVariantNumeric: 'tabular-nums' }}>
-                  {[report?.customer_name && formatPhone(file.phone), when, report?.agent_name || file.email ? `Agent ${report?.agent_name || file.email}` : null].filter(Boolean).join(' · ')}
+                  {[report?.customer_name && formatPhone(file.phone), when, agentFullName ? `Agent ${agentFullName}` : null].filter(Boolean).join(' · ')}
                 </Typography>
               </Box>
               {(report?.disposition || file.call_disposition) && <Chip variant="outlined" label={report?.disposition || file.call_disposition} />}
@@ -451,7 +452,7 @@ export default function RecordingDetail() {
                   <Card title="Call details">
                     <KeyValues items={[
                       ['Campaign', report?.campaign], ['Call type', report?.call_type],
-                      ['Agent', report?.agent_name || file.email], ['Disposition', report?.disposition || file.call_disposition],
+                      ['Agent', agentFullName], ['Disposition', report?.disposition || file.call_disposition],
                       ['Duration', durationMs ? formatMs(durationMs) : null], ['Phone', formatPhone(file.phone)],
                       ['DNIS', report?.dnis], ['Call ID', file.call_id]
                     ]} />

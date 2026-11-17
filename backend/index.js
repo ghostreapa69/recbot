@@ -20,8 +20,9 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription, getCallAnalysis, deleteCallAnalysis, getRecordingReport, listAgents, getAgentDashboard, getAgentScoreHistory, getTeamScoreChange, searchTranscripts, getTrends, listCoachingItems, getCoachingCounts, getCoachingItemForFile, addCoachingItem, updateCoachingItem, getSuggestedCoaching } from './database.js';
+import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription, getCallAnalysis, deleteCallAnalysis, getRecordingReport, getAgentDashboard, getAgentScoreHistory, getTeamScoreChange, searchTranscripts, getTrends, listCoachingItems, getCoachingCounts, getCoachingItemForFile, addCoachingItem, updateCoachingItem, getSuggestedCoaching } from './database.js';
 import { computeBadges } from './badges.js';
+import { createAgentDirectory } from './agentDirectory.js';
 import { startTranscriptionWorker } from './transcription.js';
 import { fetchLastHourCallLog, scheduleRecurringIngestion } from './five9.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
@@ -1899,7 +1900,8 @@ app.get('/api/recordings/detail', requireAuth, ensureSession, requireAuthenticat
     await auditRecordingAction(req, 'VIEW_RECORDING', recordingPath, context.file);
     res.json({
       file: context.file,
-      report,
+      report: report ? { ...report, agent_display_name: agentDirectory.agentName(report.agent) || report.agent_name || null } : null,
+      agentName: agentDirectory.agentName(report?.agent || context.file.email),
       transcription: transcription || { status: 'none' },
       analysis,
       activity: {
@@ -1963,13 +1965,23 @@ function periodFor(range) {
   return { start: fmt(start), end: fmt(today), prevStart: fmt(prevStart), prevEnd: fmt(prevEnd), bucket, range: ['week', 'month', 'year'].includes(range) ? range : 'week' };
 }
 
+const agentDirectory = createAgentDirectory({ query: (text, params) => pool.query(text, params) });
+
+// Adds each call row's agent full name (Logto, else Five9, else the email).
+const withAgentNames = rows => rows.map(row => ({ ...row, agent_display_name: agentDirectory.agentName(row.agent_email) || row.agent_name || row.agent_email || null }));
+
 const readEmail = value => (typeof value === 'string' && value.includes('@') && value.length <= 320 ? value.trim().toLowerCase() : null);
 const readDate = value => (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null);
 
 app.get('/api/agents', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
   try {
     const search = typeof req.query.search === 'string' && req.query.search.trim() ? req.query.search.trim().slice(0, 100) : null;
-    res.json({ agents: await listAgents(search) });
+    let agents = await agentDirectory.getAgentDirectory();
+    if (search) {
+      const needle = search.toLowerCase();
+      agents = agents.filter(a => a.name.toLowerCase().includes(needle) || a.email.includes(needle));
+    }
+    res.json({ agents });
   } catch (err) {
     console.error('Error in /api/agents:', err);
     res.status(500).json({ error: err.message });
@@ -1987,7 +1999,16 @@ app.get('/api/agents/dashboard', requireAuth, ensureSession, requireAuthenticate
       getAgentScoreHistory(email),
       getTeamScoreChange(week.start, week.end, week.prevStart, week.prevEnd)
     ]);
-    res.json({ email, period, ...dashboard, ...computeBadges({ email, history, teamChange }) });
+    res.json({
+      email,
+      name: agentDirectory.agentName(email),
+      period,
+      ...dashboard,
+      recent: withAgentNames(dashboard.recent),
+      worst: withAgentNames(dashboard.worst),
+      best: withAgentNames(dashboard.best),
+      ...computeBadges({ email, history, teamChange })
+    });
   } catch (err) {
     console.error('Error in /api/agents/dashboard:', err);
     res.status(500).json({ error: err.message });
@@ -2008,7 +2029,7 @@ app.get('/api/search/transcripts', requireAuth, ensureSession, requireAuthentica
     });
     await logAuditEvent(req.user.id, req.user.email, 'SEARCH_TRANSCRIPTS', null, null, req.user.ipAddress, req.user.userAgent,
       req.currentSessionId || null, { userRole: req.user.role, query: q, total: result.total });
-    res.json(result);
+    res.json({ ...result, results: withAgentNames(result.results) });
   } catch (err) {
     console.error('Error in /api/search/transcripts:', err);
     res.status(500).json({ error: err.message });
@@ -2038,7 +2059,7 @@ app.get('/api/coaching', requireAuth, ensureSession, requireManagerOrAdmin, asyn
       listCoachingItems({ status, agent: readEmail(req.query.agent) }),
       getCoachingCounts()
     ]);
-    res.json({ items, counts });
+    res.json({ items: withAgentNames(items), counts });
   } catch (err) {
     console.error('Error in /api/coaching:', err);
     res.status(500).json({ error: err.message });
@@ -2048,7 +2069,7 @@ app.get('/api/coaching', requireAuth, ensureSession, requireManagerOrAdmin, asyn
 app.get('/api/coaching/suggested', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     const since = dayjs().tz(APP_TIMEZONE).subtract(COACHING_SUGGEST_DAYS, 'day').format('YYYY-MM-DD');
-    res.json({ items: await getSuggestedCoaching(COACHING_SUGGEST_MAX_SCORE, since), maxScore: COACHING_SUGGEST_MAX_SCORE, days: COACHING_SUGGEST_DAYS });
+    res.json({ items: withAgentNames(await getSuggestedCoaching(COACHING_SUGGEST_MAX_SCORE, since)), maxScore: COACHING_SUGGEST_MAX_SCORE, days: COACHING_SUGGEST_DAYS });
   } catch (err) {
     console.error('Error in /api/coaching/suggested:', err);
     res.status(500).json({ error: err.message });
@@ -2757,6 +2778,9 @@ initializeDatabase().then(() => {
     setInterval(syncCurrentDay, 5 * 60 * 1000); // 5 minutes in milliseconds
 
     startTranscriptionWorker({ s3, bucket: process.env.AWS_BUCKET });
+
+    // Load the agent list now so the first dropdown doesn't wait for it.
+    agentDirectory.refresh().catch(err => console.error('❌ [AGENTS] Initial load failed:', err.message));
   });
 }).catch(err => {
   console.error('❌ Failed to initialize database:', err);

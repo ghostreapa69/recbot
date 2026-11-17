@@ -115,6 +115,23 @@ Historical `user_sessions` and `audit_logs` rows were keyed by Clerk user IDs (`
 
 No manual data migration is required for the common case.
 
+## 👤 Optional: agent full names from Logto
+
+The agent dropdowns (Home and Trends) and the agent names on calls use each person's **full name from Logto** when RecBot can read it, then the agent name Five9 records with each call, then the email. Without the steps below, Five9's names are used.
+
+1. In the Logto Console, go to **Applications → Create application → Machine-to-machine**, name it e.g. `RecBot user lookup`.
+2. Assign it a role that has the **Logto Management API** permission `all` (create one under **Roles → Machine-to-machine** if needed). RecBot only reads users (`GET /api/users`).
+3. Set these in the backend environment:
+
+```env
+LOGTO_M2M_APP_ID=your_m2m_app_id
+LOGTO_M2M_APP_SECRET=your_m2m_app_secret
+# Logto OSS: https://default.logto.app/api (default). Logto Cloud: https://<tenant-id>.logto.app/api
+LOGTO_MANAGEMENT_API_RESOURCE=https://default.logto.app/api
+```
+
+Names are read from each Logto user's **Name** field (or given + family name), matched by primary email. The list refreshes every 10 minutes (Logto users every hour). On startup the backend logs `[AGENTS] Loaded N agents (M names from Logto)`; a lookup failure is logged and Five9 names are used instead.
+
 ## 🐛 Troubleshooting
 
 1. **Backend exits on startup with `LOGTO_ENDPOINT environment variable is required`**

@@ -1,12 +1,13 @@
 import React, { useState } from "react";
 import { useNavigate } from 'react-router-dom';
-import { Autocomplete, Box, ButtonBase, Chip, TextField, ToggleButton, ToggleButtonGroup, Typography } from "@mui/material";
+import { Box, ButtonBase, Chip, ToggleButton, ToggleButtonGroup, Typography } from "@mui/material";
 import { useTheme } from "@mui/material/styles";
 import dayjs from "dayjs";
 import { useUser } from './auth';
 import { PageHeader } from './Layout';
 import { Card, ScoreChip, useApi, Loadable } from './ui';
 import { CountBar } from './charts';
+import AgentPicker from './AgentPicker';
 
 const BUCKET_LABEL = { day: 'ddd', week: 'MMM D', month: 'MMM' };
 
@@ -69,7 +70,6 @@ export default function TrendsPage() {
   const [scope, setScope] = useState('global');
   const [email, setEmail] = useState(myEmail);
   const [range, setRange] = useState('month');
-  const agents = useApi('/api/agents');
   const { data, error, loading, reload } = useApi(`/api/trends?scope=${scope}&range=${range}${scope === 'agent' ? `&email=${encodeURIComponent(email)}` : ''}`);
   const maxTopic = Math.max(1, ...(data?.topics || []).map(t => t.calls));
   const search = term => navigate(`/search?q=${encodeURIComponent(term.includes(' ') ? `"${term}"` : term)}`);
@@ -88,15 +88,7 @@ export default function TrendsPage() {
               <ToggleButton value="agent">One agent</ToggleButton>
             </ToggleButtonGroup>
             {scope === 'agent' && (
-              <Autocomplete
-                size="small" sx={{ width: 220 }}
-                options={agents.data?.agents || []}
-                value={(agents.data?.agents || []).find(a => a.email === email) || null}
-                getOptionLabel={a => a.name || a.email}
-                isOptionEqualToValue={(a, b) => a.email === b.email}
-                onChange={(_e, v) => setEmail(v ? v.email : myEmail)}
-                renderInput={params => <TextField {...params} label="Agent" placeholder="Me" />}
-              />
+              <AgentPicker value={email} onChange={setEmail} width={240} />
             )}
             <ToggleButtonGroup size="small" exclusive value={range} onChange={(_e, v) => v && setRange(v)} aria-label="Range">
               <ToggleButton value="week">Week</ToggleButton>

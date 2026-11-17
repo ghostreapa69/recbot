@@ -2348,20 +2348,6 @@ export async function getRecordingReport(callId) {
   return rows[0] || null;
 }
 
-export async function listAgents(search = null, limit = 200) {
-  const { rows } = await pool.query(`
-    SELECT ${AGENT_SQL} AS email, MAX(r.agent_name) AS name, COUNT(*)::int AS calls
-    FROM files f LEFT JOIN reporting r ON r.call_id = f.call_id
-    WHERE f.call_date >= to_char(NOW() - INTERVAL '180 days', 'YYYY-MM-DD')
-      AND ${AGENT_SQL} IS NOT NULL
-      AND ($1::text IS NULL OR ${AGENT_SQL} LIKE '%' || lower($1) || '%' OR lower(r.agent_name) LIKE '%' || lower($1) || '%')
-    GROUP BY 1
-    ORDER BY calls DESC
-    LIMIT $2
-  `, [search || null, limit]);
-  return rows;
-}
-
 const SCORE_COLUMNS = ['intro', 'retention', 'info', 'sentiment', 'objection', 'control'];
 
 // Aggregates for one agent between two YYYY-MM-DD dates (inclusive).

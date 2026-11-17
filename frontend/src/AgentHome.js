@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useNavigate } from 'react-router-dom';
 import {
-  Box, Typography, ToggleButton, ToggleButtonGroup, Autocomplete, TextField, ButtonBase, LinearProgress, Button
+  Box, Typography, ToggleButton, ToggleButtonGroup, ButtonBase, LinearProgress, Button
 } from "@mui/material";
 import { useTheme } from "@mui/material/styles";
 import dayjs from "dayjs";
@@ -12,6 +12,7 @@ import { PageHeader } from './Layout';
 import { Card, ScoreChip, DivergingBar, useApi, Loadable, fmtScore, formatMs, recordingUrl, CATEGORY_LABELS } from './ui';
 import { ScoreTrendChart, CountBar } from './charts';
 import { softBg } from './theme';
+import AgentPicker from './AgentPicker';
 
 const RANGES = { week: 'last week', month: 'the 5 weeks before', year: 'the year before' };
 const BUCKET_LABEL = { day: 'ddd', week: 'MMM D', month: 'MMM' };
@@ -122,12 +123,10 @@ export default function AgentHome() {
   const myEmail = (user?.primaryEmailAddress?.emailAddress || '').toLowerCase();
   const [email, setEmail] = useState(myEmail);
   const [range, setRange] = useState('week');
-  const agents = useApi('/api/agents');
   const { data, error, loading, reload } = useApi(email ? `/api/agents/dashboard?email=${encodeURIComponent(email)}&range=${range}` : null);
 
-  const agentOptions = agents.data?.agents || [];
-  const selected = agentOptions.find(a => a.email === email) || { email, name: email === myEmail ? 'Me' : null };
-  const agentName = selected.name && selected.name !== 'Me' ? selected.name : (email === myEmail ? (user?.firstName || email) : email);
+  // Full name from the server's agent directory (Logto, else Five9), else the email.
+  const agentName = (data?.email === email && data?.name) || email;
   const greeting = dayjs().hour() < 12 ? 'Good morning' : dayjs().hour() < 18 ? 'Good afternoon' : 'Good evening';
 
   const cur = data?.current || {};
@@ -143,22 +142,7 @@ export default function AgentHome() {
         subtitle="Scores come from AI review of each transcribed call, from −10 (worst) to +10 (best)."
         actions={(
           <>
-            <Autocomplete
-              size="small"
-              sx={{ width: 240 }}
-              options={agentOptions}
-              loading={agents.loading}
-              value={agentOptions.find(a => a.email === email) || null}
-              getOptionLabel={a => a.name || a.email}
-              isOptionEqualToValue={(a, b) => a.email === b.email}
-              onChange={(_e, value) => setEmail(value ? value.email : myEmail)}
-              renderInput={params => <TextField {...params} placeholder={email === myEmail ? 'My calls' : 'Pick an agent'} label="Agent" />}
-              renderOption={(props, a) => (
-                <li {...props} key={a.email}>
-                  <Box><Typography variant="body2">{a.name || a.email}</Typography><Typography variant="caption" color="text.secondary">{a.email} · {a.calls} calls</Typography></Box>
-                </li>
-              )}
-            />
+            <AgentPicker value={email} onChange={setEmail} />
             <ToggleButtonGroup size="small" exclusive value={range} onChange={(_e, v) => v && setRange(v)} aria-label="Range">
               <ToggleButton value="week">Week</ToggleButton>
               <ToggleButton value="month">Month</ToggleButton>
