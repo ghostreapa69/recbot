@@ -120,3 +120,64 @@ export function Loadable({ loading, error, children, onRetry }) {
 export function agentLabel(row) {
   return row?.agent_display_name || row?.agent_name || row?.agent_email || 'Unknown agent';
 }
+
+// ------------------------------------------------------------------
+// List-page filter pieces (Recordings, Reports)
+// ------------------------------------------------------------------
+
+// Responsive grid for filter fields: as many ~180px columns as fit.
+export function FilterGrid({ children, min = 180, sx }) {
+  return (
+    <Box sx={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${min}px, 1fr))`, gap: 1.5, ...sx }}>
+      {children}
+    </Box>
+  );
+}
+
+// Preset chips (e.g. Today, Yesterday). `options` is [{ key, label }].
+export function QuickRangeChips({ options, value, onPick, disabled }) {
+  return (
+    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, alignItems: 'center' }}>
+      {options.map(o => (
+        <Chip
+          key={o.key}
+          label={o.label}
+          size="small"
+          clickable
+          disabled={disabled}
+          color={value === o.key ? 'primary' : 'default'}
+          variant={value === o.key ? 'filled' : 'outlined'}
+          onClick={() => onPick(o.key)}
+          aria-pressed={value === o.key}
+        />
+      ))}
+    </Box>
+  );
+}
+
+// Removable chips for the filters currently applied. `items` is [{ key, label, onRemove }].
+export function ActiveFilterChips({ items, onClearAll }) {
+  if (!items.length) return null;
+  return (
+    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, alignItems: 'center' }}>
+      <Typography variant="caption" color="text.secondary">Active:</Typography>
+      {items.map(item => (
+        <Chip key={item.key} size="small" label={item.label} onDelete={item.onRemove} sx={{ bgcolor: 'subtle', border: 1, borderColor: 'divider' }} />
+      ))}
+      {onClearAll && <Chip size="small" variant="outlined" label="Clear all" onClick={onClearAll} clickable sx={{ borderStyle: 'dashed' }} />}
+    </Box>
+  );
+}
+
+export function MoreFiltersToggle({ open, onToggle, count = 0 }) {
+  return (
+    <Chip
+      size="small"
+      variant="outlined"
+      clickable
+      onClick={onToggle}
+      aria-expanded={open}
+      label={open ? '− Fewer filters' : `+ More filters${count ? ` (${count} set)` : ''}`}
+    />
+  );
+}

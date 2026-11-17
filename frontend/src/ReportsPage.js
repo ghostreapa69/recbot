@@ -1,6 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { useUser, useAuth } from './auth';
-import { Container, Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Paper, Pagination, Stack, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer, TableSortLabel, Link as MuiLink } from '@mui/material';
+import { Typography, Box, TextField, Button, Table, TableHead, TableRow, TableCell, TableBody, Pagination, Alert, CircularProgress, MenuItem, Select, FormControl, InputLabel, TableContainer, TableSortLabel, Menu, Checkbox, Chip, Link as MuiLink } from '@mui/material';
+import ViewColumnOutlinedIcon from '@mui/icons-material/ViewColumnOutlined';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import { PageHeader } from './Layout';
+import { Card, FilterGrid, QuickRangeChips, ActiveFilterChips, MoreFiltersToggle } from './ui';
 import { Link as RouterLink } from 'react-router-dom';
 import { LocalizationProvider, DateTimePicker } from '@mui/x-date-pickers';
 import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
@@ -14,6 +18,17 @@ dayjs.extend(timezone);
 dayjs.extend(customParseFormat);
 
 const FIVE9_TZ = process.env.REACT_APP_FIVE9_TIMEZONE || 'America/Los_Angeles';
+// Which report columns are shown; the choice is remembered in this browser.
+const REPORT_COLUMNS_KEY = 'recbot.reportColumns';
+const DEFAULT_REPORT_COLUMNS = ['timestamp', 'agent_name', 'customer_name', 'ani', 'campaign', 'disposition', 'call_time', 'talk_time', 'hold_time', 'after_call_work_time', 'transfers', 'recordings'];
+function readReportColumns() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(REPORT_COLUMNS_KEY) || 'null');
+    return Array.isArray(saved) && saved.length ? saved : DEFAULT_REPORT_COLUMNS;
+  } catch (e) {
+    return DEFAULT_REPORT_COLUMNS;
+  }
+}
 const parsedRawJsonCache = new WeakMap();
 
 function getParsedRawJson(row) {
@@ -64,6 +79,12 @@ function renderDefaultCell(value) {
     return trimmed === '' ? '-' : trimmed;
   }
   return value;
+}
+
+function renderDispositionCell(value) {
+  const text = renderDefaultCell(value);
+  if (text === '-') return text;
+  return <Chip size="small" variant="outlined" label={text} sx={{ borderRadius: 1.5, fontWeight: 500 }} />;
 }
 
 function renderDurationCell(value) {
@@ -137,15 +158,15 @@ function buildRecordingLink(row) {
   params.set('dateStart', dateParam);
   params.set('dateEnd', dateParam);
   params.set('callId', callId);
-  return `/?${params.toString()}`;
+  return `/recordings?${params.toString()}`;
 }
 
 function renderRecordingCell(value, row) {
   const href = buildRecordingLink(row);
   if (!href) return null;
   return (
-    <MuiLink component={RouterLink} to={href} underline="hover">
-      Open
+    <MuiLink component={RouterLink} to={href} underline="hover" sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.25, fontWeight: 600 }}>
+      <PlayArrowIcon sx={{ fontSize: 16 }} /> Open call
     </MuiLink>
   );
 }
@@ -215,6 +236,10 @@ export default function ReportsPage(){
   const [sortBy,setSortBy]=useState('timestamp'); // 'timestamp' | 'callTime'
   const [initialized,setInitialized]=useState(false);
   const [reportExporting,setReportExporting]=useState(false);
+  const [moreFilters,setMoreFilters]=useState(false);
+  const [activePreset,setActivePreset]=useState('lastHour');
+  const [visibleColumns,setVisibleColumns]=useState(readReportColumns);
+  const [columnsAnchor,setColumnsAnchor]=useState(null);
   const isAdmin = user?.publicMetadata?.role === 'admin';
   const isManager = user?.publicMetadata?.role === 'manager';
   const canExportReports = isAdmin || isManager;
@@ -227,7 +252,7 @@ export default function ReportsPage(){
     { key:'agent', label:'Agent', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'agent_name', label:'Agent Name', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'customer_name', label:'Customer Name', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' } },
-    { key:'disposition', label:'Disposition', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' } },
+    { key:'disposition', label:'Disposition', render: renderDispositionCell, headerSx:{ whiteSpace:'nowrap' } },
     { key:'ani', label:'ANI', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'dnis', label:'DNIS', render: renderDefaultCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
     { key:'talk_time', label:'Talk', render: renderDurationCell, headerSx:{ whiteSpace:'nowrap' }, cellSx:{ whiteSpace:'nowrap' } },
@@ -552,161 +577,187 @@ export default function ReportsPage(){
     // Don't call fetchReports() directly - let the useEffect handle it when filters change
   }
 
-  return <Container maxWidth="xl" sx={{ mt:3 }}>
-    <Typography variant="h5" gutterBottom>Five9 Reports</Typography>
-    <LocalizationProvider dateAdapter={AdapterDayjs}>
-      <Paper sx={{ p:2, mb:2 }}>
-        <Stack direction="row" flexWrap="wrap" spacing={1} alignItems="flex-end">
-          <DateTimePicker 
-            label="Start Date/Time" 
-            value={startDate} 
-            onChange={(newValue) => setStartDate(newValue)}
-            ampm={false}
-            slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
-          />
-          <DateTimePicker 
-            label="End Date/Time" 
-            value={endDate} 
-            onChange={(newValue) => setEndDate(newValue)}
-            ampm={false}
-            slotProps={{ textField: { size: 'small', sx: { minWidth: 240 } } }}
-          />
-          <TextField label="Agent" value={agentInput} onChange={e=>setAgentInput(e.target.value)} size="small" />
-        <FormControl size="small" sx={{ minWidth:160 }}>
-          <InputLabel id="campaign-label">Campaign</InputLabel>
-          <Select labelId="campaign-label" value={campaign} label="Campaign" onChange={e=>setCampaign(e.target.value)}>
-            <MenuItem value=""><em>All</em></MenuItem>
-            {campaigns.map(c=> <MenuItem key={c} value={c}>{c}</MenuItem>)}
-          </Select>
-        </FormControl>
-        <FormControl size="small" sx={{ minWidth:160 }}>
-          <InputLabel id="calltype-label">Call Type</InputLabel>
-          <Select labelId="calltype-label" value={callType} label="Call Type" onChange={e=>setCallType(e.target.value)}>
-            <MenuItem value=""><em>All</em></MenuItem>
-            {callTypes.map(t=> <MenuItem key={t} value={t}>{t}</MenuItem>)}
-          </Select>
-        </FormControl>
-        <FormControl size="small" sx={{ minWidth:180 }}>
-          <InputLabel id="disposition-label">Disposition</InputLabel>
-          <Select labelId="disposition-label" value={disposition} label="Disposition" onChange={e=>setDisposition(e.target.value)}>
-            <MenuItem value=""><em>All</em></MenuItem>
-            {dispositions.map(d=> <MenuItem key={d} value={d}>{d}</MenuItem>)}
-          </Select>
-        </FormControl>
-        <TextField label="Phone Number" value={phoneNumber} onChange={e=>setPhoneNumber(e.target.value)} size="small" sx={{ minWidth:160 }} />
-          <TextField label="Call ID" value={callId} onChange={e=>setCallId(e.target.value)} size="small" />
-          <TextField label="Customer Name" value={customerName} onChange={e=>setCustomerName(e.target.value)} size="small" sx={{ minWidth:200 }} />
-          <TextField label="After Call Work (min)" value={afterCallWork} onChange={e=>setAfterCallWork(e.target.value)} size="small" sx={{ minWidth:190 }} placeholder="min seconds or HH:MM:SS" />
-          <TextField label="Min Call Time" value={callTimeMinInput} onChange={e=>setCallTimeMinInput(e.target.value)} size="small" sx={{ minWidth:170 }} placeholder="seconds or HH:MM:SS" error={callTimeMin.trim() !== '' && parseDurationInput(callTimeMin) === null} />
-          <TextField label="Max Call Time" value={callTimeMaxInput} onChange={e=>setCallTimeMaxInput(e.target.value)} size="small" sx={{ minWidth:170 }} placeholder="seconds or HH:MM:SS" error={callTimeMax.trim() !== '' && parseDurationInput(callTimeMax) === null} />
-          <FormControl size="small" sx={{ minWidth:150 }}>
-            <InputLabel id="transfers-filter-label">Transfers</InputLabel>
-            <Select labelId="transfers-filter-label" value={transfersFilter} label="Transfers" onChange={e=>setTransfersFilter(e.target.value)}>
-              <MenuItem value=""><em>All</em></MenuItem>
-              <MenuItem value="0">No (0)</MenuItem>
-              <MenuItem value="1">Yes (1)</MenuItem>
-            </Select>
-          </FormControl>
-          <FormControl size="small" sx={{ minWidth:150 }}>
-            <InputLabel id="conferences-filter-label">Conferences</InputLabel>
-            <Select labelId="conferences-filter-label" value={conferencesFilter} label="Conferences" onChange={e=>setConferencesFilter(e.target.value)}>
-              <MenuItem value=""><em>All</em></MenuItem>
-              <MenuItem value="0">No (0)</MenuItem>
-              <MenuItem value="1">Yes (1)</MenuItem>
-            </Select>
-          </FormControl>
-          <FormControl size="small" sx={{ minWidth:170 }}>
-            <InputLabel id="abandoned-filter-label">Abandoned</InputLabel>
-            <Select labelId="abandoned-filter-label" value={abandonedFilter} label="Abandoned" onChange={e=>setAbandonedFilter(e.target.value)}>
-              <MenuItem value=""><em>All</em></MenuItem>
-              <MenuItem value="0">Client (0)</MenuItem>
-              <MenuItem value="1">Agent (1)</MenuItem>
-            </Select>
-          </FormControl>
-          <FormControl size="small" sx={{ minWidth:180 }}>
-            <InputLabel id="has-recording-filter-label">Has Recording</InputLabel>
-            <Select labelId="has-recording-filter-label" value={hasRecordingFilter} label="Has Recording" onChange={e=>setHasRecordingFilter(e.target.value)}>
-              <MenuItem value=""><em>All</em></MenuItem>
-              <MenuItem value="1">Yes</MenuItem>
-              <MenuItem value="0">No</MenuItem>
-            </Select>
-          </FormControl>
-        <FormControl size="small" sx={{ minWidth:190 }}>
-          <InputLabel id="sort-order-label">Sort</InputLabel>
-          <Select labelId="sort-order-label" value={`${sortBy}:${sortOrder}`} label="Sort" onChange={(e)=>{ const [by, order] = e.target.value.split(':'); setSortBy(by); setSortOrder(order); }}>
-            <MenuItem value="timestamp:desc">Newest First</MenuItem>
-            <MenuItem value="timestamp:asc">Oldest First</MenuItem>
-            <MenuItem value="callTime:desc">Longest Call Time</MenuItem>
-            <MenuItem value="callTime:asc">Shortest Call Time</MenuItem>
-          </Select>
-        </FormControl>
-        <Button variant="contained" onClick={()=>{ setAgentFilter(agentInput); setCallTimeMin(callTimeMinInput); setCallTimeMax(callTimeMaxInput); setPage(1); }} disabled={loading}>Apply</Button>
-        <Button variant="text" onClick={()=>{ setAgentInput(''); setAgentFilter(''); setCampaign(''); setCallType(''); setDisposition(''); setPhoneNumber(''); setCallId(''); setCustomerName(''); setAfterCallWork(''); setCallTimeMinInput(''); setCallTimeMaxInput(''); setCallTimeMin(''); setCallTimeMax(''); setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); setHasRecordingFilter(''); applyPreset('clear'); }} disabled={loading}>Clear</Button>
-        <Button size="small" variant="outlined" onClick={()=>applyPreset('lastHour')} disabled={loading}>Last Hour</Button>
-        <Button size="small" variant="outlined" onClick={()=>applyPreset('today')} disabled={loading}>Today</Button>
-        <Button size="small" variant="outlined" onClick={()=>applyPreset('yesterday')} disabled={loading}>Yesterday</Button>
-        <Button size="small" variant="outlined" onClick={()=>applyPreset('last24h')} disabled={loading}>Last 24h</Button>
-        {canExportReports && <Button variant="outlined" onClick={downloadReportsCsv} disabled={loading || reportExporting}>{reportExporting ? 'Exporting...' : 'Export CSV'}</Button>}
-      </Stack>
-      {error && <Alert severity="error" sx={{ mt:2 }}>{error}</Alert>}
-    </Paper>
-    </LocalizationProvider>
-    <Paper sx={{ p:0, position:'relative' }}>
-      {loading && <Box sx={{ position:'absolute', inset:0, bgcolor:'rgba(0,0,0,0.05)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:2 }}><CircularProgress size={48}/></Box>}
-      <TableContainer sx={{ maxHeight: '70vh', overflowX:'auto' }}>
-      <Table size="small" stickyHeader sx={{ tableLayout:'auto', minWidth:1800 }}>
-        <TableHead>
-          <TableRow>
-            {columns.map(col => (
-              <TableCell key={col.key} sx={{ whiteSpace:'nowrap', ...(col.headerSx || {}) }}>
-                {col.sortKey ? (
-                  <TableSortLabel
-                    active={sortBy === col.sortKey}
-                    direction={sortBy === col.sortKey ? sortOrder : 'desc'}
-                    onClick={() => handleSortClick(col.sortKey)}
-                  >
-                    {col.label}
-                  </TableSortLabel>
-                ) : col.label}
-              </TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {rows.map((row, idx) => (
-            <TableRow key={row.call_id || row.timestamp || idx} hover>
-              {columns.map(col => {
-                const rawValue = row[col.key];
-                const content = col.render ? col.render(rawValue, row) : renderDefaultCell(rawValue);
-                return (
-                  <TableCell key={col.key} sx={col.cellSx}>
-                    {content}
-                  </TableCell>
-                );
-              })}
-            </TableRow>
-          ))}
-          {!rows.length && !loading && (
-            <TableRow>
-              <TableCell colSpan={columns.length} align="center">No data</TableCell>
-            </TableRow>
-          )}
-        </TableBody>
-      </Table>
-      </TableContainer>
-    </Paper>
-    <Box sx={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:1, mt:2 }}>
-      <Stack direction="row" spacing={1} alignItems="center">
-        <Pagination count={Math.ceil(total/pageSize)||1} page={page} onChange={(e,v)=>setPage(v)} size="small" />
-        <FormControl size="small" sx={{ minWidth:120 }}>
-          <InputLabel id="page-size-label">Rows / page</InputLabel>
-          <Select labelId="page-size-label" value={pageSize} label="Rows / page" onChange={(e)=>setPageSize(Number(e.target.value))}>
-            {[25,50,100,250,500].map(opt => <MenuItem key={opt} value={opt}>{opt}</MenuItem>)}
-          </Select>
-        </FormControl>
-      </Stack>
-      <Typography variant="caption">{total.toLocaleString()}{totalCapped ? '+' : ''} rows</Typography>
-    </Box>
+  const chipFor = (key, label, value, clear) => (value ? { key, label: `${label}: ${value}`, onRemove: clear } : null);
+  const yesNo = { '0': 'No', '1': 'Yes' };
+  const activeFilters = [
+    chipFor('agent', 'Agent', agentFilter, () => { setAgentInput(''); setAgentFilter(''); }),
+    chipFor('campaign', 'Campaign', campaign, () => setCampaign('')),
+    chipFor('callType', 'Call type', callType, () => setCallType('')),
+    chipFor('disposition', 'Disposition', disposition, () => setDisposition('')),
+    chipFor('phone', 'Phone', phoneNumber, () => setPhoneNumber('')),
+    chipFor('callId', 'Call ID', callId, () => setCallId('')),
+    chipFor('customer', 'Customer', customerName, () => setCustomerName('')),
+    chipFor('acw', 'After call work ≥', afterCallWork, () => setAfterCallWork('')),
+    chipFor('ctMin', 'Call time ≥', callTimeMin, () => { setCallTimeMinInput(''); setCallTimeMin(''); }),
+    chipFor('ctMax', 'Call time ≤', callTimeMax, () => { setCallTimeMaxInput(''); setCallTimeMax(''); }),
+    chipFor('transfers', 'Transfers', yesNo[transfersFilter], () => setTransfersFilter('')),
+    chipFor('conferences', 'Conferences', yesNo[conferencesFilter], () => setConferencesFilter('')),
+    chipFor('abandoned', 'Abandoned', { '0': 'Client', '1': 'Agent' }[abandonedFilter], () => setAbandonedFilter('')),
+    chipFor('hasRecording', 'Has recording', yesNo[hasRecordingFilter], () => setHasRecordingFilter(''))
+  ].filter(Boolean);
+  const moreCount = [afterCallWork, callTimeMinInput, callTimeMaxInput, transfersFilter, conferencesFilter, abandonedFilter, hasRecordingFilter].filter(Boolean).length;
+  const clearAll = () => {
+    setAgentInput(''); setAgentFilter(''); setCampaign(''); setCallType(''); setDisposition(''); setPhoneNumber(''); setCallId(''); setCustomerName('');
+    setAfterCallWork(''); setCallTimeMinInput(''); setCallTimeMaxInput(''); setCallTimeMin(''); setCallTimeMax('');
+    setTransfersFilter(''); setConferencesFilter(''); setAbandonedFilter(''); setHasRecordingFilter('');
+    applyPreset('clear'); setActivePreset(null);
+  };
+  const pickPreset = (key) => { applyPreset(key); setActivePreset(key); };
+  const shownColumns = columns.filter(col => visibleColumns.includes(col.key));
+  const toggleColumn = (key) => {
+    const next = visibleColumns.includes(key) ? visibleColumns.filter(k => k !== key) : columns.map(c => c.key).filter(k => k === key || visibleColumns.includes(k));
+    if (!next.length) return; // keep at least one column
+    setVisibleColumns(next);
+    try { localStorage.setItem(REPORT_COLUMNS_KEY, JSON.stringify(next)); } catch (e) { /* storage unavailable */ }
+  };
+  const selectField = (id, label, value, onChange, options, allLabel = 'All') => (
+    <FormControl size="small" fullWidth>
+      <InputLabel id={id}>{label}</InputLabel>
+      <Select labelId={id} value={value} label={label} onChange={e => onChange(e.target.value)}>
+        <MenuItem value=""><em>{allLabel}</em></MenuItem>
+        {options.map(o => (Array.isArray(o) ? <MenuItem key={o[0]} value={o[0]}>{o[1]}</MenuItem> : <MenuItem key={o} value={o}>{o}</MenuItem>))}
+      </Select>
+    </FormControl>
+  );
 
-  </Container>;
+  return <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pb: 4 }}>
+    <PageHeader
+      title="Reports"
+      subtitle="Five9 call log for every call, including calls without a recording."
+      actions={canExportReports && <Button variant="outlined" onClick={downloadReportsCsv} disabled={loading || reportExporting}>{reportExporting ? 'Exporting…' : 'Export CSV'}</Button>}
+    />
+    <LocalizationProvider dateAdapter={AdapterDayjs}>
+      <Card sx={{ display: 'flex', flexDirection: 'column', gap: 2 }} aria-label="Filters">
+        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'center' }}>
+          <DateTimePicker
+            label="Start date & time"
+            value={startDate}
+            onChange={(newValue) => { setStartDate(newValue); setActivePreset(null); }}
+            ampm={false}
+            slotProps={{ textField: { size: 'small', sx: { width: 230 } } }}
+          />
+          <DateTimePicker
+            label="End date & time"
+            value={endDate}
+            onChange={(newValue) => { setEndDate(newValue); setActivePreset(null); }}
+            ampm={false}
+            slotProps={{ textField: { size: 'small', sx: { width: 230 } } }}
+          />
+          <QuickRangeChips
+            value={activePreset}
+            onPick={pickPreset}
+            disabled={loading}
+            options={[{ key: 'lastHour', label: 'Last hour' }, { key: 'today', label: 'Today' }, { key: 'yesterday', label: 'Yesterday' }, { key: 'last24h', label: 'Last 24h' }]}
+          />
+        </Box>
+        <FilterGrid>
+          <TextField label="Agent" value={agentInput} onChange={e => setAgentInput(e.target.value)} size="small" placeholder="Name or email" />
+          {selectField('campaign-label', 'Campaign', campaign, setCampaign, campaigns, 'All campaigns')}
+          {selectField('calltype-label', 'Call type', callType, setCallType, callTypes, 'All call types')}
+          {selectField('disposition-label', 'Disposition', disposition, setDisposition, dispositions, 'All dispositions')}
+          <TextField label="Phone number" value={phoneNumber} onChange={e => setPhoneNumber(e.target.value)} size="small" />
+          <TextField label="Call ID" value={callId} onChange={e => setCallId(e.target.value)} size="small" />
+          <TextField label="Customer name" value={customerName} onChange={e => setCustomerName(e.target.value)} size="small" />
+          <FormControl size="small" fullWidth>
+            <InputLabel id="sort-order-label">Sort</InputLabel>
+            <Select labelId="sort-order-label" value={`${sortBy}:${sortOrder}`} label="Sort" onChange={(e) => { const [by, order] = e.target.value.split(':'); setSortBy(by); setSortOrder(order); }}>
+              <MenuItem value="timestamp:desc">Newest first</MenuItem>
+              <MenuItem value="timestamp:asc">Oldest first</MenuItem>
+              <MenuItem value="callTime:desc">Longest call time</MenuItem>
+              <MenuItem value="callTime:asc">Shortest call time</MenuItem>
+            </Select>
+          </FormControl>
+        </FilterGrid>
+        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'center' }}>
+          <Button variant="contained" onClick={() => { setAgentFilter(agentInput); setCallTimeMin(callTimeMinInput); setCallTimeMax(callTimeMaxInput); setPage(1); }} disabled={loading}>Apply</Button>
+          <Button variant="text" onClick={clearAll} disabled={loading}>Clear</Button>
+          <MoreFiltersToggle open={moreFilters} onToggle={() => setMoreFilters(v => !v)} count={moreCount} />
+        </Box>
+        {moreFilters && (
+          <FilterGrid sx={{ borderTop: 1, borderColor: 'divider', borderTopStyle: 'dashed', pt: 2 }}>
+            <TextField label="After call work (min)" value={afterCallWork} onChange={e => setAfterCallWork(e.target.value)} size="small" placeholder="seconds or HH:MM:SS" />
+            <TextField label="Min call time" value={callTimeMinInput} onChange={e => setCallTimeMinInput(e.target.value)} size="small" placeholder="seconds or HH:MM:SS" error={callTimeMin.trim() !== '' && parseDurationInput(callTimeMin) === null} />
+            <TextField label="Max call time" value={callTimeMaxInput} onChange={e => setCallTimeMaxInput(e.target.value)} size="small" placeholder="seconds or HH:MM:SS" error={callTimeMax.trim() !== '' && parseDurationInput(callTimeMax) === null} />
+            {selectField('transfers-filter-label', 'Transfers', transfersFilter, setTransfersFilter, [['0', 'No (0)'], ['1', 'Yes (1)']])}
+            {selectField('conferences-filter-label', 'Conferences', conferencesFilter, setConferencesFilter, [['0', 'No (0)'], ['1', 'Yes (1)']])}
+            {selectField('abandoned-filter-label', 'Abandoned', abandonedFilter, setAbandonedFilter, [['0', 'Client (0)'], ['1', 'Agent (1)']])}
+            {selectField('has-recording-filter-label', 'Has recording', hasRecordingFilter, setHasRecordingFilter, [['1', 'Yes'], ['0', 'No']])}
+          </FilterGrid>
+        )}
+        <ActiveFilterChips items={activeFilters} onClearAll={activeFilters.length > 1 ? clearAll : null} />
+        {error && <Alert severity="error">{error}</Alert>}
+      </Card>
+    </LocalizationProvider>
+
+    <Card aria-label="Results">
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1.5, flexWrap: 'wrap', mb: 1.5 }}>
+        <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1 }}>
+          <Typography variant="h6">Calls</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ fontVariantNumeric: 'tabular-nums' }}>· {total.toLocaleString()}{totalCapped ? '+' : ''} rows</Typography>
+        </Box>
+        <Button size="small" variant="outlined" startIcon={<ViewColumnOutlinedIcon />} onClick={e => setColumnsAnchor(e.currentTarget)} aria-haspopup="true">
+          Columns ({shownColumns.length}/{columns.length})
+        </Button>
+        <Menu anchorEl={columnsAnchor} open={Boolean(columnsAnchor)} onClose={() => setColumnsAnchor(null)} slotProps={{ paper: { sx: { maxHeight: 420 } } }}>
+          {columns.map(col => (
+            <MenuItem key={col.key} dense onClick={() => toggleColumn(col.key)}>
+              <Checkbox size="small" checked={visibleColumns.includes(col.key)} sx={{ p: 0.5, mr: 1 }} />
+              {col.label}
+            </MenuItem>
+          ))}
+          <MenuItem dense onClick={() => { setVisibleColumns(DEFAULT_REPORT_COLUMNS); try { localStorage.removeItem(REPORT_COLUMNS_KEY); } catch (e) { /* storage unavailable */ } }}>
+            <Typography variant="body2" color="primary">Reset to default columns</Typography>
+          </MenuItem>
+        </Menu>
+      </Box>
+      <Box sx={{ position: 'relative' }}>
+        {loading && <Box sx={{ position: 'absolute', inset: 0, bgcolor: 'action.hover', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3, borderRadius: 3 }}><CircularProgress size={36} /></Box>}
+        <TableContainer sx={{ maxHeight: '65vh', overflow: 'auto', border: 1, borderColor: 'divider', borderRadius: 3 }}>
+          <Table size="small" stickyHeader sx={{ '& th, & td': { px: 1.25, whiteSpace: 'nowrap' } }}>
+            <TableHead>
+              <TableRow>
+                {shownColumns.map(col => (
+                  <TableCell key={col.key}>
+                    {col.sortKey ? (
+                      <TableSortLabel active={sortBy === col.sortKey} direction={sortBy === col.sortKey ? sortOrder : 'desc'} onClick={() => handleSortClick(col.sortKey)}>
+                        {col.label}
+                      </TableSortLabel>
+                    ) : col.label}
+                  </TableCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.map((row, idx) => (
+                <TableRow key={row.call_id || row.timestamp || idx} hover>
+                  {shownColumns.map(col => (
+                    <TableCell key={col.key} sx={col.cellSx}>
+                      {col.render ? col.render(row[col.key], row) : renderDefaultCell(row[col.key])}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))}
+              {!rows.length && !loading && (
+                <TableRow>
+                  <TableCell colSpan={shownColumns.length} align="center" sx={{ py: 5, color: 'text.secondary' }}>No calls match these filters.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      </Box>
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, mt: 2 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+          <Pagination count={Math.ceil(total / pageSize) || 1} page={page} onChange={(e, v) => setPage(v)} color="primary" />
+          <FormControl size="small" sx={{ minWidth: 120 }}>
+            <InputLabel id="page-size-label">Rows / page</InputLabel>
+            <Select labelId="page-size-label" value={pageSize} label="Rows / page" onChange={(e) => setPageSize(Number(e.target.value))}>
+              {[25, 50, 100, 250, 500].map(opt => <MenuItem key={opt} value={opt}>{opt}</MenuItem>)}
+            </Select>
+          </FormControl>
+        </Box>
+        <Typography variant="body2" color="text.secondary" sx={{ fontVariantNumeric: 'tabular-nums' }}>{total.toLocaleString()}{totalCapped ? '+' : ''} rows</Typography>
+      </Box>
+    </Card>
+  </Box>;
 }

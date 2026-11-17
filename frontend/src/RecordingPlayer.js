@@ -190,8 +190,10 @@ function Waveform({ player, durationHintMs, markers, sentiment }) {
   );
 }
 
-// Sticky bar at the bottom of the call file page.
-export function PlayerBar({ player, durationHintMs, markers = [], sentiment }) {
+// Sticky bar at the bottom of the call file and Recordings pages. `player` is
+// anything with the useRecordingPlayer shape; `title`/`subtitle` name the call
+// and `actions` adds buttons on the right.
+export function PlayerBar({ player, durationHintMs, markers = [], sentiment, speeds = SPEEDS, title, subtitle, actions }) {
   const durationSec = player.duration || (durationHintMs || 0) / 1000;
   return (
     <Box sx={{
@@ -209,13 +211,20 @@ export function PlayerBar({ player, durationHintMs, markers = [], sentiment }) {
           {player.loading ? <CircularProgress size={20} color="inherit" /> : player.playing ? <PauseIcon /> : <PlayArrowIcon />}
         </IconButton>
         <IconButton aria-label="Forward 10 seconds" onClick={() => player.seek(player.time + 10)} disabled={!player.ready} sx={{ display: { xs: 'none', sm: 'inline-flex' } }}><Forward10Icon /></IconButton>
+        {title && (
+          <Box sx={{ minWidth: 0, width: 190, display: { xs: 'none', md: 'block' } }}>
+            <Typography variant="body2" fontWeight={600} noWrap>{title}</Typography>
+            {subtitle && <Typography variant="caption" color="text.secondary" noWrap component="div">{subtitle}</Typography>}
+          </Box>
+        )}
         <Typography variant="caption" color={player.error ? 'error' : 'text.secondary'} sx={{ whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
           {player.error || `${formatMs(player.time * 1000)} / ${formatMs(durationSec * 1000)}`}
         </Typography>
         <Waveform player={player} durationHintMs={durationHintMs} markers={markers} sentiment={sentiment} />
         <ToggleButtonGroup size="small" exclusive value={player.rate} onChange={(_e, v) => v && player.changeRate(v)} aria-label="Playback speed" sx={{ display: { xs: 'none', md: 'flex' } }}>
-          {SPEEDS.map(s => <ToggleButton key={s} value={s} sx={{ px: 1, py: 0.25, fontSize: 12 }}>{s}x</ToggleButton>)}
+          {speeds.map(s => <ToggleButton key={s} value={s} sx={{ px: 1, py: 0.25, fontSize: 12 }}>{s === 0.5 ? '.5' : s}x</ToggleButton>)}
         </ToggleButtonGroup>
+        {actions}
       </Box>
     </Box>
   );

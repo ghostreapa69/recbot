@@ -1,10 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { useUser, useAuth } from './auth';
 import {
-  Container,
   Typography,
   IconButton,
-  Paper,
   Box,
   Pagination,
   TextField,
@@ -14,16 +12,13 @@ import {
   TableContainer,
   TableHead,
   TableRow,
-  Grid,
   TableSortLabel,
-  InputAdornment,
   Switch,
   FormControlLabel,
   CssBaseline,
   Select,
   MenuItem,
   CircularProgress,
-  LinearProgress,
   FormControl,
   InputLabel,
   Button,
@@ -33,13 +28,12 @@ import {
   ToggleButtonGroup,
   Tooltip,
   Badge,
+  Chip,
 } from "@mui/material";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import PauseIcon from "@mui/icons-material/Pause";
 import StopIcon from "@mui/icons-material/Stop";
 import VolumeUpIcon from "@mui/icons-material/VolumeUp";
-import FastForwardIcon from "@mui/icons-material/FastForward";
-import FastRewindIcon from "@mui/icons-material/FastRewind";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import StarIcon from "@mui/icons-material/Star";
 import StarBorderIcon from "@mui/icons-material/StarBorder";
@@ -52,7 +46,9 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import dayjs from "dayjs";
 import customParseFormat from 'dayjs/plugin/customParseFormat';
 import { rememberCallQueue } from './RecordingDetail';
-import { ScoreChip, recordingUrl } from './ui';
+import { ScoreChip, recordingUrl, Card, FilterGrid, QuickRangeChips, ActiveFilterChips, MoreFiltersToggle, formatPhone } from './ui';
+import { PageHeader } from './Layout';
+import { PlayerBar } from './RecordingPlayer';
 import { requestNotificationsRefresh } from './NotificationBell';
 
 dayjs.extend(customParseFormat);
@@ -73,7 +69,10 @@ function normalizeFile(rec) {
     commentCount: Number(rec.commentCount) || 0,
     favoritedByMe: Boolean(rec.favoritedByMe),
     canFavorite: Boolean(rec.canFavorite),
-    overallScore: rec.overallScore ?? null
+    overallScore: rec.overallScore ?? null,
+    agentEmail: rec.agentEmail || '',
+    agentName: rec.agentName || '',
+    customerName: rec.customerName || ''
   };
 }
 
@@ -189,6 +188,9 @@ function FileViewer({ darkMode }) {
   const [view, setView] = useState('all');
   const [onlyMine, setOnlyMine] = useState(false);
   const [lowScoreOnly, setLowScoreOnly] = useState(false);
+  const [moreFilters, setMoreFilters] = useState(false);
+  // Bumped after a filter chip is removed, so the refetch sees the updated state.
+  const [refetchNonce, setRefetchNonce] = useState(0);
   // fetchFiles reads the view from this ref, so every call site — including
   // debounced timers holding stale closures — uses the current one. Change the
   // view only through updateView().
@@ -350,6 +352,11 @@ function FileViewer({ darkMode }) {
     const newOffset = reset ? 0 : currentOffset;
     fetchFiles(calendarDateStart, calendarDateEnd, newOffset);
   };
+
+  useEffect(() => {
+    if (refetchNonce === 0) return;
+    if (calendarDateStart || viewRef.current.view !== 'all') refreshFiles(true);
+  }, [refetchNonce]);
 
   // Fetch file disposition values for the filter dropdown
   useEffect(() => {
@@ -1123,31 +1130,6 @@ function FileViewer({ darkMode }) {
     }
   };
 
-  const seekForward = () => {
-    if (playing) {
-      seekTo(playing.currentTime + 10); // Seek forward 10 seconds
-    }
-  };
-
-  const seekBackward = () => {
-    if (playing) {
-      seekTo(playing.currentTime - 10); // Seek backward 10 seconds
-    }
-  };
-
-  const handleProgressClick = (event) => {
-    if (playing && duration > 0) {
-      const progressBar = event.currentTarget;
-      const rect = progressBar.getBoundingClientRect();
-      const clickX = event.clientX - rect.left;
-      const progressWidth = rect.width;
-      const newTime = (clickX / progressWidth) * duration;
-      const clampedTime = Math.max(0, Math.min(newTime, duration));
-      playing.currentTime = clampedTime;
-      setCurrentTime(clampedTime);
-    }
-  };
-
   const handleFilesPerPageChange = (event) => {
     const newLimit = event.target.value;
     setFilesPerPage(newLimit);
@@ -1242,6 +1224,7 @@ function FileViewer({ darkMode }) {
 
 
   const formatRange = (start, end) => {
+    if (start && end && dayjs(start).isSame(end, 'day')) return dayjs(start).format("MMM D, YYYY");
     if (start && end) return `${dayjs(start).format("MMM D")} - ${dayjs(end).format("MMM D, YYYY")}`;
     if (start) return view === 'all' ? dayjs(start).format("MMM D, YYYY") : `Since ${dayjs(start).format("MMM D, YYYY")}`;
     if (end) return `Through ${dayjs(end).format("MMM D, YYYY")}`;
@@ -1261,319 +1244,101 @@ function FileViewer({ darkMode }) {
   else if (view === 'favorites') emptyMessage = 'No favorites found for the selected criteria';
   else if (view === 'top') emptyMessage = 'No favorited recordings found for the selected criteria';
 
+  // ---- Quick date ranges (they only fill in the dates) ----
+  const todayStart = dayjs().startOf('day');
+  const sameDay = (a, b) => Boolean(a && b && dayjs(a).isSame(b, 'day'));
+  const singleDay = calendarDateStart && (!calendarDateEnd || sameDay(calendarDateEnd, calendarDateStart));
+  let rangeKey = null;
+  if (singleDay && sameDay(calendarDateStart, todayStart)) rangeKey = 'today';
+  else if (singleDay && sameDay(calendarDateStart, todayStart.subtract(1, 'day'))) rangeKey = 'yesterday';
+  else if (sameDay(calendarDateEnd, todayStart) && sameDay(calendarDateStart, todayStart.subtract(6, 'day'))) rangeKey = '7d';
+  else if (sameDay(calendarDateEnd, todayStart) && sameDay(calendarDateStart, todayStart.subtract(29, 'day'))) rangeKey = '30d';
+  const pickRange = (key) => {
+    const ranges = {
+      today: [todayStart, null],
+      yesterday: [todayStart.subtract(1, 'day'), todayStart.subtract(1, 'day')],
+      '7d': [todayStart.subtract(6, 'day'), todayStart],
+      '30d': [todayStart.subtract(29, 'day'), todayStart]
+    };
+    const [start, end] = ranges[key];
+    cancelPendingFilterFetches();
+    removeUrlParam('recording');
+    setCalendarDateStart(start);
+    setCalendarDateEnd(end);
+    fetchFiles(start, end, 0);
+  };
+
+  // ---- Active filter chips; removing one refetches with the new values ----
+  const refetchAfter = (update) => { update(); setRefetchNonce(n => n + 1); };
+  const timeRangeSet = timeMode === 'range' && (timePickerStart || timePickerEnd);
+  const activeFilters = [
+    phoneFilter && { key: 'phone', label: `Phone: ${phoneFilter}`, onRemove: () => refetchAfter(() => setPhoneFilter('')) },
+    callIdFilter && { key: 'callId', label: `Call ID: ${callIdFilter}`, onRemove: () => refetchAfter(() => setCallIdFilter('')) },
+    emailFilter && { key: 'email', label: `Agent: ${emailFilter}`, onRemove: () => refetchAfter(() => setEmailFilter('')) },
+    dispositionFilter && { key: 'disp', label: `Disposition: ${dispositionFilter}`, onRemove: () => refetchAfter(() => setDispositionFilter('')) },
+    durationMin && { key: 'dur', label: `Over ${durationMin} min`, onRemove: () => refetchAfter(() => setDurationMin('')) },
+    timeRangeSet && { key: 'time', label: `Time: ${timePickerStart ? dayjs(timePickerStart).format('h:mm A') : 'any'} – ${timePickerEnd ? dayjs(timePickerEnd).format('h:mm A') : 'any'}`, onRemove: () => refetchAfter(() => { setTimePickerStart(null); setTimePickerEnd(null); }) },
+    onlyMine && { key: 'mine', label: 'Only my calls', onRemove: () => handleOnlyMineChange({ target: { checked: false } }) },
+    lowScoreOnly && { key: 'low', label: `Score ≤ ${LOW_SCORE_MAX}`, onRemove: () => handleLowScoreChange({ target: { checked: false } }) }
+  ].filter(Boolean);
+  const clearAllFilters = () => refetchAfter(() => {
+    setPhoneFilter(''); setCallIdFilter(''); setEmailFilter(''); setDispositionFilter(''); setDurationMin('');
+    setTimePickerStart(null); setTimePickerEnd(null);
+    updateView({ onlyMine: false, lowScoreOnly: false });
+  });
+  const moreCount = (durationMin ? 1 : 0) + (timeRangeSet ? 1 : 0);
+
+  // ---- Bottom player: the call page's player bar, driven by this page's audio ----
+  const playingRow = currentTrack ? files.find(f => f.file === currentTrack) : null;
+  const playerView = {
+    playing: isPlaying,
+    loading: Boolean(currentTrack && !playing),
+    error: null,
+    time: currentTime,
+    duration,
+    ready: duration > 0,
+    rate: playbackRate,
+    waveform: waveformData,
+    play: resumeAudio,
+    pause: pauseAudio,
+    seek: (seconds) => seekTo(seconds),
+    changeRate: (rate) => handlePlaybackRateChange(null, rate)
+  };
+  const sortHeader = (column, label, firstDirection = 'asc') => (
+    <TableSortLabel
+      active={sortColumn === column}
+      direction={sortColumn === column ? sortDirection : firstDirection}
+      onClick={() => handleSort(column)}
+    >
+      {label}
+    </TableSortLabel>
+  );
+  const twoLine = (top, bottom) => (
+    <Box sx={{ minWidth: 0 }}>
+      <Typography variant="body2" fontWeight={600} noWrap>{top}</Typography>
+      {bottom && <Typography variant="caption" color="text.secondary" noWrap component="div" sx={{ fontVariantNumeric: 'tabular-nums' }}>{bottom}</Typography>}
+    </Box>
+  );
+
   return (
     <LocalizationProvider dateAdapter={AdapterDayjs}>
-      <Container maxWidth={false} disableGutters sx={{ pb: 4 }}>
-        <Typography variant="h4" component="h1" sx={{ fontSize: { xs: 22, md: 26 }, mb: 0.5 }}>
-          Recordings
-        </Typography>
-        <Typography color="text.secondary" sx={{ mb: 2.5 }}>
-          Every call recording. Click a row to open its call file with the transcript and scorecard.
-        </Typography>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pb: 4 }}>
+        <PageHeader
+          title="Recordings"
+          subtitle="Every call recording. Click a row to open its call file with the transcript and scorecard."
+          actions={(
+            <ToggleButtonGroup exclusive size="small" value={view} onChange={handleViewChange} aria-label="Recordings view">
+              <ToggleButton value="all">All recordings</ToggleButton>
+              <ToggleButton value="favorites">My favorites</ToggleButton>
+              <ToggleButton value="top">Most favorited</ToggleButton>
+            </ToggleButtonGroup>
+          )}
+        />
 
-        {/* Audio Player */}
-        {currentTrack && (
-          <Paper
-            elevation={3}
-            sx={{
-              position: 'fixed',
-              bottom: 20,
-              left: '50%',
-              transform: 'translateX(-50%)',
-              p: 2, 
-              zIndex: 1000,
-              minWidth: 600,
-              maxWidth: 800,
-              background: darkMode ? '#424242' : '#fff'
-            }}
-          >
-            <Box>
-              <Typography variant="subtitle2" noWrap sx={{ mb: 2 }}>
-                Now Playing: {currentTrack.split('/').pop()}
-                {waveformData && Array.isArray(waveformData) && (
-                  <span style={{ fontSize: '0.7em', opacity: 0.7, marginLeft: '10px' }}>
-                    (Waveform: {waveformData.length} points)
-                  </span>
-                )}
-              </Typography>
-              
-              {/* Waveform Seek Bar Row - Full Width */}
-              <Box sx={{ mb: 2 }}>
-                <Box 
-                  onClick={handleProgressClick}
-                  sx={{ 
-                    cursor: 'pointer',
-                    py: 2,
-                    position: 'relative',
-                    height: 60, // Taller for waveform
-                    backgroundColor: darkMode ? '#333' : '#f5f5f5',
-                    borderRadius: 3,
-                    overflow: 'hidden',
-                    '&:hover': {
-                      backgroundColor: darkMode ? '#404040' : '#eeeeee'
-                    }
-                  }}
-                >
-                  {/* Waveform Visualization */}
-                  {waveformData && Array.isArray(waveformData) && currentTrack ? (
-                    <Box sx={{ 
-                      position: 'absolute', 
-                      top: 0, 
-                      left: 0, 
-                      right: 0, 
-                      bottom: 0,
-                      display: 'flex',
-                      alignItems: 'flex-end', // Align bars to bottom
-                      justifyContent: 'space-between',
-                      px: 1,
-                      gap: 0.1
-                    }}>
-                      {/* Waveform bars */}
-                      {waveformData && Array.isArray(waveformData) && waveformData.map((amplitude, index) => {
-                        // Enhanced amplitude scaling for better visibility
-                        const minHeight = 2;
-                        const maxHeight = 45;
-                        const scaledHeight = Math.max(minHeight, amplitude * maxHeight);
-                        
-                        // Color intensity based on amplitude
-                        const intensity = Math.min(1, amplitude * 2); // Amplify for color
-                        const color = darkMode 
-                          ? `rgba(144, 202, 249, ${0.3 + intensity * 0.7})` 
-                          : `rgba(25, 118, 210, ${0.4 + intensity * 0.6})`;
-                        
-                        return (
-                        <Box
-                          key={index}
-                          sx={{
-                            flex: '1 1 0px', // Equal width distribution
-                            minWidth: '1px',
-                            maxWidth: '2px',
-                            height: scaledHeight + 'px',
-                            backgroundColor: color,
-                            borderRadius: '1px 1px 0 0', // Rounded top
-                            opacity: 0.8
-                          }}
-                        />
-                        );
-                      })}
-                      
-                      {/* Progress overlay */}
-                      <Box sx={{
-                        position: 'absolute',
-                        top: 0,
-                        left: 0,
-                        height: '100%',
-                        width: duration ? `${(currentTime / duration) * 100}%` : '0%',
-                        backgroundColor: darkMode ? 'rgba(144, 202, 249, 0.3)' : 'rgba(25, 118, 210, 0.3)',
-                        transition: 'width 0.1s ease'
-                      }} />
-                      
-                      {/* Current position indicator */}
-                      <Box sx={{
-                        position: 'absolute',
-                        top: 0,
-                        left: duration ? `${(currentTime / duration) * 100}%` : '0%',
-                        height: '100%',
-                        width: '2px',
-                        backgroundColor: darkMode ? '#fff' : '#333',
-                        transform: 'translateX(-1px)',
-                        transition: 'left 0.1s ease'
-                      }} />
-                      
-                      {/* Waveform generation progress indicator */}
-                      {isGeneratingWaveform && (
-                        <Box sx={{
-                          position: 'absolute',
-                          top: 4,
-                          right: 4,
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 0.5,
-                          backgroundColor: 'rgba(0,0,0,0.7)',
-                          borderRadius: 1,
-                          px: 1,
-                          py: 0.5
-                        }}>
-                          <CircularProgress size={12} sx={{ color: '#fff' }} />
-                          <Typography variant="caption" sx={{ color: '#fff', fontSize: '0.6rem' }}>
-                            {waveformData?.isPartial ? 'Building...' : 'Analyzing...'}
-                          </Typography>
-                        </Box>
-                      )}
-                    </Box>
-                  ) : isGeneratingWaveform ? (
-                    // Loading state while generating waveform
-                    <Box sx={{ 
-                      display: 'flex', 
-                      alignItems: 'center', 
-                      justifyContent: 'center', 
-                      height: '100%',
-                      gap: 1
-                    }}>
-                      <CircularProgress size={20} />
-                      <Typography variant="caption" sx={{ opacity: 0.7 }}>
-                        Analyzing audio...
-                      </Typography>
-                    </Box>
-                  ) : (
-                    // Fallback to regular progress bar
-                    <Box sx={{ display: 'flex', alignItems: 'center', height: '100%', px: 2 }}>
-                      <LinearProgress 
-                        variant="determinate" 
-                        value={duration ? (currentTime / duration) * 100 : 0}
-                        sx={{ 
-                          width: '100%',
-                          height: 8,
-                          borderRadius: 4,
-                          backgroundColor: darkMode ? '#555' : '#e0e0e0',
-                          '& .MuiLinearProgress-bar': {
-                            borderRadius: 4,
-                            backgroundColor: darkMode ? '#90caf9' : '#1976d2'
-                          }
-                        }}
-                      />
-                    </Box>
-                  )}
-                </Box>
-                
-                {/* Time display under the seek bar */}
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
-                  <Typography variant="caption" sx={{ opacity: 0.7 }}>
-                    {Math.floor(currentTime / 60)}:{(Math.floor(currentTime % 60)).toString().padStart(2, '0')}
-                  </Typography>
-                  <Typography variant="caption" sx={{ opacity: 0.7 }}>
-                    {Math.floor(duration / 60)}:{(Math.floor(duration % 60)).toString().padStart(2, '0')}
-                  </Typography>
-                </Box>
-              </Box>
-              
-              {/* Controls Row */}
-              <Box display="flex" alignItems="center" justifyContent="space-between">
-                <Box display="flex" alignItems="center" gap={1}>
-                  <IconButton onClick={seekBackward} size="small" title="Rewind 10s">
-                    <FastRewindIcon />
-                  </IconButton>
-                  
-                  <IconButton 
-                    onClick={isPlaying ? pauseAudio : resumeAudio} 
-                    color="primary"
-                    size="medium"
-                  >
-                    {isPlaying ? <PauseIcon /> : <PlayArrowIcon />}
-                  </IconButton>
-                  
-                  <IconButton onClick={seekForward} size="small" title="Forward 10s">
-                    <FastForwardIcon />
-                  </IconButton>
-                  
-                  <IconButton onClick={stopAudio} size="small">
-                    <StopIcon />
-                  </IconButton>
-                </Box>
-                
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-                  <Box sx={{ display: 'flex', alignItems: 'center', minWidth: 120 }}>
-                    <VolumeUpIcon fontSize="small" sx={{ mr: 1, opacity: 0.7 }} />
-                    <Slider
-                      size="small"
-                      value={volume}
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      onChange={(_, newValue) => handleVolumeChange(newValue)}
-                      sx={{ 
-                        width: 80,
-                        '& .MuiSlider-thumb': {
-                          width: 12,
-                          height: 12,
-                        }
-                      }}
-                    />
-                  </Box>
-                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                    <Typography variant="caption" sx={{ opacity: 0.7 }}>Speed</Typography>
-                    <ToggleButtonGroup
-                      size="small"
-                      value={playbackRate}
-                      exclusive
-                      onChange={handlePlaybackRateChange}
-                      aria-label="Playback speed"
-                    >
-                      {PLAYBACK_RATE_OPTIONS.map((rate) => (
-                        <ToggleButton key={rate} value={rate} aria-label={`playback-${rate}`} sx={{ px: 1.25 }}>
-                          {rate === 0.5 ? '.5x' : `${rate}x`}
-                        </ToggleButton>
-                      ))}
-                    </ToggleButtonGroup>
-                  </Box>
-                </Box>
-              </Box>
-              
-              {/* Keyboard shortcuts hint */}
-              <Typography 
-                variant="caption" 
-                sx={{ 
-                  display: 'block', 
-                  textAlign: 'center', 
-                  mt: 1, 
-                  opacity: 0.6, 
-                  fontSize: '0.65rem' 
-                }}
-              >
-                ← → arrow keys: seek ±5s | spacebar: play/pause
-              </Typography>
-            </Box>
-          </Paper>
-        )}
-
-        {/* View: all recordings, my favorites, or most favorited */}
-        <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2, mb: 2 }}>
-          <ToggleButtonGroup
-            exclusive
-            size="small"
-            color="primary"
-            value={view}
-            onChange={handleViewChange}
-            aria-label="Recordings view"
-            sx={{ '& .MuiToggleButton-root': { textTransform: 'none', whiteSpace: 'nowrap' } }}
-          >
-            <ToggleButton value="all">All recordings</ToggleButton>
-            <ToggleButton value="favorites">My favorites</ToggleButton>
-            <ToggleButton value="top">Most favorited</ToggleButton>
-          </ToggleButtonGroup>
-          <FormControlLabel
-            control={<Switch checked={onlyMine} onChange={handleOnlyMineChange} />}
-            label="Only my calls"
-          />
-          <FormControlLabel
-            control={<Switch checked={lowScoreOnly} onChange={handleLowScoreChange} />}
-            label={`Low scores (≤ ${LOW_SCORE_MAX})`}
-          />
-        </Box>
-
-        <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-          <Box display="flex" alignItems="center" gap={2}>
-            <Typography variant="h6">
-              {listHeading}
-            </Typography>
-            <IconButton
-              onClick={() => (focusedPath ? fetchFocused(focusedPath) : refreshFiles(true))}
-              disabled={loading || (view === 'all' && !calendarDateStart && !focusedPath)}
-              color="primary"
-            >
-              <RefreshIcon />
-            </IconButton>
-          </Box>
-        </Box>
-
-        {/* Date Selection */}
-        <Paper elevation={1} sx={{ p: 2, mb: 2, backgroundColor: darkMode ? 'grey.900' : 'grey.50' }}>
-          <Typography variant="h6" gutterBottom>
-            Date Selection
-          </Typography>
-          <Box display="flex" gap={2} alignItems="center" flexWrap="wrap">
+        <Card sx={{ display: 'flex', flexDirection: 'column', gap: 2 }} aria-label="Filters">
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'center' }}>
             <DatePicker
-              label={view === 'all' ? "Start Date" : "Start Date (Optional)"}
+              label={view === 'all' ? 'From' : 'From (optional)'}
               value={calendarDateStart}
               onChange={(newValue) => {
                 setCalendarDateStart(newValue);
@@ -1581,10 +1346,10 @@ function FileViewer({ darkMode }) {
                   fetchFiles(newValue, calendarDateEnd, 0);
                 }
               }}
-              slotProps={{ textField: { size: 'small' }, field: { clearable: view !== 'all' } }}
+              slotProps={{ textField: { size: 'small', sx: { width: 180 } }, field: { clearable: view !== 'all' } }}
             />
             <DatePicker
-              label="End Date (Optional)"
+              label="To (optional)"
               value={calendarDateEnd}
               onChange={(newValue) => {
                 setCalendarDateEnd(newValue);
@@ -1592,72 +1357,28 @@ function FileViewer({ darkMode }) {
                   fetchFiles(calendarDateStart, newValue, 0);
                 }
               }}
-              slotProps={{ textField: { size: 'small' }, field: { clearable: view !== 'all' } }}
+              slotProps={{ textField: { size: 'small', sx: { width: 180 } }, field: { clearable: true } }}
             />
-            {view !== 'all' && (
-              <Typography variant="caption" color="text.secondary">
-                Leave empty for all dates
-              </Typography>
-            )}
+            <QuickRangeChips
+              value={rangeKey}
+              onPick={pickRange}
+              options={[{ key: 'today', label: 'Today' }, { key: 'yesterday', label: 'Yesterday' }, { key: '7d', label: 'Last 7 days' }, { key: '30d', label: 'Last 30 days' }]}
+            />
+            {view !== 'all' && <Typography variant="caption" color="text.secondary">Leave the dates empty for all dates</Typography>}
           </Box>
-        </Paper>
 
-        {/* Column filters */}
-        <Grid container spacing={2} mb={2}>
-          <Grid item xs={12} md={3}>
+          <FilterGrid>
+            <TextField size="small" label="Phone number" value={phoneFilter} onChange={(e) => setPhoneFilter(stripPhoneFormatting(e.target.value))} placeholder="Any part of the number" />
             <TextField
-              fullWidth
-              size="small"
-              label="Phone Number"
-              value={phoneFilter}
-              onChange={(e) => setPhoneFilter(stripPhoneFormatting(e.target.value))}
-              InputProps={{
-                startAdornment: <InputAdornment position="start">📞</InputAdornment>,
-              }}
-            />
-          </Grid>
-          <Grid item xs={12} md={3}>
-            <TextField
-              fullWidth
               size="small"
               label="Call ID"
               value={callIdFilter}
               onChange={(e) => setCallIdFilter(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') refreshFiles(true); }}
-              InputProps={{
-                startAdornment: <InputAdornment position="start">🆔</InputAdornment>,
-              }}
-              helperText={callIdFilter ? 'Substring match (2+ chars auto)' : 'Enter 2+ chars for auto filter'}
+              placeholder="2+ characters"
             />
-          </Grid>
-          <Grid item xs={12} md={3}>
-            <TextField
-              fullWidth
-              size="small"
-              label="Email"
-              value={emailFilter}
-              onChange={(e) => setEmailFilter(e.target.value)}
-              InputProps={{
-                startAdornment: <InputAdornment position="start">📧</InputAdornment>,
-              }}
-            />
-          </Grid>
-          <Grid item xs={12} md={2}>
-            <TextField
-              fullWidth
-              size="small"
-              label="Min Duration"
-              value={durationMin}
-              onChange={(e) => setDurationMin(e.target.value)}
-              InputProps={{
-                startAdornment: <InputAdornment position="start">⏱️</InputAdornment>,
-              }}
-            />
-          </Grid>
-        </Grid>
-        <Grid container spacing={2} mb={2}>
-          <Grid item xs={12} md={3}>
-            <FormControl fullWidth size="small" sx={{ minWidth: 200 }}>
+            <TextField size="small" label="Agent email" value={emailFilter} onChange={(e) => setEmailFilter(e.target.value)} placeholder="name@company.com" />
+            <FormControl size="small">
               <InputLabel id="file-disposition-label">Disposition</InputLabel>
               <Select
                 labelId="file-disposition-label"
@@ -1670,59 +1391,66 @@ function FileViewer({ darkMode }) {
                   }
                 }}
               >
-                <MenuItem value=""><em>All</em></MenuItem>
+                <MenuItem value=""><em>Any disposition</em></MenuItem>
                 {fileDispositions.map(d => <MenuItem key={d} value={d}>{d}</MenuItem>)}
               </Select>
             </FormControl>
-          </Grid>
-          <Grid item xs={6} md={3}>
-            <TimePicker
-              label="Start Time"
-              value={timePickerStart}
-              onChange={setTimePickerStart}
-              disabled={timeMode !== 'range'}
-              slotProps={{ textField: { size: 'small', fullWidth: true } }}
-            />
-          </Grid>
-          <Grid item xs={6} md={3}>
-            <TimePicker
-              label="End Time"
-              value={timePickerEnd}
-              onChange={setTimePickerEnd}
-              disabled={timeMode !== 'range'}
-              slotProps={{ textField: { size: 'small', fullWidth: true } }}
-            />
-          </Grid>
-          <Grid item xs={12} md={3} sx={{ display:'flex', alignItems:'center' }}>
-            <FormControl fullWidth size="small">
-              <InputLabel>Time Filter</InputLabel>
-              <Select value={timeMode} onChange={(e) => setTimeMode(e.target.value)}>
-                <MenuItem value="range">Time Range</MenuItem>
-                <MenuItem value="none">No Time Filter</MenuItem>
-              </Select>
-            </FormControl>
-          </Grid>
-        </Grid>
+          </FilterGrid>
+
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 2, alignItems: 'center' }}>
+            <FormControlLabel control={<Switch checked={onlyMine} onChange={handleOnlyMineChange} />} label="Only my calls" />
+            <FormControlLabel control={<Switch checked={lowScoreOnly} onChange={handleLowScoreChange} />} label={`Low scores (≤ ${LOW_SCORE_MAX})`} />
+            <MoreFiltersToggle open={moreFilters} onToggle={() => setMoreFilters(v => !v)} count={moreCount} />
+          </Box>
+
+          {moreFilters && (
+            <FilterGrid sx={{ borderTop: 1, borderColor: 'divider', borderTopStyle: 'dashed', pt: 2 }}>
+              <TextField size="small" label="Min duration (min)" value={durationMin} onChange={(e) => setDurationMin(e.target.value)} />
+              <FormControl size="small">
+                <InputLabel id="time-filter-label">Time filter</InputLabel>
+                <Select labelId="time-filter-label" label="Time filter" value={timeMode} onChange={(e) => setTimeMode(e.target.value)}>
+                  <MenuItem value="range">Time range</MenuItem>
+                  <MenuItem value="none">No time filter</MenuItem>
+                </Select>
+              </FormControl>
+              <TimePicker label="Start time" value={timePickerStart} onChange={setTimePickerStart} disabled={timeMode !== 'range'} slotProps={{ textField: { size: 'small', fullWidth: true } }} />
+              <TimePicker label="End time" value={timePickerEnd} onChange={setTimePickerEnd} disabled={timeMode !== 'range'} slotProps={{ textField: { size: 'small', fullWidth: true } }} />
+            </FilterGrid>
+          )}
+
+          <ActiveFilterChips items={activeFilters} onClearAll={activeFilters.length > 1 ? clearAllFilters : null} />
+        </Card>
 
         {focusedPath && (
-          <Alert
-            severity="info"
-            sx={{ mb: 2 }}
-            action={<Button color="inherit" size="small" onClick={clearFocus}>Show all</Button>}
-          >
+          <Alert severity="info" action={<Button color="inherit" size="small" onClick={clearFocus}>Show all</Button>}>
             Showing one linked recording{dateFromRecordingPath(focusedPath) ? ` from ${dateFromRecordingPath(focusedPath).format("MMM D, YYYY")}` : ''}.
           </Alert>
         )}
 
-        {/* Results and pagination controls */}
-        <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-          <Typography variant="body2" color="text.secondary">
-            {loading ? "Loading..." : `Showing ${files.length} of ${(Number(totalCount) || 0).toLocaleString()} files`}
-          </Typography>
-          <Box display="flex" alignItems="center" gap={2}>
-            <FormControl size="small">
-              <InputLabel>Per Page</InputLabel>
-              <Select value={filesPerPage} onChange={handleFilesPerPageChange}>
+        <Card aria-label="Results">
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1.5, flexWrap: 'wrap', mb: 1.5 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+              <Typography variant="h6">{listHeading}</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ fontVariantNumeric: 'tabular-nums' }}>
+                {loading ? '· Loading…' : `· ${(Number(totalCount) || 0).toLocaleString()} recording${Number(totalCount) === 1 ? '' : 's'}`}
+              </Typography>
+              <Tooltip title="Refresh">
+                <span>
+                  <IconButton
+                    size="small"
+                    aria-label="Refresh"
+                    onClick={() => (focusedPath ? fetchFocused(focusedPath) : refreshFiles(true))}
+                    disabled={loading || (view === 'all' && !calendarDateStart && !focusedPath)}
+                    sx={{ border: 1, borderColor: 'divider' }}
+                  >
+                    <RefreshIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </Box>
+            <FormControl size="small" sx={{ minWidth: 110 }}>
+              <InputLabel id="per-page-label">Per page</InputLabel>
+              <Select labelId="per-page-label" label="Per page" value={filesPerPage} onChange={handleFilesPerPageChange}>
                 <MenuItem value={10}>10</MenuItem>
                 <MenuItem value={25}>25</MenuItem>
                 <MenuItem value={50}>50</MenuItem>
@@ -1730,210 +1458,160 @@ function FileViewer({ darkMode }) {
               </Select>
             </FormControl>
           </Box>
-        </Box>
 
-        {error500 && (
-          <Paper sx={{ p: 2, mb: 2, backgroundColor: 'error.light' }}>
-            <Typography color="error.contrastText">
-              {errorMessage
-                ? `🚫 ${errorMessage}`
-                : '❌ Server error occurred. Please try again or contact support.'}
-            </Typography>
-          </Paper>
-        )}
+          {error500 && (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              {errorMessage || 'Server error occurred. Please try again or contact support.'}
+            </Alert>
+          )}
 
-        {loading && (
-          <Box display="flex" justifyContent="center" mb={2}>
-            <CircularProgress />
-          </Box>
-        )}
+          {loading && files.length === 0 && (
+            <Box display="flex" justifyContent="center" py={4}><CircularProgress size={28} /></Box>
+          )}
 
-        {files.length === 0 && !loading && (calendarDateStart || view !== 'all' || focusedPath) && (
-          <Paper sx={{ p: 4, textAlign: 'center', backgroundColor: darkMode ? 'grey.900' : 'grey.50' }}>
-            <Typography variant="h6" color="text.secondary">
-              {emptyMessage}
-            </Typography>
-            {view === 'favorites' && !focusedPath && (
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                Use the ☆ in the Favorites column to add a recording to your favorites.
-              </Typography>
-            )}
-          </Paper>
-        )}
-
-        {files.length > 0 && (
-          <>
-            <TableContainer component={Paper} sx={{ mb: 2 }}>
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'date'}
-                        direction={sortColumn === 'date' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('date')}
-                      >
-                        Date
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'time'}
-                        direction={sortColumn === 'time' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('time')}
-                      >
-                        Time
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'callId'}
-                        direction={sortColumn === 'callId' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('callId')}
-                      >
-                        Call ID
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'phone'}
-                        direction={sortColumn === 'phone' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('phone')}
-                      >
-                        Phone
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'email'}
-                        direction={sortColumn === 'email' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('email')}
-                      >
-                        Email
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'durationMs'}
-                        direction={sortColumn === 'durationMs' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('durationMs')}
-                      >
-                        Duration
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'callDisposition'}
-                        direction={sortColumn === 'callDisposition' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('callDisposition')}
-                      >
-                        Disposition
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'score'}
-                        direction={sortColumn === 'score' ? sortDirection : 'asc'}
-                        onClick={() => handleSort('score')}
-                      >
-                        Score
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell>
-                      <TableSortLabel
-                        active={sortColumn === 'favoriteCount'}
-                        direction={sortColumn === 'favoriteCount' ? sortDirection : 'desc'}
-                        onClick={() => handleSort('favoriteCount')}
-                      >
-                        Favorites
-                      </TableSortLabel>
-                    </TableCell>
-                    <TableCell align="center">Actions</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {files.map((fileInfo) => (
-                    <TableRow
-                      key={fileInfo.file}
-                      hover
-                      selected={currentTrack === fileInfo.file}
-                      onClick={(e) => {
-                        // Buttons in the row (play, favorite, comments) handle their own clicks.
-                        if (e.target.closest('button, a, input')) return;
-                        openCallFile(fileInfo);
-                      }}
-                      sx={{ cursor: 'pointer' }}
-                    >
-                      <TableCell>{fileInfo.date}</TableCell>
-                      <TableCell>{fileInfo.time}</TableCell>
-                      <TableCell>{fileInfo.callId || '-'}</TableCell>
-                      <TableCell>{fileInfo.phone}</TableCell>
-                      <TableCell>{fileInfo.email}</TableCell>
-                      <TableCell>{formatDuration(fileInfo.durationMs)}</TableCell>
-                      <TableCell>{fileInfo.callDisposition || '-'}</TableCell>
-                      <TableCell><ScoreChip score={fileInfo.overallScore} /></TableCell>
-                      <TableCell>
-                        <Box display="flex" alignItems="center">
-                          {/* The span lets the tooltip explain a disabled star. */}
-                          <Tooltip title={favoriteTooltip(fileInfo)}>
-                            <span>
-                              <IconButton
-                                size="small"
-                                disabled={!fileInfo.canFavorite}
-                                onClick={() => toggleFavorite(fileInfo)}
-                                aria-pressed={fileInfo.favoritedByMe}
-                                aria-label={favoriteTooltip(fileInfo)}
-                              >
-                                {fileInfo.favoritedByMe ? <StarIcon color="warning" /> : <StarBorderIcon />}
-                              </IconButton>
-                            </span>
-                          </Tooltip>
-                          {fileInfo.favoriteCount > 0 && (
-                            <Typography variant="body2" component="span">{fileInfo.favoriteCount}</Typography>
-                          )}
-                        </Box>
-                      </TableCell>
-                      <TableCell align="center">
-                        <IconButton
-                          color="primary"
-                          onClick={() => playAudio(fileInfo.file)}
-                          size="small"
-                          title="Play"
-                        >
-                          <PlayArrowIcon />
-                        </IconButton>
-                        <IconButton
-                          onClick={() => openCallFile(fileInfo, 'activity')}
-                          size="small"
-                          title="Comments"
-                          aria-label={`Comments (${fileInfo.commentCount})`}
-                          sx={{ ml: 1 }}
-                        >
-                          <Badge badgeContent={fileInfo.commentCount} color="primary" max={99}>
-                            <ChatBubbleOutlineIcon fontSize="small" />
-                          </Badge>
-                        </IconButton>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableContainer>
-
-            <Box display="flex" justifyContent="center">
-              <Pagination
-                count={Math.max(1, Math.ceil((Number(totalCount) || 0) / filesPerPage))}
-                page={Math.floor(currentOffset / filesPerPage) + 1}
-                onChange={handlePageChange}
-                color="primary"
-                showFirstButton
-                showLastButton
-              />
+          {files.length === 0 && !loading && (calendarDateStart || view !== 'all' || focusedPath) && (
+            <Box sx={{ py: 5, textAlign: 'center' }}>
+              <Typography color="text.secondary">{emptyMessage}</Typography>
+              {view === 'favorites' && !focusedPath && (
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Use the ☆ in the Favorites column to add a recording to your favorites.
+                </Typography>
+              )}
             </Box>
-          </>
-        )}
-      </Container>
+          )}
 
+          {files.length > 0 && (
+            <>
+              <TableContainer sx={{ border: 1, borderColor: 'divider', borderRadius: 3, opacity: loading ? 0.6 : 1, overflowX: 'auto' }}>
+                <Table size="small" sx={{ '& th, & td': { px: 1.25 }, '& th': { whiteSpace: 'nowrap' } }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{sortHeader('date', 'Date')} · {sortHeader('time', 'Time')}</TableCell>
+                      <TableCell>{sortHeader('phone', 'Customer')}</TableCell>
+                      <TableCell>{sortHeader('email', 'Agent')}</TableCell>
+                      <TableCell>{sortHeader('callId', 'Call ID')}</TableCell>
+                      <TableCell>{sortHeader('durationMs', 'Duration')}</TableCell>
+                      <TableCell>{sortHeader('callDisposition', 'Disposition')}</TableCell>
+                      <TableCell>{sortHeader('score', 'Score')}</TableCell>
+                      <TableCell>{sortHeader('favoriteCount', '★', 'desc')}</TableCell>
+                      <TableCell align="right">Actions</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {files.map((fileInfo) => {
+                      const day = dayjs(fileInfo.date.replace(/\//g, '-'));
+                      const clock = fileInfo.time ? dayjs(`2000-01-01 ${fileInfo.time}`) : null;
+                      return (
+                        <TableRow
+                          key={fileInfo.file}
+                          hover
+                          selected={currentTrack === fileInfo.file}
+                          onClick={(e) => {
+                            // Buttons in the row (play, favorite, comments) handle their own clicks.
+                            if (e.target.closest('button, a, input')) return;
+                            openCallFile(fileInfo);
+                          }}
+                          sx={{ cursor: 'pointer' }}
+                        >
+                          <TableCell sx={{ whiteSpace: 'nowrap' }}>{twoLine(clock?.isValid() ? clock.format('h:mm A') : fileInfo.time, day.isValid() ? day.format('MMM D, YYYY') : fileInfo.date)}</TableCell>
+                          <TableCell sx={{ maxWidth: 220 }}>{fileInfo.customerName ? twoLine(fileInfo.customerName, formatPhone(fileInfo.phone)) : twoLine(formatPhone(fileInfo.phone))}</TableCell>
+                          <TableCell sx={{ maxWidth: 240 }}>{twoLine(fileInfo.agentName || fileInfo.agentEmail || fileInfo.email, fileInfo.agentName ? (fileInfo.agentEmail || fileInfo.email) : null)}</TableCell>
+                          <TableCell sx={{ color: 'text.secondary', fontVariantNumeric: 'tabular-nums' }}>{fileInfo.callId || '–'}</TableCell>
+                          <TableCell sx={{ fontVariantNumeric: 'tabular-nums' }}>{formatDuration(fileInfo.durationMs)}</TableCell>
+                          <TableCell>{fileInfo.callDisposition ? <Chip size="small" variant="outlined" label={fileInfo.callDisposition} sx={{ borderRadius: 1.5, fontWeight: 500 }} /> : '–'}</TableCell>
+                          <TableCell><ScoreChip score={fileInfo.overallScore} /></TableCell>
+                          <TableCell>
+                            <Box display="flex" alignItems="center">
+                              {/* The span lets the tooltip explain a disabled star. */}
+                              <Tooltip title={favoriteTooltip(fileInfo)}>
+                                <span>
+                                  <IconButton
+                                    size="small"
+                                    disabled={!fileInfo.canFavorite}
+                                    onClick={() => toggleFavorite(fileInfo)}
+                                    aria-pressed={fileInfo.favoritedByMe}
+                                    aria-label={favoriteTooltip(fileInfo)}
+                                  >
+                                    {fileInfo.favoritedByMe ? <StarIcon color="warning" fontSize="small" /> : <StarBorderIcon fontSize="small" />}
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                              {fileInfo.favoriteCount > 0 && (
+                                <Typography variant="body2" component="span" color="text.secondary">{fileInfo.favoriteCount}</Typography>
+                              )}
+                            </Box>
+                          </TableCell>
+                          <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                            <IconButton
+                              onClick={() => (currentTrack === fileInfo.file && playing ? (isPlaying ? pauseAudio() : resumeAudio()) : playAudio(fileInfo.file))}
+                              size="small"
+                              aria-label={currentTrack === fileInfo.file && isPlaying ? 'Pause' : 'Play'}
+                              sx={{ bgcolor: 'primary.main', color: 'primary.contrastText', '&:hover': { bgcolor: 'primary.dark' } }}
+                            >
+                              {currentTrack === fileInfo.file && isPlaying ? <PauseIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
+                            </IconButton>
+                            <IconButton
+                              onClick={() => openCallFile(fileInfo, 'activity')}
+                              size="small"
+                              aria-label={`Comments (${fileInfo.commentCount})`}
+                              sx={{ ml: 1, border: 1, borderColor: 'divider' }}
+                            >
+                              <Badge badgeContent={fileInfo.commentCount} color="primary" max={99}>
+                                <ChatBubbleOutlineIcon fontSize="small" />
+                              </Badge>
+                            </IconButton>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, mt: 2 }}>
+                <Typography variant="body2" color="text.secondary" sx={{ fontVariantNumeric: 'tabular-nums' }}>
+                  Showing {(currentOffset + 1).toLocaleString()}–{(currentOffset + files.length).toLocaleString()} of {(Number(totalCount) || 0).toLocaleString()}
+                </Typography>
+                <Pagination
+                  count={Math.max(1, Math.ceil((Number(totalCount) || 0) / filesPerPage))}
+                  page={Math.floor(currentOffset / filesPerPage) + 1}
+                  onChange={handlePageChange}
+                  color="primary"
+                  shape="circular"
+                  showFirstButton
+                  showLastButton
+                />
+              </Box>
+            </>
+          )}
+        </Card>
+      </Box>
+
+      {currentTrack && (
+        <PlayerBar
+          player={playerView}
+          durationHintMs={playingRow?.durationMs}
+          speeds={PLAYBACK_RATE_OPTIONS}
+          title={playingRow ? (playingRow.customerName || formatPhone(playingRow.phone)) : currentTrack.split('/').pop()}
+          subtitle={playingRow ? [playingRow.agentName || playingRow.email, dayjs(playingRow.date.replace(/\//g, '-')).format('MMM D, YYYY')].filter(Boolean).join(' · ') : null}
+          actions={(
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Box sx={{ display: { xs: 'none', lg: 'flex' }, alignItems: 'center', gap: 1, width: 110 }}>
+                <VolumeUpIcon fontSize="small" sx={{ color: 'text.secondary' }} />
+                <Slider size="small" aria-label="Volume" value={volume} min={0} max={1} step={0.05} onChange={(_, v) => handleVolumeChange(v)} />
+              </Box>
+              {playingRow && (
+                <Button size="small" variant="outlined" onClick={() => openCallFile(playingRow)} sx={{ display: { xs: 'none', sm: 'inline-flex' }, whiteSpace: 'nowrap' }}>
+                  Open call file
+                </Button>
+              )}
+              <Tooltip title="Stop and close the player">
+                <IconButton size="small" aria-label="Stop" onClick={stopAudio}><StopIcon fontSize="small" /></IconButton>
+              </Tooltip>
+            </Box>
+          )}
+        />
+      )}
     </LocalizationProvider>
   );
 }

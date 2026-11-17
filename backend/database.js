@@ -953,6 +953,7 @@ export async function queryFiles(filters = {}) {
   // the sort key, as favorite_count is for "Most favorited").
   const dataQuery = `
     SELECT file_path, phone, email, call_date, call_time, call_id, call_disposition, duration_ms, file_size,
+      agent_email, agent_name, customer_name,
       (SELECT COUNT(*) FROM recording_favorites rf WHERE rf.file_path = f.file_path)::int AS favorite_count,
       (SELECT COUNT(*) FROM recording_comments rc WHERE rc.file_path = f.file_path)::int AS comment_count,
       (SELECT ca.overall_score FROM call_analyses ca WHERE ca.file_path = f.file_path AND ca.status = 'completed')::float AS overall_score,
@@ -989,6 +990,9 @@ export async function queryFiles(filters = {}) {
       comment_count: f.comment_count,
       favorited_by_me: f.favorited_by_me,
       overall_score: f.overall_score ?? null,
+      agent_email: f.agent_email || null,
+      agent_name: f.agent_name || null,
+      customer_name: f.customer_name || null,
       // NULL when files.email is NULL and no reporting row matches.
       is_mine: f.is_mine === true
     })),

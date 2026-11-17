@@ -1767,6 +1767,9 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
         commentCount: f.comment_count,
         favoritedByMe: f.favorited_by_me,
         overallScore: f.overall_score,
+        agentEmail: f.agent_email,
+        agentName: f.agent_name,
+        customerName: f.customer_name,
         isMine: f.is_mine,
         // Members may favorite only their own calls; anyone may remove their own favorite.
         canFavorite: req.user.role !== 'member' || f.is_mine || f.favorited_by_me
