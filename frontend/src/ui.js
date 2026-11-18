@@ -27,9 +27,40 @@ export function formatPhone(raw) {
 
 export const recordingUrl = (path, extra = '') => `/recordings/view?path=${encodeURIComponent(path)}${extra}`;
 
-export function ScoreChip({ score, size = 'small', pending = false }) {
+// The transcription worker's minimum call length (ms), fetched once and shared; null until loaded.
+let minScoredPromise = null;
+export function useMinScoredMs() {
+  const { getToken } = useAuth();
+  const [value, setValue] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    if (!minScoredPromise) {
+      minScoredPromise = (async () => {
+        const token = await getToken();
+        const res = await fetch('/api/scoring/config', { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return (await res.json()).minDurationMs ?? null;
+      })().catch(() => { minScoredPromise = null; return null; });
+    }
+    minScoredPromise.then(v => { if (alive) setValue(v); });
+    return () => { alive = false; };
+  }, [getToken]);
+  return value;
+}
+
+// Calls at or below the minimum length are never transcribed or scored.
+export const isTooShortToScore = (durationMs, minMs) => minMs !== null && minMs !== undefined && durationMs > 0 && durationMs <= minMs;
+export const TOO_SHORT_LABEL = 'Not Scored: Call not long enough';
+
+export function ScoreChip({ score, size = 'small', pending = false, durationMs }) {
   const theme = useTheme();
+  const minScoredMs = useMinScoredMs();
   if (score === null || score === undefined) {
+    if (isTooShortToScore(durationMs, minScoredMs)) {
+      // Long label: on narrow screens it wraps to two lines instead of squeezing the row.
+      return <Chip size={size} label={TOO_SHORT_LABEL} variant="outlined"
+        sx={{ color: 'text.secondary', height: 'auto', maxWidth: { xs: 130, sm: 'none' }, '& .MuiChip-label': { whiteSpace: { xs: 'normal', sm: 'nowrap' }, textAlign: 'center', py: 0.25 } }} />;
+    }
     return <Chip size={size} label={pending ? 'Scoring…' : 'No score'} variant="outlined" sx={{ color: 'text.secondary' }} />;
   }
   const tone = scoreTone(score);

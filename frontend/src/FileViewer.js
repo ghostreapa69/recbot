@@ -1570,7 +1570,7 @@ function FileViewer({ darkMode }) {
                           <TableCell sx={{ color: 'text.secondary', fontVariantNumeric: 'tabular-nums' }}>{fileInfo.callId || '–'}</TableCell>
                           <TableCell sx={{ fontVariantNumeric: 'tabular-nums' }}>{formatDuration(fileInfo.durationMs)}</TableCell>
                           <TableCell>{fileInfo.callDisposition ? <Chip size="small" variant="outlined" label={fileInfo.callDisposition} sx={{ borderRadius: 1.5, fontWeight: 500 }} /> : '–'}</TableCell>
-                          <TableCell><ScoreChip score={fileInfo.overallScore} /></TableCell>
+                          <TableCell><ScoreChip score={fileInfo.overallScore} durationMs={fileInfo.durationMs} /></TableCell>
                           <TableCell>
                             <Box display="flex" alignItems="center">
                               {/* The span lets the tooltip explain a disabled star. */}

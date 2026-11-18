@@ -20,6 +20,8 @@ dayjs.extend(timezonePlugin);
 
 const LOOKBACK_DAYS = parseInt(process.env.TRANSCRIBE_LOOKBACK_DAYS || '7', 10);
 const MIN_DURATION_SECONDS = parseInt(process.env.TRANSCRIBE_MIN_DURATION_SECONDS || '50', 10);
+// Calls at or below this length are never transcribed or scored.
+export const MIN_DURATION_MS = MIN_DURATION_SECONDS * 1000;
 // On-prem GPU capacity sets the pace, so each step's batch size is configurable.
 const MAX_PER_TICK = parseInt(process.env.TRANSCRIBE_MAX_PER_TICK || '10', 10);
 const MAX_REDACTION_ATTEMPTS = 3;
@@ -68,7 +70,7 @@ async function findExistingJob(filePath) {
 
 async function submitNew(s3, bucket) {
   const cutoff = dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
-  const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_SECONDS * 1000, MAX_PER_TICK);
+  const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_MS, MAX_PER_TICK);
   let submitted = 0;
   for (const filePath of filePaths) {
     let wavPath;

@@ -65,7 +65,7 @@ export function CallRow({ row, extra }) {
           {[extra, row.disposition, row.duration_ms ? formatMs(row.duration_ms) : null].filter(Boolean).join(' · ')}
         </Typography>
       </Box>
-      <ScoreChip score={row.overall_score} pending />
+      <ScoreChip score={row.overall_score} pending durationMs={row.duration_ms} />
     </ButtonBase>
   );
 }
