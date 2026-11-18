@@ -405,6 +405,35 @@ export async function initializeDatabase() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_coaching_items_status ON coaching_items(status);`);
 
+  // Five9 agent groups (synced by five9Teams.js). A supervisor in a group
+  // manages the group's other members. Replaced wholesale on each sync.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS five9_users (
+      username TEXT PRIMARY KEY,
+      email TEXT,
+      full_name TEXT,
+      is_supervisor BOOLEAN NOT NULL DEFAULT FALSE,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      synced_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_five9_users_email ON five9_users(email);`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS five9_groups (
+      name TEXT PRIMARY KEY,
+      description TEXT,
+      synced_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS five9_group_members (
+      group_name TEXT NOT NULL,
+      username TEXT NOT NULL,
+      PRIMARY KEY (group_name, username)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_five9_group_members_user ON five9_group_members(username);`);
+
   // Create indexes
   // Migration: add call_disposition column to existing files tables
   await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS call_disposition TEXT;`);
@@ -885,6 +914,7 @@ export async function queryFiles(filters = {}) {
     scoreMax,
     favorites,
     mine,
+    agentEmails,
     viewerEmail,
     sortColumn = 'date',
     sortDirection = 'desc',
@@ -926,6 +956,8 @@ export async function queryFiles(filters = {}) {
     conditions.push(`EXISTS (SELECT 1 FROM recording_favorites rf WHERE rf.file_path = f.file_path)`);
   }
   if (mine) { conditions.push(ownedBySql(`$${paramIdx++}`)); params.push(viewerEmail || null); }
+  // A manager's team (an empty team matches nothing).
+  if (Array.isArray(agentEmails)) { conditions.push(`f.agent_email = ANY($${paramIdx++}::text[])`); params.push(agentEmails); }
 
   const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
   // The count query binds exactly these; Postgres rejects unused bind values.
@@ -2477,8 +2509,9 @@ export async function getRecordingReport(callId) {
 
 const SCORE_COLUMNS = ['intro', 'retention', 'info', 'sentiment', 'objection', 'control'];
 
-// Aggregates for one agent for the current period ($2..$3) and the previous one ($4..$5), in one pass.
-async function periodKpis(email, start, end, prevStart, prevEnd) {
+// Aggregates for a set of agents ($1, a text[]) for the current period ($2..$3)
+// and the previous one ($4..$5), in one pass.
+async function periodKpis(emails, start, end, prevStart, prevEnd) {
   const columns = (alias, from, to) => {
     const f = `FILTER (WHERE f.call_date >= ${from} AND f.call_date <= ${to})`;
     return [
@@ -2494,51 +2527,52 @@ async function periodKpis(email, start, end, prevStart, prevEnd) {
     SELECT ${columns('cur', '$2', '$3')},
       ${columns('prev', '$4', '$5')}
     FROM ${CALLS_FROM}
-    WHERE ${AGENT_SQL} = $1 AND f.call_date >= $4 AND f.call_date <= $3
-  `, [email, start, end, prevStart, prevEnd]);
+    WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $4 AND f.call_date <= $3
+  `, [emails, start, end, prevStart, prevEnd]);
   const pick = prefix => Object.fromEntries(Object.entries(row)
     .filter(([k]) => k.startsWith(`${prefix}_`))
     .map(([k, v]) => [k.slice(prefix.length + 1), v]));
   return { current: pick('cur'), previous: pick('prev') };
 }
 
-// Lowest or highest scored calls for one agent. The agent's scored calls are
+// Lowest or highest scored calls for a set of agents. Their scored calls are
 // collected first (MATERIALIZED); otherwise Postgres may walk every scored call
 // in the company in score order and probe each one, which takes seconds.
 const scoredCallsSql = (direction) => `
   WITH f AS MATERIALIZED (
     SELECT fi.*, ca.overall_score AS score
     FROM files fi JOIN call_analyses ca ON ca.file_path = fi.file_path AND ca.status = 'completed'
-    WHERE fi.agent_email = $1 AND fi.call_date >= $2 AND fi.call_date <= $3 AND ca.overall_score IS NOT NULL
+    WHERE fi.agent_email = ANY($1::text[]) AND fi.call_date >= $2 AND fi.call_date <= $3 AND ca.overall_score IS NOT NULL
   )
   SELECT ${callRowSql('f.score')}
   FROM f LEFT JOIN reporting r ON r.call_id = f.call_id
   ORDER BY f.score ${direction}, f.call_date DESC LIMIT 5`;
 
-export async function getAgentDashboard(email, { start, end, prevStart, prevEnd, bucket }) {
-  const { current, previous } = await periodKpis(email, start, end, prevStart, prevEnd);
+// Home page data for one agent ([email]) or a team (several emails).
+export async function getAgentDashboard(emails, { start, end, prevStart, prevEnd, bucket }) {
+  const { current, previous } = await periodKpis(emails, start, end, prevStart, prevEnd);
   const trunc = { day: 'day', week: 'week', month: 'month' }[bucket] || 'day';
   const [trend, dispositions, recent, worst, best] = await Promise.all([
     pool.query(`
       SELECT to_char(date_trunc('${trunc}', f.call_date::date), 'YYYY-MM-DD') AS bucket,
         AVG(ca.overall_score)::float AS avg_score, COUNT(*)::int AS calls
       FROM ${CALLS_FROM}
-      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
+      WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $2 AND f.call_date <= $3
       GROUP BY 1 ORDER BY 1
-    `, [email, start, end]),
+    `, [emails, start, end]),
     pool.query(`
       SELECT COALESCE(r.disposition, f.call_disposition, 'Unknown') AS disposition, COUNT(*)::int AS calls
       FROM ${CALLS_FROM}
-      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
+      WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $2 AND f.call_date <= $3
       GROUP BY 1 ORDER BY calls DESC LIMIT 6
-    `, [email, start, end]),
+    `, [emails, start, end]),
     pool.query(`
       SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
-      WHERE ${AGENT_SQL} = $1 AND f.call_date >= $2 AND f.call_date <= $3
+      WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $2 AND f.call_date <= $3
       ORDER BY f.call_date DESC, f.call_time DESC LIMIT 8
-    `, [email, start, end]),
-    pool.query(scoredCallsSql('ASC'), [email, start, end]),
-    pool.query(scoredCallsSql('DESC'), [email, start, end])
+    `, [emails, start, end]),
+    pool.query(scoredCallsSql('ASC'), [emails, start, end]),
+    pool.query(scoredCallsSql('DESC'), [emails, start, end])
   ]);
   return {
     current,
@@ -2551,14 +2585,42 @@ export async function getAgentDashboard(email, { start, end, prevStart, prevEnd,
   };
 }
 
-// Every scored call for an agent, oldest first, for badge and streak rules.
-export async function getAgentScoreHistory(email) {
+// Every scored call for an agent ([email]), oldest first, for badge and streak rules.
+export async function getAgentScoreHistory(emails) {
   const { rows } = await pool.query(`
     SELECT f.call_date, f.call_time, ca.overall_score::float AS overall, ${SCORE_COLUMNS.map(c => `ca.${c}_score AS ${c}`).join(', ')}
     FROM ${CALLS_FROM}
-    WHERE ${AGENT_SQL} = $1 AND ca.overall_score IS NOT NULL
+    WHERE ${AGENT_SQL} = ANY($1::text[]) AND ca.overall_score IS NOT NULL
     ORDER BY f.call_date, f.call_time
-  `, [email]);
+  `, [emails]);
+  return rows;
+}
+
+// One row per team member for the team dashboard: calls, scores and handle
+// time this period, plus the previous period's average score. Members with no
+// calls still get a row.
+export async function getTeamLeaderboard(emails, { start, end, prevStart, prevEnd }) {
+  const cur = 'FILTER (WHERE f.call_date >= $2 AND f.call_date <= $3)';
+  const { rows } = await pool.query(`
+    WITH s AS (
+      SELECT ${AGENT_SQL} AS email,
+        MAX(f.agent_name) AS five9_name,
+        COUNT(*) ${cur}::int AS calls,
+        COUNT(ca.overall_score) ${cur}::int AS scored,
+        AVG(ca.overall_score) ${cur}::float AS avg_score,
+        AVG(ca.overall_score) FILTER (WHERE f.call_date >= $4 AND f.call_date <= $5)::float AS prev_avg_score,
+        AVG(NULLIF(COALESCE(r.talk_time, 0) + COALESCE(r.hold_time, 0) + COALESCE(r.after_call_work_time, 0), 0)) ${cur}::float AS avg_handle_ms,
+        ${SCORE_COLUMNS.map(c => `AVG(ca.${c}_score) ${cur}::float AS ${c}`).join(',\n        ')}
+      FROM ${CALLS_FROM}
+      WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $4 AND f.call_date <= $3
+      GROUP BY 1
+    )
+    SELECT e.email, s.five9_name, COALESCE(s.calls, 0) AS calls, COALESCE(s.scored, 0) AS scored, s.avg_score, s.prev_avg_score,
+      s.avg_handle_ms, ${SCORE_COLUMNS.map(c => `s.${c}`).join(', ')}
+    FROM unnest($1::text[]) AS e(email)
+    LEFT JOIN s ON s.email = e.email
+    ORDER BY s.avg_score DESC NULLS LAST, e.email
+  `, [emails, start, end, prevStart, prevEnd]);
   return rows;
 }
 
@@ -2602,9 +2664,10 @@ export async function searchTranscripts({ q, agent = null, dateStart = null, dat
   return { results: rows.map(({ total, rank, ...row }) => row), total: rows[0]?.total ?? 0 };
 }
 
-export async function getTrends({ email = null, start, end, prevStart, prevEnd, bucket }) {
+// `emails` limits the trends to some agents (one agent, or a team); null is everyone.
+export async function getTrends({ emails = null, start, end, prevStart, prevEnd, bucket }) {
   const trunc = { day: 'day', week: 'week', month: 'month' }[bucket] || 'day';
-  const agentFilter = `($5::text IS NULL OR ${AGENT_SQL} = $5)`;
+  const agentFilter = `($5::text[] IS NULL OR ${AGENT_SQL} = ANY($5::text[]))`;
   const base = `FROM call_topics ct
     JOIN files f ON f.file_path = ct.file_path
     LEFT JOIN reporting r ON r.call_id = f.call_id
@@ -2620,35 +2683,41 @@ export async function getTrends({ email = null, start, end, prevStart, prevEnd, 
     HAVING COUNT(*) FILTER (WHERE f.call_date >= $1 AND f.call_date <= $2) > 0
     ORDER BY calls DESC
     LIMIT ${kind === 'topic' ? 20 : 15}
-  `, [start, end, prevStart, prevEnd, email]);
+  `, [start, end, prevStart, prevEnd, emails]);
   const [topics, keywords, overTime] = await Promise.all([
     counts('topic'),
     counts('keyword'),
     pool.query(`
       SELECT to_char(date_trunc('${trunc}', f.call_date::date), 'YYYY-MM-DD') AS bucket, ct.value, COUNT(*)::int AS calls
       ${base}
-      WHERE ct.kind = 'topic' AND f.call_date >= $1 AND f.call_date <= $2 AND ($3::text IS NULL OR ${AGENT_SQL} = $3)
+      WHERE ct.kind = 'topic' AND f.call_date >= $1 AND f.call_date <= $2 AND ($3::text[] IS NULL OR ${AGENT_SQL} = ANY($3::text[]))
       GROUP BY 1, 2 ORDER BY 1
-    `, [start, end, email])
+    `, [start, end, emails])
   ]);
   return { topics: topics.rows, keywords: keywords.rows, overTime: overTime.rows };
 }
 
-export async function listCoachingItems({ status = null, agent = null } = {}) {
+// `agents` (text[]) limits the queue to some agents, e.g. a manager's team; null is everyone.
+export async function listCoachingItems({ status = null, agents = null } = {}) {
   const { rows } = await pool.query(`
     SELECT ci.id, ci.status, ci.note, ci.created_by, ci.created_by_name, ci.created_at, ci.updated_at, ${CALL_ROW_SQL}
     FROM coaching_items ci
     JOIN files f ON f.file_path = ci.file_path
     LEFT JOIN reporting r ON r.call_id = f.call_id
     LEFT JOIN call_analyses ca ON ca.file_path = f.file_path AND ca.status = 'completed'
-    WHERE ($1::text IS NULL OR ci.status = $1) AND ($2::text IS NULL OR ci.agent_email = lower($2))
+    WHERE ($1::text IS NULL OR ci.status = $1) AND ($2::text[] IS NULL OR f.agent_email = ANY($2::text[]))
     ORDER BY ci.updated_at DESC
-  `, [status, agent]);
+  `, [status, agents]);
   return rows;
 }
 
-export async function getCoachingCounts() {
-  const { rows } = await pool.query(`SELECT status, COUNT(*)::int AS count FROM coaching_items GROUP BY status`);
+export async function getCoachingCounts(agents = null) {
+  const { rows } = await pool.query(`
+    SELECT ci.status, COUNT(*)::int AS count
+    FROM coaching_items ci JOIN files f ON f.file_path = ci.file_path
+    WHERE ($1::text[] IS NULL OR f.agent_email = ANY($1::text[]))
+    GROUP BY ci.status
+  `, [agents]);
   return Object.fromEntries(rows.map(r => [r.status, r.count]));
 }
 
@@ -2680,15 +2749,90 @@ export async function updateCoachingItem(id, { status, note }) {
   return rows[0] || null;
 }
 
-export async function getSuggestedCoaching(maxScore, sinceDate, limit = 20) {
+export async function getSuggestedCoaching(maxScore, sinceDate, limit = 20, agents = null) {
   const { rows } = await pool.query(`
     SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
     WHERE ca.overall_score <= $1 AND f.call_date >= $2
+      AND ($4::text[] IS NULL OR ${AGENT_SQL} = ANY($4::text[]))
       AND NOT EXISTS (SELECT 1 FROM coaching_items ci WHERE ci.file_path = f.file_path)
     ORDER BY ca.overall_score ASC, f.call_date DESC
     LIMIT $3
-  `, [maxScore, sinceDate, limit]);
+  `, [maxScore, sinceDate, limit, agents]);
   return rows;
+}
+
+// ============================================================
+// Five9 teams
+// ============================================================
+// Replaces the stored Five9 users, groups and memberships in one transaction.
+export async function saveFive9TeamSnapshot({ users, groups, members }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM five9_group_members');
+    await client.query('DELETE FROM five9_groups');
+    await client.query('DELETE FROM five9_users');
+    await client.query(`
+      INSERT INTO five9_users (username, email, full_name, is_supervisor, active)
+      SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::boolean[], $5::boolean[])
+      ON CONFLICT (username) DO NOTHING
+    `, [users.map(u => u.username), users.map(u => u.email), users.map(u => u.fullName), users.map(u => u.isSupervisor), users.map(u => u.active)]);
+    await client.query(`
+      INSERT INTO five9_groups (name, description) SELECT * FROM unnest($1::text[], $2::text[]) ON CONFLICT (name) DO NOTHING
+    `, [groups.map(g => g.name), groups.map(g => g.description)]);
+    await client.query(`
+      INSERT INTO five9_group_members (group_name, username) SELECT * FROM unnest($1::text[], $2::text[]) ON CONFLICT DO NOTHING
+    `, [members.map(m => m.groupName), members.map(m => m.username)]);
+    await client.query(`INSERT INTO app_state (key, value) VALUES ('five9_teams_synced_at', NOW()::text)
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Groups where this email belongs to a Five9 supervisor.
+export async function getSupervisedGroups(email) {
+  const { rows } = await pool.query(`
+    SELECT DISTINCT m.group_name AS name
+    FROM five9_users u JOIN five9_group_members m ON m.username = u.username
+    WHERE u.is_supervisor AND (u.email = $1 OR lower(u.username) = $1)
+    ORDER BY 1
+  `, [email]);
+  return rows.map(r => r.name);
+}
+
+export async function getAllFive9Groups() {
+  const { rows } = await pool.query('SELECT name FROM five9_groups ORDER BY name');
+  return rows.map(r => r.name);
+}
+
+// Active non-supervisor members of the given groups (null = every group), by email.
+export async function getGroupAgents(groupNames = null) {
+  const { rows } = await pool.query(`
+    SELECT COALESCE(u.email, lower(u.username)) AS email, MAX(u.full_name) AS name,
+      array_agg(DISTINCT m.group_name ORDER BY m.group_name) AS groups
+    FROM five9_users u JOIN five9_group_members m ON m.username = u.username
+    WHERE u.active AND NOT u.is_supervisor
+      AND (u.email IS NOT NULL OR u.username LIKE '%@%')
+      AND ($1::text[] IS NULL OR m.group_name = ANY($1::text[]))
+    GROUP BY 1
+    ORDER BY 2 NULLS LAST, 1
+  `, [groupNames]);
+  return rows;
+}
+
+export async function getFive9TeamStatus() {
+  const { rows: [row] } = await pool.query(`
+    SELECT (SELECT COUNT(*) FROM five9_groups)::int AS groups,
+      (SELECT COUNT(*) FROM five9_users WHERE is_supervisor)::int AS supervisors,
+      (SELECT COUNT(*) FROM five9_users WHERE NOT is_supervisor)::int AS agents,
+      (SELECT value FROM app_state WHERE key = 'five9_teams_synced_at') AS synced_at
+  `);
+  return row;
 }
 
 // ============================================================

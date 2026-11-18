@@ -52,6 +52,12 @@ RecBot is a production-focused web platform for browsing, filtering, auditing, a
 - **Topics & keywords**: what customers call about, company-wide or for one agent, with change from the previous period
 - **Coaching queue** (managers and admins only): queue calls for one-on-one review, with suggestions for low-scoring calls
 
+### 👥 Five9 Teams
+- **Teams come from Five9 agent groups**: a user with the Five9 supervisor role who is in an agent group manages that group's other (active) members. RecBot access still comes from the RecBot manager/admin role; Five9 only decides who is on whose team
+- **Synced** about a minute after start and every 6 hours (`getAgentGroups` and `getUsersInfo`), or on demand from Admin → Database Management → **Five9 teams → Sync now**. A failed sync keeps the previous teams. People are matched by their Five9 email (or username when it is an email)
+- **Managers with a team** open Home on a team dashboard (team totals, trend, categories, best and lowest calls, and a sortable per-agent table; click an agent to open their dashboard). Coaching defaults to their team, and Recordings and Trends get a **My team** option
+- **Admins** see every Five9 agent as their team and can narrow it to one group
+
 ### ⚡ Recording Scan & Five9 Matching
 - **Every 5 minutes** the backend lists today's recordings in S3 and inserts only the new ones (existing rows are left alone)
 - **Five9 lookup during the scan**: recordings from the last 6 hours that have a call ID but no Five9 call log row trigger one Five9 Call Log report covering just those calls (at most one every 10 minutes); the regular scheduled Five9 ingestion still runs for the Reports page
