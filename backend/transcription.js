@@ -24,7 +24,7 @@ const MIN_DURATION_SECONDS = parseInt(process.env.TRANSCRIBE_MIN_DURATION_SECOND
 export const MIN_DURATION_MS = MIN_DURATION_SECONDS * 1000;
 // Calls with these dispositions are never transcribed or scored (matched case-insensitively).
 export const SKIP_DISPOSITIONS = [
-  'Agent Error', 'Answering Machine', 'Caller Disconnected', 'DeadAir', 'Force Stop', 'Forced Logout',
+  'Agent Error', 'Answering Machine', 'DeadAir', 'Force Stop', 'Forced Logout',
   'Recycle', 'Sent To Voicemail', 'System Shutdown', 'Voicemail', 'X - DO NOT USE - ACW Expired'
 ];
 // On-prem GPU capacity sets the pace, so each step's batch size is configurable.
