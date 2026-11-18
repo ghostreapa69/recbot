@@ -140,6 +140,9 @@ WAV_DIR=/data/wav
 SCRIBERR_URL=https://scriberr.yourcompany.com
 SCRIBERR_API_KEY=your_scriberr_api_key
 # SCRIBERR_TRANSCRIBE_MODEL=        # blank = Scriberr's default model
+# SCRIBERR_DEVICE=cuda              # blank = CPU; cuda for an NVIDIA GPU server
+# SCRIBERR_COMPUTE_TYPE=float16     # float16 on GPU, int8 on CPU
+# SCRIBERR_BATCH_SIZE=8
 # SCRIBERR_LANGUAGE=en
 # SCRIBERR_LLM_MODEL=               # LLM configured in Scriberr
 # SCRIBERR_LLM_TIMEOUT_MS=600000

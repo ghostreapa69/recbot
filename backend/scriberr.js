@@ -8,6 +8,10 @@ import path from 'path';
 const BASE_URL = (process.env.SCRIBERR_URL || '').replace(/\/+$/, '');
 const API_KEY = process.env.SCRIBERR_API_KEY || '';
 const TRANSCRIBE_MODEL = process.env.SCRIBERR_TRANSCRIBE_MODEL || '';
+// Scriberr runs submitted jobs on the CPU unless told otherwise; set 'cuda' for a GPU server.
+const DEVICE = process.env.SCRIBERR_DEVICE || '';
+const COMPUTE_TYPE = process.env.SCRIBERR_COMPUTE_TYPE || '';
+const BATCH_SIZE = process.env.SCRIBERR_BATCH_SIZE || '';
 const LANGUAGE = process.env.SCRIBERR_LANGUAGE || 'en';
 const LLM_MODEL = process.env.SCRIBERR_LLM_MODEL || '';
 const REQUEST_TIMEOUT_MS = 30 * 1000;
@@ -49,6 +53,9 @@ export async function submit(filePath, title) {
   form.append('max_speakers', '2');
   form.append('language', LANGUAGE);
   if (TRANSCRIBE_MODEL) form.append('model', TRANSCRIBE_MODEL);
+  if (DEVICE) form.append('device', DEVICE);
+  if (COMPUTE_TYPE) form.append('compute_type', COMPUTE_TYPE);
+  if (BATCH_SIZE) form.append('batch_size', BATCH_SIZE);
   const res = await request('/api/v1/transcription/submit', { method: 'POST', body: form, timeoutMs: UPLOAD_TIMEOUT_MS });
   const job = await res.json();
   const id = job.id ?? job.job_id ?? job.ID;
