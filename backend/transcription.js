@@ -9,10 +9,11 @@ import crypto from 'crypto';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import {
   pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription, markRedactionFailed,
-  getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError
+  getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError,
+  getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis
 } from './database.js';
 import * as scriberr from './scriberr.js';
-import { redactUtterances, analyzeCall } from './analysis.js';
+import { redactUtterances, analyzeCall, identifyAgentSpeaker } from './analysis.js';
 
 dayjs.extend(utcPlugin);
 dayjs.extend(timezonePlugin);
@@ -142,6 +143,28 @@ async function analyzeMissing() {
   return analyzed;
 }
 
+// Re-checks scorecards made before the speaker check existed. If the agent turns out to be
+// the other speaker, the scorecard is deleted so the next tick scores the call again.
+export async function recheckSpeakers(limit = MAX_PER_TICK) {
+  let rescored = 0;
+  for (const row of await getAnalysesNeedingSpeakerCheck(limit)) {
+    try {
+      const detected = await identifyAgentSpeaker(row.utterances, llm(row.scriberr_id));
+      if (detected && row.agent_speaker && detected !== row.agent_speaker) {
+        console.log(`🔁 [SPEAKER] ${row.file_path} agent was ${row.agent_speaker}, detected ${detected} — rescoring`);
+        await deleteCallAnalysis(row.file_path);
+        rescored++;
+      } else {
+        await markSpeakerChecked(row.file_path);
+      }
+    } catch (err) {
+      // Left unchecked, so it's tried again on a later tick.
+      console.error(`❌ [SPEAKER] Check failed for ${row.file_path}: ${err.message}`);
+    }
+  }
+  return rescored;
+}
+
 let isRunning = false;
 
 // One pass of the worker: poll finished jobs, score new transcripts, submit new recordings.
@@ -158,8 +181,9 @@ export async function runTranscriptionTick({ s3, bucket }) {
     if (!locked) return;
     const completed = await pollPending();
     const analyzed = await analyzeMissing();
+    const rescored = await recheckSpeakers();
     const { submitted, failed } = await submitNew(s3, bucket);
-    console.log(`📝 [TRANSCRIBE] completed=${completed} analyzed=${analyzed} submitted=${submitted} failed=${failed}`);
+    console.log(`📝 [TRANSCRIBE] completed=${completed} analyzed=${analyzed} speakerRescores=${rescored} submitted=${submitted} failed=${failed}`);
   } catch (err) {
     console.error('❌ [TRANSCRIBE] Tick failed:', err.message);
   } finally {
