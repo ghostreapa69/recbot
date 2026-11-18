@@ -20,17 +20,48 @@ function parseTimestamp(value) {
   return ((Number(m[1] || 0) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000;
 }
 
-// Pulls the first JSON object out of a model reply (which may wrap it in prose or ``` fences).
-export function extractJson(text) {
+// The first complete {...} object in the text, found by matching braces outside strings,
+// so anything the model writes after the JSON is ignored. Unbalanced: the rest of the text.
+function firstJsonObject(text) {
   const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end <= start) throw new Error('Reply contained no JSON object');
-  return JSON.parse(text.slice(start, end + 1));
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return text.slice(start, i + 1);
+  }
+  return text.slice(start);
+}
+
+// Pulls the first JSON object out of a model reply (which may wrap it in prose or ``` fences,
+// or add text after it). Trailing commas are forgiven; anything else still throws.
+export function extractJson(text) {
+  const candidate = firstJsonObject(String(text).replace(/```(?:json)?/gi, ''));
+  if (!candidate) throw new Error('Reply contained no JSON object');
+  try {
+    return JSON.parse(candidate);
+  } catch (err) {
+    try {
+      return JSON.parse(candidate.replace(/,\s*([}\]])/g, '$1'));
+    } catch {
+      throw err;
+    }
+  }
 }
 
 // ------------------------------------------------------------------
 // PII redaction
 // ------------------------------------------------------------------
+// Lines go to the model and come back as "<number>|<text>" rather than JSON: nothing in what
+// people say (quotes, commas, braces) needs escaping, so the reply can't be malformed that way.
 const REDACT_PROMPT = `You redact personal information from a mortgage company phone call transcript.
 Replace each piece of personal information with a tag in square brackets:
 [PERSON_NAME] for any person's full or last name (keep the agent's and customer's first names only if they are used alone),
@@ -39,17 +70,19 @@ Replace each piece of personal information with a tag in square brackets:
 Numbers spoken as words or digit by digit are still personal information.
 Do not change anything else: keep loan amounts, interest rates, dates of appointments, company names and all other words exactly as they are.
 Keep any existing [TAG] placeholders.
-Reply with only JSON in this exact shape, one entry for every input line, using the same "i" numbers:
-{"lines":[{"i":0,"text":"..."}]}
+Each input line is "<number>|<text>". Reply with exactly one line for every input line, in the same order and the same form, "<number>|<redacted text>", using the same numbers. Write nothing else: no JSON, no notes.
 
 Lines:
 `;
+
+const oneLine = text => String(text).replace(/\s*[\r\n]+\s*/g, ' ').trim();
 
 function chunkUtterances(utterances) {
   const chunks = [];
   let current = [];
   let chars = 0;
   utterances.forEach((u, i) => {
+    if (!oneLine(u.text)) return; // nothing to redact
     if (current.length && (current.length >= REDACT_CHUNK_LINES || chars + u.text.length > REDACT_CHUNK_CHARS)) {
       chunks.push(current);
       current = [];
@@ -62,35 +95,54 @@ function chunkUtterances(utterances) {
   return chunks;
 }
 
-// Checks one chunk's reply covers exactly the requested lines; returns { index: text }.
-export function validateRedaction(reply, indexes) {
-  const json = extractJson(reply);
-  if (!Array.isArray(json.lines)) throw new Error('Redaction reply has no "lines" array');
-  const byIndex = new Map();
-  for (const line of json.lines) {
-    if (!Number.isInteger(line?.i) || typeof line.text !== 'string') throw new Error('Redaction reply has a malformed line');
-    byIndex.set(line.i, line.text.trim());
+// Reads a "<number>|<text>" reply. Returns { lines: Map(index -> text), missing: [indexes] }.
+// Chatter and fences are ignored. A number that wasn't asked for, or the same number twice
+// with different text, means the numbering can't be trusted, so the whole reply is rejected.
+export function parseRedaction(reply, indexes) {
+  const wanted = new Set(indexes);
+  const lines = new Map();
+  let trusted = true;
+  for (const raw of String(reply).split(/\r?\n/)) {
+    const m = /^\s*(?:[-*]\s*)?(\d+)\s*\|(.*)$/.exec(raw);
+    if (!m) continue;
+    const i = Number(m[1]);
+    const text = m[2].trim();
+    if (!wanted.has(i) || (lines.has(i) && lines.get(i) !== text)) { trusted = false; break; }
+    lines.set(i, text);
   }
-  for (const i of indexes) {
-    if (!byIndex.has(i)) throw new Error(`Redaction reply is missing line ${i}`);
+  if (!trusted) return { lines: new Map(), missing: [...indexes] };
+  for (const [i, text] of lines) if (!text) lines.delete(i);
+  return { lines, missing: indexes.filter(i => !lines.has(i)) };
+}
+
+// Redacts the given lines: one request, then one retry for just the lines that didn't come
+// back, then halves of whatever is still missing, down to single lines. Throws if a single
+// line can't be redacted.
+async function redactLines(utterances, indexes, llm) {
+  const ask = async idx => parseRedaction(await llm(REDACT_PROMPT + idx.map(i => `${i}|${oneLine(utterances[i].text)}`).join('\n')), idx);
+  const done = new Map();
+  let { lines, missing } = await ask(indexes);
+  lines.forEach((text, i) => done.set(i, text));
+  if (missing.length) {
+    ({ lines, missing } = await ask(missing));
+    lines.forEach((text, i) => done.set(i, text));
   }
-  if (byIndex.size !== indexes.length) throw new Error(`Redaction reply has ${byIndex.size} lines, expected ${indexes.length}`);
-  return byIndex;
+  if (missing.length === 1) throw new Error(`Redaction reply is missing line ${missing[0]}`);
+  if (missing.length) {
+    const mid = Math.ceil(missing.length / 2);
+    for (const half of [missing.slice(0, mid), missing.slice(mid)]) {
+      (await redactLines(utterances, half, llm)).forEach((text, i) => done.set(i, text));
+    }
+  }
+  return done;
 }
 
 // Returns a redacted copy of the utterances. Timings and speakers come from the input,
-// never from the model. Throws if any chunk can't be redacted, so nothing unredacted is kept.
+// never from the model. Throws if any line can't be redacted, so nothing unredacted is kept.
 export async function redactUtterances(utterances, llm) {
   const redacted = utterances.map(u => ({ ...u }));
   for (const indexes of chunkUtterances(utterances)) {
-    const lines = indexes.map(i => JSON.stringify({ i, text: utterances[i].text })).join('\n');
-    let byIndex;
-    try {
-      byIndex = validateRedaction(await llm(REDACT_PROMPT + lines), indexes);
-    } catch (err) {
-      // One retry: small local models sometimes break the JSON format.
-      byIndex = validateRedaction(await llm(REDACT_PROMPT + lines), indexes);
-    }
+    const byIndex = await redactLines(utterances, indexes, llm);
     for (const i of indexes) redacted[i].text = byIndex.get(i);
   }
   return redacted;
