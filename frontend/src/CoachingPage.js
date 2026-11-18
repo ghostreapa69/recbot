@@ -1,12 +1,13 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from 'react-router-dom';
-import { Alert, Box, Button, ButtonBase, Tab, Tabs, Typography } from "@mui/material";
+import { Alert, Box, Button, ButtonBase, Tab, Tabs, Typography, ToggleButton, ToggleButtonGroup } from "@mui/material";
 import dayjs from "dayjs";
 import relativeTime from 'dayjs/plugin/relativeTime';
 import { useAuth } from './auth';
 import { PageHeader } from './Layout';
 import { Card, ScoreChip, useApi, Loadable, postJson, recordingUrl, agentLabel } from './ui';
 import { rememberCallQueue } from './RecordingDetail';
+import { useMyTeam } from './TeamHome';
 
 dayjs.extend(relativeTime);
 
@@ -17,8 +18,13 @@ export default function CoachingPage() {
   const { getToken } = useAuth();
   const [status, setStatus] = useState('to_review');
   const [actionError, setActionError] = useState(null);
-  const queue = useApi(`/api/coaching?status=${status}`);
-  const suggested = useApi('/api/coaching/suggested');
+  // Managers with a Five9 team start on their team; "Everyone" shows all agents.
+  const { team, loading: teamLoading } = useMyTeam();
+  const [scopeChoice, setScopeChoice] = useState(null);
+  const scope = scopeChoice || (team?.hasTeam ? 'team' : 'all');
+  const ready = !teamLoading;
+  const queue = useApi(ready ? `/api/coaching?status=${status}&scope=${scope}` : null);
+  const suggested = useApi(ready ? `/api/coaching/suggested?scope=${scope}` : null);
   useEffect(() => { if (queue.data?.items) rememberCallQueue(queue.data.items.map(i => i.file_path)); }, [queue.data]);
 
   const run = async (fn) => {
@@ -37,7 +43,16 @@ export default function CoachingPage() {
 
   return (
     <>
-      <PageHeader title="Coaching queue" subtitle="Calls picked for one-on-one review. Only managers and admins can see this page." />
+      <PageHeader
+        title="Coaching queue"
+        subtitle="Calls picked for one-on-one review. Only managers and admins can see this page."
+        actions={team?.hasTeam && (
+          <ToggleButtonGroup size="small" exclusive value={scope} onChange={(_e, v) => v && setScopeChoice(v)} aria-label="Whose calls">
+            <ToggleButton value="team">{team.isAdmin ? 'Five9 agents' : 'My team'}</ToggleButton>
+            <ToggleButton value="all">Everyone</ToggleButton>
+          </ToggleButtonGroup>
+        )}
+      />
       {actionError && <Alert severity="error" sx={{ mb: 2 }}>{actionError}</Alert>}
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0,1fr)', lg: 'minmax(0,2fr) minmax(0,1fr)' }, gap: 2.5, alignItems: 'start' }}>
         <Card>

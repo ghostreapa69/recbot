@@ -133,10 +133,26 @@ let five9Queue = Promise.resolve();
 // Fetches Five9's Call Log for [start, end] (Dates) and upserts it into reporting.
 export function fetchCallLog({ start, end, auditUser = null }) {
   if (!five9Configured) return Promise.resolve({ inserted:0, total:0, disabled:true });
-  const run = () => runCallLogReport({ start: dayjs.tz(start, FIVE9_TIMEZONE), end: dayjs.tz(end, FIVE9_TIMEZONE), auditUser });
-  const result = five9Queue.then(run, run);
+  return runQueued(() => runCallLogReport({ start: dayjs.tz(start, FIVE9_TIMEZONE), end: dayjs.tz(end, FIVE9_TIMEZONE), auditUser }));
+}
+
+function runQueued(fn) {
+  const result = five9Queue.then(fn, fn);
   five9Queue = result.catch(() => {});
   return result;
+}
+
+// Calls one Admin API action (e.g. getAgentGroups) and returns the raw SOAP
+// response XML. Queued behind any running report; throws on a SOAP fault.
+export function five9AdminCall(action, innerXml = '') {
+  if (!five9Configured) return Promise.reject(new Error('Five9 credentials not set'));
+  return runQueued(async () => {
+    await establishFive9Session();
+    const xml = await soapRequest(action, `<ws:${action}>${innerXml}</ws:${action}>`);
+    const fault = xml.match(/<faultstring>([^<]+)<\/faultstring>/i);
+    if (fault) throw new Error(`Five9 ${action} fault: ${fault[1]}`);
+    return xml;
+  });
 }
 
 async function runCallLogReport({ start, end, auditUser }) {

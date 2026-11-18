@@ -21,12 +21,13 @@ import {
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
-import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription, getCallAnalysis, deleteCallAnalysis, getRecordingReport, insertNewFiles, fillFileAgents, getRecentFilesMissingFive9, runFileAgentBackfill, getAgentDashboard, getAgentScoreHistory, getTeamScoreChange, searchTranscripts, getTrends, listCoachingItems, getCoachingCounts, getCoachingItemForFile, addCoachingItem, updateCoachingItem, getSuggestedCoaching } from './database.js';
+import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabaseStats, getAuditLogs, getUserSessions, logAuditEvent, parseFileMetadata, logUserLogout, logUserSession, getDistinctUsers, expireStaleSessions, touchUserSession, expireInactiveSessions, repairOpenSessions, backfillExpiredOpenSessions, backfillFileMetadata, backfillAuditLogCallIds, queryReports, exportReports, getReportingSummary, getDistinctCampaigns, getDistinctCallTypes, getDistinctDispositions, getDistinctFileDispositions, exportAuditLogs, getUserUsageReport, exportUserUsageReport, normalizeReportTimestamp, getLegacyReportTimestampStats, rewriteReportTimestamps, getCallIdsWithRecordings, closeUserSession, getOpenSessionId, getRecordingContext, addFavorite, removeFavorite, getFavoriteState, getRecordingActivity, addComment, deleteComment, commentExists, getCommenterEmails, createNotifications, deleteUnreadFavoriteNotifications, deleteCommentNotifications, getNotifications, markNotificationsRead, getTranscription, getCallAnalysis, deleteCallAnalysis, getRecordingReport, insertNewFiles, fillFileAgents, getRecentFilesMissingFive9, runFileAgentBackfill, getAgentDashboard, getAgentScoreHistory, getTeamLeaderboard, saveFive9TeamSnapshot, getSupervisedGroups, getAllFive9Groups, getGroupAgents, getFive9TeamStatus, getTeamScoreChange, searchTranscripts, getTrends, listCoachingItems, getCoachingCounts, getCoachingItemForFile, addCoachingItem, updateCoachingItem, getSuggestedCoaching } from './database.js';
 import { computeBadges } from './badges.js';
 import { createAgentDirectory } from './agentDirectory.js';
 import { createRecordingScan } from './recordingScan.js';
 import { startTranscriptionWorker } from './transcription.js';
-import { fetchLastHourCallLog, fetchCallLog, five9Configured, scheduleRecurringIngestion } from './five9.js';
+import { fetchLastHourCallLog, fetchCallLog, five9Configured, five9AdminCall, scheduleRecurringIngestion } from './five9.js';
+import { syncFive9Teams } from './five9Teams.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -1749,6 +1750,8 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
       recordingPath: readRecordingPath(req.query.path),
       favorites: ['mine', 'any'].includes(req.query.favorites) ? req.query.favorites : null,
       mine: req.query.mine === '1',
+      // "My team": always the signed-in manager's own team, never from the query string.
+      agentEmails: req.query.team === '1' ? (await teamFor(req.user)).members.map(m => m.email) : undefined,
       viewerEmail: req.user.email.toLowerCase(),
       sortColumn,
       sortDirection,
@@ -2001,6 +2004,115 @@ const agentDirectory = createAgentDirectory({ query: (text, params) => pool.quer
 // Adds each call row's agent full name (Logto, else Five9, else the email).
 const withAgentNames = rows => rows.map(row => ({ ...row, agent_display_name: agentDirectory.agentName(row.agent_email) || row.agent_name || row.agent_email || null }));
 
+// ---- Five9 teams ----
+// A manager's team is the agents in the Five9 agent groups where they are a
+// supervisor; an admin's team is every Five9 agent (optionally one group).
+// Members have no team. Cached briefly; cleared after each sync.
+const TEAM_CACHE_MS = 5 * 60 * 1000;
+const teamCache = new Map();
+
+async function teamFor(user, group = null) {
+  const email = user.email.toLowerCase();
+  const isAdmin = user.role === 'admin';
+  if (!isAdmin && user.role !== 'manager') return { hasTeam: false, isAdmin: false, groups: [], group: null, members: [] };
+  const key = `${email}|${user.role}|${group || ''}`;
+  const cached = teamCache.get(key);
+  if (cached && Date.now() - cached.at < TEAM_CACHE_MS) return cached.team;
+
+  const groups = isAdmin ? await getAllFive9Groups() : await getSupervisedGroups(email);
+  const picked = group && groups.includes(group) ? group : null;
+  let members = [];
+  if (isAdmin) members = await getGroupAgents(picked ? [picked] : null);
+  else if (groups.length) members = await getGroupAgents(picked ? [picked] : groups);
+  members = members.map(m => ({ email: m.email, name: agentDirectory.agentName(m.email) || m.name || m.email, groups: m.groups }));
+  const team = { hasTeam: members.length > 0, isAdmin, groups, group: picked, members };
+  teamCache.set(key, { at: Date.now(), team });
+  return team;
+}
+
+const TEAM_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const TEAM_SYNC_LOCK = 727003;
+let lastTeamSync = null;
+
+// Pulls agent groups and users from Five9 and replaces the stored teams.
+// Only one container syncs at a time.
+async function runTeamSync(trigger) {
+  if (!five9Configured) return { skipped: 'Five9 credentials not set' };
+  const client = await pool.connect();
+  let locked = false;
+  try {
+    ({ rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [TEAM_SYNC_LOCK]));
+    if (!locked) return { skipped: 'another sync is running' };
+    const started = Date.now();
+    const result = await syncFive9Teams({ call: five9AdminCall, saveSnapshot: saveFive9TeamSnapshot });
+    teamCache.clear();
+    lastTeamSync = { at: new Date().toISOString(), trigger, ok: true, ...result };
+    console.log(`👥 [FIVE9 TEAMS] Synced (${trigger}) in ${Date.now() - started}ms: ${result.groups} groups, ${result.supervisors} supervisors, ${result.agents} agents, ${result.memberships} memberships, ${result.usersWithoutEmail} users without email`);
+    return result;
+  } catch (err) {
+    lastTeamSync = { at: new Date().toISOString(), trigger, ok: false, error: err.message };
+    console.error(`❌ [FIVE9 TEAMS] Sync failed (${trigger}); keeping the previous teams:`, err.message);
+    throw err;
+  } finally {
+    if (locked) await client.query('SELECT pg_advisory_unlock($1)', [TEAM_SYNC_LOCK]).catch(() => {});
+    client.release();
+  }
+}
+
+app.get('/api/teams/me', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const team = await teamFor(req.user, typeof req.query.group === 'string' ? req.query.group : null);
+    res.json(team);
+  } catch (err) {
+    console.error('Error in /api/teams/me:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/teams/dashboard', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const team = await teamFor(req.user, typeof req.query.group === 'string' ? req.query.group : null);
+    const period = periodFor(req.query.range);
+    if (!team.hasTeam) {
+      return res.json({ ...team, period, message: team.isAdmin ? 'No Five9 agent groups have been synced yet.' : 'No Five9 agent group lists you as a supervisor.' });
+    }
+    const emails = team.members.map(m => m.email);
+    const [dashboard, leaderboard] = await Promise.all([getAgentDashboard(emails, period), getTeamLeaderboard(emails, period)]);
+    const names = new Map(team.members.map(m => [m.email, m.name]));
+    res.json({
+      ...team,
+      period,
+      ...dashboard,
+      recent: withAgentNames(dashboard.recent),
+      worst: withAgentNames(dashboard.worst),
+      best: withAgentNames(dashboard.best),
+      leaderboard: leaderboard.map(row => ({ ...row, name: names.get(row.email) || row.five9_name || row.email }))
+    });
+  } catch (err) {
+    console.error('Error in /api/teams/dashboard:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/five9/teams/status', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    res.json({ configured: five9Configured, ...(await getFive9TeamStatus()), lastSync: lastTeamSync });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/five9/teams/sync', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const result = await runTeamSync('manual');
+    await logAuditEvent(req.user.id, req.user.email, 'MAINTENANCE', null, null, req.user.ipAddress, req.user.userAgent,
+      req.currentSessionId || null, { maintenance: 'five9_team_sync', ...result });
+    res.json({ result, status: await getFive9TeamStatus(), lastSync: lastTeamSync });
+  } catch (err) {
+    res.status(502).json({ error: `Five9 team sync failed: ${err.message}`, lastSync: lastTeamSync });
+  }
+});
+
 const readEmail = value => (typeof value === 'string' && value.includes('@') && value.length <= 320 ? value.trim().toLowerCase() : null);
 const readDate = value => (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null);
 
@@ -2026,8 +2138,8 @@ app.get('/api/agents/dashboard', requireAuth, ensureSession, requireAuthenticate
     const period = periodFor(req.query.range);
     const week = periodFor('week');
     const [dashboard, history, teamChange] = await Promise.all([
-      getAgentDashboard(email, period),
-      getAgentScoreHistory(email),
+      getAgentDashboard([email], period),
+      getAgentScoreHistory([email]),
       getTeamScoreChange(week.start, week.end, week.prevStart, week.prevEnd)
     ]);
     res.json({
@@ -2070,8 +2182,15 @@ app.get('/api/search/transcripts', requireAuth, ensureSession, requireAuthentica
 app.get('/api/trends', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
   try {
     const period = periodFor(req.query.range);
-    const email = req.query.scope === 'agent' ? (readEmail(req.query.email) || req.user.email.toLowerCase()) : null;
-    res.json({ period, email, ...(await getTrends({ email, ...period })) });
+    let emails = null;
+    let email = null;
+    if (req.query.scope === 'agent') {
+      email = readEmail(req.query.email) || req.user.email.toLowerCase();
+      emails = [email];
+    } else if (req.query.scope === 'team') {
+      emails = (await teamFor(req.user)).members.map(m => m.email);
+    }
+    res.json({ period, email, scope: req.query.scope || 'global', ...(await getTrends({ emails, ...period })) });
   } catch (err) {
     console.error('Error in /api/trends:', err);
     res.status(500).json({ error: err.message });
@@ -2083,14 +2202,25 @@ const COACHING_NOTE_MAX_LENGTH = 2000;
 const COACHING_SUGGEST_MAX_SCORE = -3;
 const COACHING_SUGGEST_DAYS = 14;
 
+// The coaching queue shows a manager's team by default (scope=team) when they
+// have one; scope=all (or no team) shows everyone.
+async function coachingScope(req) {
+  const team = await teamFor(req.user);
+  const wantTeam = req.query.scope ? req.query.scope === 'team' : team.hasTeam;
+  return wantTeam ? { scope: 'team', agents: team.members.map(m => m.email) } : { scope: 'all', agents: null };
+}
+
 app.get('/api/coaching', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     const status = COACHING_STATUSES.includes(req.query.status) ? req.query.status : null;
+    const { scope, agents } = await coachingScope(req);
+    const filterAgent = readEmail(req.query.agent);
+    const scoped = filterAgent ? [filterAgent].filter(e => !agents || agents.includes(e)) : agents;
     const [items, counts] = await Promise.all([
-      listCoachingItems({ status, agent: readEmail(req.query.agent) }),
-      getCoachingCounts()
+      listCoachingItems({ status, agents: scoped }),
+      getCoachingCounts(agents)
     ]);
-    res.json({ items: withAgentNames(items), counts });
+    res.json({ items: withAgentNames(items), counts, scope });
   } catch (err) {
     console.error('Error in /api/coaching:', err);
     res.status(500).json({ error: err.message });
@@ -2100,7 +2230,8 @@ app.get('/api/coaching', requireAuth, ensureSession, requireManagerOrAdmin, asyn
 app.get('/api/coaching/suggested', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
     const since = dayjs().tz(APP_TIMEZONE).subtract(COACHING_SUGGEST_DAYS, 'day').format('YYYY-MM-DD');
-    res.json({ items: withAgentNames(await getSuggestedCoaching(COACHING_SUGGEST_MAX_SCORE, since)), maxScore: COACHING_SUGGEST_MAX_SCORE, days: COACHING_SUGGEST_DAYS });
+    const { scope, agents } = await coachingScope(req);
+    res.json({ items: withAgentNames(await getSuggestedCoaching(COACHING_SUGGEST_MAX_SCORE, since, 20, agents)), maxScore: COACHING_SUGGEST_MAX_SCORE, days: COACHING_SUGGEST_DAYS, scope });
   } catch (err) {
     console.error('Error in /api/coaching/suggested:', err);
     res.status(500).json({ error: err.message });
@@ -2812,6 +2943,13 @@ initializeDatabase().then(() => {
 
     // One-time: index and fill agent columns on existing recordings (no-op once done).
     runFileAgentBackfill().catch(err => console.error('❌ [AGENT BACKFILL] Failed:', err.message));
+
+    // Five9 agent groups → manager teams: shortly after start, then every 6 hours.
+    if (five9Configured) {
+      const syncTeams = () => runTeamSync('scheduled').catch(() => {});
+      setTimeout(syncTeams, 60 * 1000);
+      setInterval(syncTeams, TEAM_SYNC_INTERVAL_MS);
+    }
 
     // Load the agent list now so the first dropdown doesn't wait for it.
     agentDirectory.refresh().catch(err => console.error('❌ [AGENTS] Initial load failed:', err.message));

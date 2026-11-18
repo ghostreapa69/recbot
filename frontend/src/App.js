@@ -18,7 +18,7 @@ import AdminPage from './AdminPage';
 import ReportsPage from './ReportsPage';
 import { AuthProvider, useUser } from './auth';
 import Layout from './Layout';
-import AgentHome from './AgentHome';
+import Home from './TeamHome';
 import RecordingDetail from './RecordingDetail';
 import SearchPage from './SearchPage';
 import TrendsPage from './TrendsPage';
@@ -281,7 +281,7 @@ function HomeOrLegacyLink() {
   const location = useLocation();
   const recording = new URLSearchParams(location.search).get('recording');
   if (recording) return <Navigate to={`/recordings/view?path=${encodeURIComponent(recording)}`} replace />;
-  return <AgentHome />;
+  return <Home />;
 }
 
 function ManagerOnly({ children }) {

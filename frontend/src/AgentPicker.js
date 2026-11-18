@@ -9,16 +9,20 @@ const filterOptions = createFilterOptions({ stringify: a => `${a.name} ${a.email
 
 // Dropdown of agents by full name (from /api/agents), mapped to their emails.
 // `value` is an email; picking nothing goes back to the signed-in user.
-export default function AgentPicker({ value, onChange, width = 260, label = 'Agent' }) {
+// `teamOption` ({ label, onPick }) adds a "My team" entry at the top.
+const TEAM_KEY = '__team__';
+
+export default function AgentPicker({ value, onChange, width = 260, label = 'Agent', teamOption = null, placeholder = 'Search by name or email' }) {
   const { user } = useUser();
   const myEmail = (user?.primaryEmailAddress?.emailAddress || '').toLowerCase();
   const { data, error, loading } = useApi('/api/agents');
 
   const agents = data?.agents || [];
   // The signed-in user is always pickable, even with no recent calls.
-  const options = agents.some(a => a.email === myEmail) || !myEmail
+  const withMe = agents.some(a => a.email === myEmail) || !myEmail
     ? agents
     : [{ email: myEmail, name: [user?.firstName, user?.lastName].filter(Boolean).join(' ') || myEmail, calls: 0 }, ...agents];
+  const options = teamOption ? [{ email: TEAM_KEY, name: teamOption.label }, ...withMe] : withMe;
   const selected = options.find(a => a.email === value) || (value ? { email: value, name: value } : null);
 
   return (
@@ -31,19 +35,29 @@ export default function AgentPicker({ value, onChange, width = 260, label = 'Age
       filterOptions={filterOptions}
       getOptionLabel={a => a.name || a.email}
       isOptionEqualToValue={(a, b) => a.email === b.email}
-      onChange={(_e, picked) => onChange(picked ? picked.email : myEmail)}
+      onChange={(_e, picked) => {
+        if (picked?.email === TEAM_KEY) teamOption.onPick();
+        else onChange(picked ? picked.email : myEmail);
+      }}
       noOptionsText={error ? 'Could not load agents' : 'No matching agents'}
       renderInput={params => (
         <TextField
           {...params}
           label={label}
-          placeholder="Search by name or email"
+          placeholder={placeholder}
           error={Boolean(error)}
           helperText={error ? `Could not load the agent list: ${error}` : undefined}
         />
       )}
       renderOption={(props, a) => {
         const { key, ...rest } = props;
+        if (a.email === TEAM_KEY) {
+          return (
+            <li key={a.email} {...rest}>
+              <Typography variant="body2" fontWeight={700} color="primary">{a.name}</Typography>
+            </li>
+          );
+        }
         return (
           <li key={a.email} {...rest}>
             <Box sx={{ minWidth: 0 }}>

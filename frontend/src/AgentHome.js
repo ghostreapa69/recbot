@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useNavigate } from 'react-router-dom';
 import {
-  Box, Typography, ToggleButton, ToggleButtonGroup, ButtonBase, LinearProgress, Button
+  Box, Typography, ToggleButton, ToggleButtonGroup, ButtonBase, LinearProgress, Button, Alert
 } from "@mui/material";
 import { useTheme } from "@mui/material/styles";
 import dayjs from "dayjs";
@@ -14,10 +14,10 @@ import { ScoreTrendChart, CountBar } from './charts';
 import { softBg } from './theme';
 import AgentPicker from './AgentPicker';
 
-const RANGES = { week: 'last week', month: 'the 5 weeks before', year: 'the year before' };
-const BUCKET_LABEL = { day: 'ddd', week: 'MMM D', month: 'MMM' };
+export const RANGES = { week: 'last week', month: 'the 5 weeks before', year: 'the year before' };
+export const BUCKET_LABEL = { day: 'ddd', week: 'MMM D', month: 'MMM' };
 
-function Delta({ value, unit = '', goodWhenUp = true, digits = 0, onBrand = false }) {
+export function Delta({ value, unit = '', goodWhenUp = true, digits = 0, onBrand = false }) {
   if (value === null || value === undefined || Number.isNaN(value)) return null;
   const up = value >= 0;
   const good = goodWhenUp === null ? null : (goodWhenUp ? up : !up);
@@ -34,7 +34,7 @@ function Delta({ value, unit = '', goodWhenUp = true, digits = 0, onBrand = fals
   );
 }
 
-function Tile({ value, label, delta, hero }) {
+export function Tile({ value, label, delta, hero }) {
   return (
     <Box sx={{
       p: 1.75, borderRadius: 3.5, border: 1, display: 'flex', flexDirection: 'column', gap: 1.25, minWidth: 0,
@@ -117,11 +117,13 @@ function BadgesCard({ streak, badges }) {
   );
 }
 
-export default function AgentHome() {
+// One agent's dashboard. From the team view it opens on `initialEmail` with a
+// "Back to team" button (`onBackToTeam`); `note` shows a one-line notice.
+export default function AgentHome({ initialEmail = null, onBackToTeam = null, note = null }) {
   const { user } = useUser();
   const navigate = useNavigate();
   const myEmail = (user?.primaryEmailAddress?.emailAddress || '').toLowerCase();
-  const [email, setEmail] = useState(myEmail);
+  const [email, setEmail] = useState(initialEmail || myEmail);
   const [range, setRange] = useState('week');
   const { data, error, loading, reload } = useApi(email ? `/api/agents/dashboard?email=${encodeURIComponent(email)}&range=${range}` : null);
 
@@ -142,7 +144,8 @@ export default function AgentHome() {
         subtitle="Scores come from AI review of each transcribed call, from −10 (worst) to +10 (best)."
         actions={(
           <>
-            <AgentPicker value={email} onChange={setEmail} />
+            {onBackToTeam && <Button variant="outlined" onClick={onBackToTeam}>‹ Back to team</Button>}
+            <AgentPicker value={email} onChange={setEmail} teamOption={onBackToTeam ? { label: 'My team', onPick: onBackToTeam } : null} />
             <ToggleButtonGroup size="small" exclusive value={range} onChange={(_e, v) => v && setRange(v)} aria-label="Range">
               <ToggleButton value="week">Week</ToggleButton>
               <ToggleButton value="month">Month</ToggleButton>
@@ -151,6 +154,7 @@ export default function AgentHome() {
           </>
         )}
       />
+      {note && <Alert severity="info" sx={{ mb: 2.5 }}>{note}</Alert>}
       <Loadable loading={loading && !data} error={error} onRetry={reload}>
         {data && (
           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0,1fr)', lg: 'minmax(0,2fr) minmax(0,1fr)' }, gap: 2.5, alignItems: 'start', opacity: loading ? 0.6 : 1 }}>

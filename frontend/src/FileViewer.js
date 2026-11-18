@@ -49,6 +49,7 @@ import { rememberCallQueue } from './RecordingDetail';
 import { ScoreChip, recordingUrl, Card, FilterGrid, QuickRangeChips, ActiveFilterChips, MoreFiltersToggle, formatPhone } from './ui';
 import { PageHeader } from './Layout';
 import { PlayerBar } from './RecordingPlayer';
+import { useMyTeam } from './TeamHome';
 import { requestNotificationsRefresh } from './NotificationBell';
 
 dayjs.extend(customParseFormat);
@@ -198,13 +199,16 @@ function FileViewer({ darkMode }) {
   const [view, setView] = useState('all');
   const [onlyMine, setOnlyMine] = useState(false);
   const [lowScoreOnly, setLowScoreOnly] = useState(false);
+  // "My team": the manager's Five9 team (the server works out who that is).
+  const [myTeam, setMyTeam] = useState(false);
+  const { team } = useMyTeam();
   const [moreFilters, setMoreFilters] = useState(false);
   // Bumped after a filter chip is removed, so the refetch sees the updated state.
   const [refetchNonce, setRefetchNonce] = useState(0);
   // fetchFiles reads the view from this ref, so every call site — including
   // debounced timers holding stale closures — uses the current one. Change the
   // view only through updateView().
-  const viewRef = React.useRef({ view: 'all', onlyMine: false, lowScoreOnly: false });
+  const viewRef = React.useRef({ view: 'all', onlyMine: false, lowScoreOnly: false, myTeam: false });
   // Recording shown by a ?recording= link. It is a one-off lookup: any other fetch clears it.
   const [focusedPath, setFocusedPath] = useState(null);
   const fetchSeqRef = React.useRef(0);
@@ -219,6 +223,7 @@ function FileViewer({ darkMode }) {
     if ('view' in patch) setView(patch.view);
     if ('onlyMine' in patch) setOnlyMine(patch.onlyMine);
     if ('lowScoreOnly' in patch) setLowScoreOnly(patch.lowScoreOnly);
+    if ('myTeam' in patch) setMyTeam(patch.myTeam);
   };
 
   const userEmail = user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
@@ -227,7 +232,7 @@ function FileViewer({ darkMode }) {
   // the favorites views). options.path fetches exactly one recording — a
   // shared link — and ignores the filters.
   const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null, customDisposition = null, options = {}) => {
-    const { view: viewValue, onlyMine: onlyMineValue, lowScoreOnly: lowScoreValue } = viewRef.current;
+    const { view: viewValue, onlyMine: onlyMineValue, lowScoreOnly: lowScoreValue, myTeam: myTeamValue } = viewRef.current;
     const pathValue = options.path || null;
     if (!pathValue && !start && viewValue === 'all') return;
     // The date pickers emit invalid dates while a date is half-typed.
@@ -296,6 +301,7 @@ function FileViewer({ darkMode }) {
       if (viewValue === 'top') url += `&favorites=any`;
       if (onlyMineValue) url += `&mine=1`;
       if (lowScoreValue) url += `&scoreMax=${LOW_SCORE_MAX}`;
+      if (myTeamValue) url += `&team=1`;
     }
 
     // Audit VIEW_FILES only on the first fetch after a page load/refresh,
@@ -437,7 +443,7 @@ function FileViewer({ darkMode }) {
         historyNeedsUpdate = true;
       }
     }
-    updateView({ view: viewValue, onlyMine: !recordingParam && params.get('mine') === '1' });
+    updateView({ view: viewValue, onlyMine: !recordingParam && params.get('mine') === '1', myTeam: !recordingParam && params.get('team') === '1' });
 
     if (recordingParam) {
       startFromQuery = dateFromRecordingPath(recordingParam) || dayjs();
@@ -677,6 +683,13 @@ function FileViewer({ darkMode }) {
     setSortColumn(column);
     setSortDirection(direction);
     fetchFiles(start, end, 0, filesPerPage, column, direction);
+  };
+
+  const handleMyTeamChange = (event) => {
+    cancelPendingFilterFetches();
+    removeUrlParam('recording');
+    updateView({ myTeam: event.target.checked });
+    fetchFiles(calendarDateStart, calendarDateEnd, 0);
   };
 
   const handleLowScoreChange = (event) => {
@@ -1300,13 +1313,14 @@ function FileViewer({ darkMode }) {
     hasTranscript && { key: 'transcript', label: hasTranscript === '1' ? 'Has transcript' : 'No transcript', onRemove: () => refetchAfter(() => setExtraFilters({ hasTranscript: '' })) },
     timeRangeSet && { key: 'time', label: `Time: ${timePickerStart ? dayjs(timePickerStart).format('h:mm A') : 'any'} – ${timePickerEnd ? dayjs(timePickerEnd).format('h:mm A') : 'any'}`, onRemove: () => refetchAfter(() => { setTimePickerStart(null); setTimePickerEnd(null); }) },
     onlyMine && { key: 'mine', label: 'Only my calls', onRemove: () => handleOnlyMineChange({ target: { checked: false } }) },
-    lowScoreOnly && { key: 'low', label: `Score ≤ ${LOW_SCORE_MAX}`, onRemove: () => handleLowScoreChange({ target: { checked: false } }) }
+    lowScoreOnly && { key: 'low', label: `Score ≤ ${LOW_SCORE_MAX}`, onRemove: () => handleLowScoreChange({ target: { checked: false } }) },
+    myTeam && { key: 'team', label: 'My team', onRemove: () => handleMyTeamChange({ target: { checked: false } }) }
   ].filter(Boolean);
   const clearAllFilters = () => refetchAfter(() => {
     setPhoneFilter(''); setCallIdFilter(''); setEmailFilter(''); setDispositionFilter(''); setDurationMin('');
     setExtraFilters({ durationMax: '', hasTranscript: '' });
     setTimePickerStart(null); setTimePickerEnd(null);
-    updateView({ onlyMine: false, lowScoreOnly: false });
+    updateView({ onlyMine: false, lowScoreOnly: false, myTeam: false });
   });
   const moreCount = (durationMin ? 1 : 0) + (durationMax ? 1 : 0) + (timeRangeSet ? 1 : 0);
 
@@ -1434,6 +1448,7 @@ function FileViewer({ darkMode }) {
 
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 2, alignItems: 'center' }}>
             <FormControlLabel control={<Switch checked={onlyMine} onChange={handleOnlyMineChange} />} label="Only my calls" />
+            {(team?.hasTeam || myTeam) && <FormControlLabel control={<Switch checked={myTeam} onChange={handleMyTeamChange} />} label={team?.isAdmin ? 'Five9 agents' : 'My team'} />}
             <FormControlLabel control={<Switch checked={lowScoreOnly} onChange={handleLowScoreChange} />} label={`Low scores (≤ ${LOW_SCORE_MAX})`} />
             <MoreFiltersToggle open={moreFilters} onToggle={() => setMoreFilters(v => !v)} count={moreCount} />
           </Box>

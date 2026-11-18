@@ -19,7 +19,8 @@ export function buildTheme(darkMode) {
   return createTheme({
     palette: {
       mode: darkMode ? 'dark' : 'light',
-      primary: { main: p.brand },
+      // The dark theme's blue is light, so text on it is dark.
+      primary: { main: p.brand, contrastText: darkMode ? p.background : '#ffffff' },
       success: { main: p.good },
       warning: { main: p.warn },
       error: { main: p.bad },

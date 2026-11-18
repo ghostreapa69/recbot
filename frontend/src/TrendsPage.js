@@ -7,6 +7,7 @@ import { useUser } from './auth';
 import { PageHeader } from './Layout';
 import { Card, ScoreChip, useApi, Loadable } from './ui';
 import { CountBar } from './charts';
+import { useMyTeam } from './TeamHome';
 import AgentPicker from './AgentPicker';
 
 const BUCKET_LABEL = { day: 'ddd', week: 'MMM D', month: 'MMM' };
@@ -68,6 +69,7 @@ export default function TrendsPage() {
   const { user } = useUser();
   const myEmail = (user?.primaryEmailAddress?.emailAddress || '').toLowerCase();
   const [scope, setScope] = useState('global');
+  const { team } = useMyTeam();
   const [email, setEmail] = useState(myEmail);
   const [range, setRange] = useState('month');
   const { data, error, loading, reload } = useApi(`/api/trends?scope=${scope}&range=${range}${scope === 'agent' ? `&email=${encodeURIComponent(email)}` : ''}`);
@@ -85,6 +87,7 @@ export default function TrendsPage() {
           <>
             <ToggleButtonGroup size="small" exclusive value={scope} onChange={(_e, v) => v && setScope(v)} aria-label="Scope">
               <ToggleButton value="global">All agents</ToggleButton>
+              {team?.hasTeam && <ToggleButton value="team">{team.isAdmin ? 'Five9 agents' : 'My team'}</ToggleButton>}
               <ToggleButton value="agent">One agent</ToggleButton>
             </ToggleButtonGroup>
             {scope === 'agent' && (

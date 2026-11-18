@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useUser, useAuth } from './auth';
+import Five9TeamsCard from './Five9TeamsCard';
 import {
   Box,
   Typography,
@@ -442,6 +443,7 @@ function AdminPage({ darkMode }) {
         <Tab value={REPORTING_TAB} label="Reporting" icon={<ReportIcon />} />
       </Tabs>
 
+      {currentTab === 0 && isAdmin && <Five9TeamsCard />}
       {currentTab === 0 && (
         <Paper elevation={1} sx={{ p: 3, mb: 3, backgroundColor: darkMode ? 'grey.900' : 'grey.50' }}>
           <Typography variant="h6" gutterBottom>
