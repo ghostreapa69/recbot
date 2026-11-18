@@ -43,7 +43,10 @@ async function downloadAsWav(s3, bucket, filePath) {
     let stderr = '';
     ffmpeg.stderr.on('data', d => { stderr += d.toString(); });
     ffmpeg.on('error', reject);
-    ffmpeg.on('close', code => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${stderr.trim().slice(0, 300)}`))));
+    ffmpeg.on('close', code => {
+      if (!object.Body.readableEnded) object.Body.destroy(); // frees the S3 connection if ffmpeg stopped early
+      if (code === 0) resolve(); else reject(new Error(`ffmpeg exited ${code}: ${stderr.trim().slice(0, 300)}`));
+    });
     object.Body.on('error', err => ffmpeg.stdin.destroy(err));
     ffmpeg.stdin.on('error', () => {}); // ffmpeg may close stdin early on bad input; the close code reports it
     object.Body.pipe(ffmpeg.stdin);

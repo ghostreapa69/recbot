@@ -10,7 +10,6 @@ import utcPlugin from 'dayjs/plugin/utc.js';
 import timezonePlugin from 'dayjs/plugin/timezone.js';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import {
   S3Client,
   ListObjectsV2Command,
@@ -28,6 +27,8 @@ import { createRecordingScan } from './recordingScan.js';
 import { startTranscriptionWorker } from './transcription.js';
 import { fetchLastHourCallLog, fetchCallLog, five9Configured, five9AdminCall, scheduleRecurringIngestion } from './five9.js';
 import { syncFive9Teams } from './five9Teams.js';
+import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
+import { monitorEventLoopDelay } from 'perf_hooks';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -411,6 +412,24 @@ function releaseFfmpegSlot() {
     if (starter) starter();
   }
 }
+
+const audioCache = createAudioCache({
+  s3,
+  bucket: process.env.AWS_BUCKET,
+  outputHz: FFMPEG_OUTPUT_HZ,
+  acquireFfmpeg: acquireFfmpegSlot,
+  releaseFfmpeg: releaseFfmpegSlot,
+  onOriginalFetch: err => (err ? recordS3Failure(`${err.name || 'Error'} ${err.message}`.trim()) : recordS3Success())
+});
+
+// Warn when the event loop stalls: a blocked loop fails the healthcheck and times out S3 requests.
+const loopDelay = monitorEventLoopDelay({ resolution: 50 });
+loopDelay.enable();
+setInterval(() => {
+  const maxMs = loopDelay.max / 1e6;
+  if (maxMs > 1000) console.warn(`🐢 [EVENT LOOP] blocked for up to ${Math.round(maxMs)}ms in the last 10s`);
+  loopDelay.reset();
+}, 10000).unref();
 
 // --- AUTO SESSION EXPIRATION (4h) ---
 const MAX_SESSION_HOURS = parseInt(process.env.MAX_SESSION_HOURS || '4');
@@ -1166,6 +1185,13 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
     console.log(`🎵 [STREAMING] Checking cache for: ${s3Key}`);
     console.log(`📁 [CACHE KEY] Audio: ${cacheKey}, Waveform: ${waveformCacheKey}`);
 
+    // A recently converted copy on local disk serves seeks fastest.
+    const localCopy = !forceNoCache && audioCache.localEntry(cacheKey);
+    if (localCopy) {
+      console.log(`⚡ [LOCAL HIT][${requestId}] ${cacheKey}`);
+      return audioCache.serveLocal(localCopy, cacheKey, req, res, s3Key.split('/').pop());
+    }
+
     // Check if already cached
     if (!forceNoCache) {
       const cachedHead = headCacheGet(cacheKey);
@@ -1186,9 +1212,8 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
           res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
           if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
           if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
-          cachedResponse.Body.on('error', e=> console.error(`❌ [CACHE STREAM ERR][${requestId}]`, e));
           res.on('close', ()=> console.log(`📤 [CACHE STREAM CLOSED][${requestId}] durationMs=${Date.now()-startedTs}`));
-          cachedResponse.Body.pipe(res);
+          pipeToResponse(cachedResponse.Body, res, `[${requestId}]`);
           releaseAudioS3();
           return;
         } catch (e) {
@@ -1223,9 +1248,8 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
             res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
             if (cachedResponse.ContentLength) res.setHeader('Content-Length', cachedResponse.ContentLength);
             if (cachedResponse.ContentRange) res.setHeader('Content-Range', cachedResponse.ContentRange);
-            cachedResponse.Body.on('error', e=> console.error(`❌ [CACHE STREAM ERR][${requestId}]`, e));
             res.on('close', ()=> console.log(`📤 [CACHE STREAM CLOSED][${requestId}] durationMs=${Date.now()-startedTs}`));
-            cachedResponse.Body.pipe(res);
+            pipeToResponse(cachedResponse.Body, res, `[${requestId}]`);
             return;
           }
         } catch (e) {
@@ -1258,166 +1282,21 @@ app.get('/api/audio/*', requireAuth, ensureSession, async (req, res) => {
       console.error('⚠️ [AUDIT PLAY] Consolidated log failed:', e);
     }
 
-    // Get the original file from S3
-    const s3StartTime = Date.now();
-    let originalResponse;
-    try {
-      const originalCommand = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key });
-      // Implement manual timeout using AbortController (AWS SDK v3 supports abortSignal)
-      const controller = new AbortController();
-      const timeoutMs = parseInt(process.env.AUDIO_S3_TIMEOUT_MS || '20000', 10);
-      const tHandle = setTimeout(() => {
-        controller.abort();
-      }, timeoutMs);
-      originalResponse = await s3.send(originalCommand, { abortSignal: controller.signal });
-      clearTimeout(tHandle);
-      const s3FetchTime = Date.now() - s3StartTime;
-      console.log(`📦 [S3 FETCH][${requestId}] Retrieved file in ${s3FetchTime}ms size=${originalResponse.ContentLength || 'unknown'} timeoutMs=${timeoutMs}`);
-      recordS3Success();
-    } catch (e) {
-      console.error(`❌ [S3 FETCH FAIL][${requestId}] ${e.name||''} ${e.message}`);
-      recordS3Failure(`${e.name || 'Error'} ${e.message}`.trim());
-      return res.status(404).json({ error: 'Original file not found', detail: e.message });
-    }
-
-    // Convert and cache for seeking support
-    const tmpCachePath = path.join(os.tmpdir(), cacheKey.replace(/\//g, '_'));
-    
-  console.log(`🔄 [CONVERT][${requestId}] Starting FFmpeg WAV conversion: ${s3Key}`);
+    // Convert once (shared by concurrent requests), then stream from disk while the S3 cache upload runs.
     const conversionStartTime = Date.now();
-    
-    // Ensure we do not exceed concurrent ffmpeg processes
-    await acquireFfmpegSlot();
-    
-    const ffmpegArgs = [
-      '-hide_banner',
-      '-loglevel', debugMode ? 'info' : (process.env.FFMPEG_LOGLEVEL || 'warning'),
-      '-nostdin',
-      '-i', 'pipe:0',            // Input from stdin
-      '-fflags', '+discardcorrupt',
-      '-err_detect', 'ignore_err', // treat minor decode errors as non-fatal
-      '-f', 'wav',
-      '-acodec', 'pcm_s16le',
-      '-ac', '1',
-      '-ar', FFMPEG_OUTPUT_HZ,
-      '-y',                      // overwrite temp file if exists
-      tmpCachePath
-    ];
-  const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
-  console.log(`🎬 [FFMPEG SPAWN][${requestId}] cmd=ffmpeg args=${ffmpegArgs.join(' ')}`);
-
-    // Error handling
-    ffmpeg.stderr.on('data', (data) => {
-      const msg = data.toString();
-      if (/Packet is too small/i.test(msg)) {
-        console.warn(`⚠️  [FFmpeg WARN][${requestId}] ${msg.trim()}`);
-      } else {
-        console.log(`[FFmpeg][stderr][${requestId}] ${msg.trim()}`);
-      }
-    });
-
-    ffmpeg.on('error', (error) => {
-      console.error(`❌ [FFmpeg ERROR][${requestId}]:`, error);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Audio conversion failed' });
-      }
-      if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
-      releaseFfmpegSlot();
-    });
-
-    // Stream input to FFmpeg
-    let sourceEnded = false;
-    originalResponse.Body.on('error', e => {
-      console.error(`❌ [S3 BODY ERR][${requestId}]`, e.message);
-      try { ffmpeg.stdin.destroy(e); } catch {}
-    });
-    originalResponse.Body.on('end', () => {
-      sourceEnded = true;
-      console.log(`📥 [S3 BODY END][${requestId}] upstream complete`);
-      try { ffmpeg.stdin.end(); } catch {}
-    });
-    originalResponse.Body.pipe(ffmpeg.stdin);
-    console.log(`🔌 [PIPE][${requestId}] S3->FFmpeg piping established`);
-
-    ffmpeg.on('close', async (code) => {
-      const conversionTime = Date.now() - conversionStartTime;
-      console.log(`⏱️ [CONVERSION][${requestId}] Completed in ${conversionTime}ms exitCode=${code}`);
-      if (!sourceEnded) {
-        console.log(`⚠️ [CONVERSION][${requestId}] FFmpeg closed before source end (sourceEnded=${sourceEnded})`);
-      }
-      
-      // Even if non-zero, sometimes partial output exists; validate file size
-      let tmpOk = false;
-      try {
-        if (fs.existsSync(tmpCachePath)) {
-          const st = fs.statSync(tmpCachePath);
-            tmpOk = st.size > 1024; // require minimal size
-        }
-      } catch {}
-      if (code !== 0 && !tmpOk) {
-  console.error(`❌ [FFMPEG BAD OUTPUT][${requestId}] exitCode=${code} sizeInvalid`);
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Failed to convert audio' });
-        }
-        if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
-        releaseFfmpegSlot();
-        return;
-      }
-
-      try {
-        // Upload to S3 cache
-        const fileData = fs.readFileSync(tmpCachePath);
-        await s3.send(new PutObjectCommand({
-          Bucket: BUCKET_NAME,
-          Key: cacheKey,
-          Body: fileData,
-          ContentType: 'audio/wav'
-        }));
-        
-  console.log(`✅ [CACHED][${requestId}] Uploaded to S3 cache: ${cacheKey} size=${fileData.length}`);
-        
-        // Now serve the file with range support
-        const range = req.headers.range;
-        if (range) {
-          // Handle range request for seeking
-          const parts = range.replace(/bytes=/, "").split("-");
-          const start = parseInt(parts[0], 10);
-          const end = parts[1] ? parseInt(parts[1], 10) : fileData.length - 1;
-          const chunksize = (end - start) + 1;
-          
-          res.status(206);
-          res.setHeader('Content-Range', `bytes ${start}-${end}/${fileData.length}`);
-          res.setHeader('Content-Length', chunksize);
-          res.setHeader('Content-Type', 'audio/wav');
-          res.setHeader('Accept-Ranges', 'bytes');
-          
-          res.end(fileData.slice(start, end + 1));
-          console.log(`📤 [RANGE SERVE][${requestId}] bytes=${chunksize} range=${start}-${end}`);
-        } else {
-          // Serve full file
-          res.setHeader('Content-Type', 'audio/wav');
-          res.setHeader('Accept-Ranges', 'bytes');
-          res.setHeader('Content-Length', fileData.length);
-          res.setHeader('Cache-Control', 'public, max-age=3600');
-          res.setHeader('Content-Disposition', `inline; filename="${s3Key.split('/').pop()}"`);
-          
-          res.end(fileData);
-          console.log(`📤 [FULL SERVE][${requestId}] bytes=${fileData.length}`);
-        }
-        
-        // Clean up temp file
-        fs.unlinkSync(tmpCachePath);
-        
-      } catch (error) {
-        console.error(`❌ Error caching or serving file:`, error);
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Failed to serve converted audio' });
-        }
-        if (fs.existsSync(tmpCachePath)) fs.unlinkSync(tmpCachePath);
-      }
-      releaseFfmpegSlot();
-      console.log(`🏁 [AUDIO DONE][${requestId}] totalMs=${Date.now()-startedTs}`);
-    });
+    let converted;
+    try {
+      converted = await audioCache.getOrConvert(s3Key, cacheKey, {
+        timeoutMs: parseInt(process.env.AUDIO_S3_TIMEOUT_MS || '20000', 10),
+        loglevel: debugMode ? 'info' : (process.env.FFMPEG_LOGLEVEL || 'warning')
+      });
+    } catch (e) {
+      console.error(`❌ [CONVERT FAIL][${requestId}] ${e.message}`);
+      if (!res.headersSent) res.status(e.status || 500).json({ error: e.status === 404 ? 'Original file not found' : 'Failed to convert audio', detail: e.message });
+      return;
+    }
+    console.log(`⏱️ [CONVERSION][${requestId}] ready in ${Date.now() - conversionStartTime}ms shared=${!!converted.shared} size=${converted.entry.size}`);
+    audioCache.serveLocal(converted.entry, cacheKey, req, res, s3Key.split('/').pop());
   } catch (err) {
     console.error('Error streaming S3 file:', err);
     res.status(404).json({ error: 'File not found' });
@@ -1435,186 +1314,18 @@ app.get('/api/waveform/*', requireAuth, ensureSession, requireAuthenticatedUser,
     console.log(`📊 [WAVEFORM AUTH] User ${req.user.email} (${req.user.role}) loading waveform: ${filename}`);
 
     const s3Key = filename.startsWith('recordings/') ? filename : `recordings/${filename}`;
-    const waveformCacheKey = 'cache/waveform/' + crypto.createHash('md5').update(s3Key).digest('hex') + '.json';
-    
-    console.log(`📊 [WAVEFORM] Checking cache for: ${s3Key}`);
 
-    // Check if waveform already cached
     try {
-      const waveformCommand = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: waveformCacheKey });
-      const waveformResponse = await s3.send(waveformCommand);
-      const waveformData = JSON.parse(await waveformResponse.Body.transformToString());
-      
-      console.log(`⚡ [WAVEFORM CACHE HIT] Serving cached waveform for: ${s3Key}`);
-      res.json({ waveform: waveformData, cached: true });
-      return;
-      
+      const cached = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: waveformKeyFor(s3Key) }));
+      const waveformData = JSON.parse(await cached.Body.transformToString());
+      return res.json({ waveform: waveformData, cached: true });
     } catch {
       console.log(`📦 [WAVEFORM CACHE MISS] Need to generate for: ${s3Key}`);
     }
 
-    // Generate waveform from the SAME converted audio that gets played back
-    // First, check if we have the converted audio in cache
-    const audioCacheKey = 'cache/wav/' + crypto.createHash('md5').update(s3Key).digest('hex') + '.wav';
-    let audioSource = null;
-    let useConvertedAudio = false;
-
-    try {
-      // Try to use the converted audio cache first
-      await s3.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: audioCacheKey }));
-      audioSource = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: audioCacheKey });
-      useConvertedAudio = true;
-      console.log(`🎯 [WAVEFORM] Using converted audio cache for perfect sync: ${audioCacheKey}`);
-    } catch {
-      // Fall back to original audio
-      audioSource = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key });
-      console.log(`📄 [WAVEFORM] Using original audio (will convert): ${s3Key}`);
-    }
-
-    const audioResponse = await s3.send(audioSource);
-
-    console.log(`🔄 [WAVEFORM] Starting synchronized FFmpeg analysis for: ${s3Key}`);
-    const waveformStartTime = Date.now();
-
-    // FFmpeg parameters depend on whether we're using converted audio or original
-    let ffmpegArgs;
-    if (useConvertedAudio) {
-      // Already converted WAV - just extract PCM data
-      ffmpegArgs = [
-        '-i', 'pipe:0',
-        '-f', 's16le',            // Raw 16-bit PCM for analysis
-        '-acodec', 'pcm_s16le',   
-        'pipe:1'                  // No conversion needed - already mono 22050Hz
-      ];
-      console.log(`🎯 [WAVEFORM] Using pre-converted audio (already mono 22050Hz)`);
-    } else {
-      // Original audio - apply EXACT SAME conversion as playback
-      ffmpegArgs = [
-        '-i', 'pipe:0',
-        '-f', 's16le',            // Raw 16-bit PCM for analysis
-        '-acodec', 'pcm_s16le',   // Same codec as playback
-        '-ac', '1',               // Convert to mono (same as playback)
-        '-ar', '22050',           // Convert sample rate (same as playback)
-        'pipe:1'
-      ];
-      console.log(`🔄 [WAVEFORM] Converting original audio (mono 22050Hz)`);
-    }
-
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-
-    let audioData = Buffer.alloc(0);
-    
-    ffmpeg.stdout.on('data', (chunk) => {
-      audioData = Buffer.concat([audioData, chunk]);
-    });
-
-    ffmpeg.stderr.on('data', (data) => {
-      // Suppress FFmpeg stderr for waveform generation
-    });
-
-    ffmpeg.on('error', (error) => {
-      console.error('❌ [WAVEFORM FFmpeg ERROR]:', error);
-      res.status(500).json({ error: 'Waveform generation failed' });
-    });
-
-    audioResponse.Body.pipe(ffmpeg.stdin);
-
-    ffmpeg.on('close', async (code) => {
-      if (code !== 0) {
-        console.error(`❌ [WAVEFORM] FFmpeg process exited with code ${code}`);
-        res.status(500).json({ error: 'Failed to generate waveform' });
-        return;
-      }
-
-      // Process audio data into waveform with proper timing alignment
-      const samples = [];
-      const sampleSize = 2; // 16-bit = 2 bytes
-      const expectedSampleRate = 22050; // Hz (expected after conversion)
-      const targetPoints = 1000; // Target number of waveform points
-      const totalSamples = Math.floor(audioData.length / sampleSize);
-      const samplesPerPoint = Math.floor(totalSamples / targetPoints);
-      
-      // Calculate actual duration for verification
-      const durationSeconds = totalSamples / expectedSampleRate;
-
-      console.log(`📊 [WAVEFORM ANALYSIS] Source: ${useConvertedAudio ? 'converted cache' : 'original file'}`);
-      console.log(`📊 [WAVEFORM ANALYSIS] Duration: ${durationSeconds.toFixed(1)}s, Total samples: ${totalSamples}, Samples per point: ${samplesPerPoint}`);
-      console.log(`📊 [WAVEFORM ANALYSIS] Audio data size: ${audioData.length} bytes, Expected sample rate: ${expectedSampleRate}Hz`);
-
-      for (let i = 0; i < targetPoints; i++) {
-        let maxAmplitude = 0;
-        let rmsSum = 0;
-        let count = 0;
-        
-        for (let j = 0; j < samplesPerPoint; j++) {
-          const sampleIndex = i * samplesPerPoint + j;
-          const offset = sampleIndex * sampleSize;
-          
-          if (offset + 1 < audioData.length) {
-            // Read 16-bit signed integer
-            const sample = audioData.readInt16LE(offset);
-            const amplitude = Math.abs(sample);
-            
-            // Track peak amplitude for this segment
-            maxAmplitude = Math.max(maxAmplitude, amplitude);
-            
-            // Also calculate RMS for smoothness
-            rmsSum += sample * sample;
-            count++;
-          }
-        }
-        
-        if (count > 0) {
-          // Use combination of peak and RMS for better dynamics
-          const rms = Math.sqrt(rmsSum / count);
-          const peakNormalized = maxAmplitude / 32768;
-          const rmsNormalized = rms / 32768;
-          
-          // Blend peak (for dynamics) and RMS (for smoothness)
-          const finalAmplitude = (peakNormalized * 0.7) + (rmsNormalized * 0.3);
-          
-          // Apply some compression to enhance visibility of quiet parts
-          const compressed = Math.pow(finalAmplitude, 0.6); // Square root compression
-          
-          samples.push(Math.min(compressed, 1));
-        } else {
-          samples.push(0);
-        }
-      }
-
-      const waveformTime = Date.now() - waveformStartTime;
-      console.log(`✅ [WAVEFORM] Generated ${samples.length} points in ${waveformTime}ms`);
-      
-      // Log amplitude distribution for debugging
-      const maxVal = Math.max(...samples);
-      const minVal = Math.min(...samples);
-      const avgVal = samples.reduce((a, b) => a + b, 0) / samples.length;
-      console.log(`📈 [WAVEFORM STATS] Min: ${minVal.toFixed(3)}, Max: ${maxVal.toFixed(3)}, Avg: ${avgVal.toFixed(3)}`);
-
-      // Cache the waveform data
-      try {
-        await s3.send(new PutObjectCommand({
-          Bucket: BUCKET_NAME,
-          Key: waveformCacheKey,
-          Body: JSON.stringify(samples),
-          ContentType: 'application/json'
-        }));
-        console.log(`💾 [WAVEFORM CACHED] Saved to: ${waveformCacheKey}`);
-      } catch (cacheError) {
-        console.error('⚠️ [WAVEFORM CACHE] Failed to cache:', cacheError);
-      }
-
-      res.json({ 
-        waveform: samples, 
-        cached: false, 
-        generationTime: waveformTime,
-        duration: durationSeconds,
-        sampleRate: expectedSampleRate,
-        totalSamples: totalSamples,
-        source: useConvertedAudio ? 'converted_cache' : 'original_file'
-      });
-    });
-
+    const result = await audioCache.getWaveform(s3Key);
+    console.log(`✅ [WAVEFORM] ${s3Key} ${result.waveform.length} points from ${result.source}, ${result.duration.toFixed(1)}s audio in ${result.generationTime}ms`);
+    res.json({ ...result, cached: false });
   } catch (error) {
     console.error('❌ [WAVEFORM ERROR]:', error);
     res.status(500).json({ error: 'Waveform generation failed' });
@@ -1663,7 +1374,7 @@ app.get('/api/download/*', requireAuth, ensureSession, requireManagerOrAdmin, as
       res.setHeader('Content-Disposition', `attachment; filename="${s3Key.split('/').pop()}"`);
       res.setHeader('Content-Length', s3Response.ContentLength || 0);
 
-      s3Response.Body.pipe(res);
+      pipeToResponse(s3Response.Body, res, ' [DOWNLOAD]');
     } catch (error) {
       console.error('Download error:', error);
       res.status(404).json({ error: 'File not found' });
