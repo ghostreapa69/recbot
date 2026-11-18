@@ -2353,15 +2353,20 @@ export async function markNotificationsRead(recipientEmail, ids) {
 // Transcriptions
 // ============================================================
 // call_date is stored as YYYY-MM-DD text, so string comparison is date order.
-export async function getFilesNeedingTranscription(cutoffDate, minDurationMs, limit) {
+// skipDispositions: lowercased dispositions that are never transcribed. The disposition is the
+// one the app shows (Five9 reporting first, else the file's own), compared case-insensitively.
+export async function getFilesNeedingTranscription(cutoffDate, minDurationMs, limit, skipDispositions = []) {
   const { rows } = await pool.query(`
     SELECT f.file_path
     FROM files f
     LEFT JOIN transcriptions t ON t.file_path = f.file_path
     WHERE t.file_path IS NULL AND f.call_date >= $1 AND f.duration_ms > $2
+      AND lower(trim(COALESCE(
+        (SELECT r.disposition FROM reporting r WHERE r.call_id = f.call_id AND r.disposition <> '' LIMIT 1),
+        f.call_disposition, ''))) <> ALL($4::text[])
     ORDER BY f.call_date DESC, f.call_time DESC
     LIMIT $3
-  `, [cutoffDate, minDurationMs, limit]);
+  `, [cutoffDate, minDurationMs, limit, skipDispositions]);
   return rows.map(r => r.file_path);
 }
 

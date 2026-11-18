@@ -24,7 +24,7 @@ import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabas
 import { computeBadges } from './badges.js';
 import { createAgentDirectory } from './agentDirectory.js';
 import { createRecordingScan } from './recordingScan.js';
-import { startTranscriptionWorker, MIN_DURATION_MS } from './transcription.js';
+import { startTranscriptionWorker, MIN_DURATION_MS, SKIP_DISPOSITIONS } from './transcription.js';
 import { fetchLastHourCallLog, fetchCallLog, five9Configured, five9AdminCall, scheduleRecurringIngestion } from './five9.js';
 import { syncFive9Teams } from './five9Teams.js';
 import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
@@ -1666,9 +1666,9 @@ app.get('/api/recordings/detail', requireAuth, ensureSession, requireAuthenticat
   }
 });
 
-// Lets the UI label calls too short to be transcribed and scored.
+// Lets the UI label calls that won't be transcribed and scored (too short, or a skipped disposition).
 app.get('/api/scoring/config', requireAuth, ensureSession, (req, res) => {
-  res.json({ minDurationMs: MIN_DURATION_MS });
+  res.json({ minDurationMs: MIN_DURATION_MS, skipDispositions: SKIP_DISPOSITIONS });
 });
 
 // Deletes the call's scorecard so the transcription worker scores it again on its next tick.
