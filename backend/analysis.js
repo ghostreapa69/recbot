@@ -164,6 +164,40 @@ export function computeTranscriptStats(utterances, agentSpeaker = null) {
 }
 
 // ------------------------------------------------------------------
+// Which speaker is the agent
+// ------------------------------------------------------------------
+const SPEAKER_CHECK_CHARS = 8000;
+const SPEAKER_PROMPT = `This is the start of a phone call recorded by a mortgage company. Speakers are labelled by diarization ("Speaker A", "Speaker B"). One speaker is the company's AGENT (loan officer or processor); the other is the CUSTOMER.
+
+The agent is the one selling a mortgage or helping the other person get one: offering rates, loan programs or quotes, asking qualifying questions (income, credit, property value, loan balance, occupancy, timeline), explaining next steps, and steering toward an application, documents or an appointment.
+The customer is the one seeking the loan or answering those questions about their own finances and home.
+
+Either speaker may talk first: on inbound calls the customer often speaks first, and the recording can start mid-greeting. Decide from what each speaker says, not from who speaks first.
+
+Reply with only JSON: {"agent_speaker":"A","confidence":"high","reason":"one short sentence"}
+agent_speaker is the letter of the agent's label, or "unknown" if you cannot tell. confidence is "high", "medium" or "low".`;
+
+export function buildSpeakerPrompt(utterances) {
+  let transcript = utterances.map(u => `Speaker ${u.speaker}: ${u.text}`).join('\n');
+  if (transcript.length > SPEAKER_CHECK_CHARS) transcript = `${transcript.slice(0, SPEAKER_CHECK_CHARS)}\n[transcript continues]`;
+  return `${SPEAKER_PROMPT}\n\nTranscript:\n${transcript}`;
+}
+
+// Returns the agent's speaker letter, or null when the model can't tell with at least
+// medium confidence. Throws only if the LLM request itself fails.
+export async function identifyAgentSpeaker(utterances, llm) {
+  const speakers = new Set(utterances.map(u => u.speaker));
+  if (speakers.size < 2) return null;
+  const reply = await llm(buildSpeakerPrompt(utterances));
+  let json;
+  try { json = extractJson(reply); } catch { return null; }
+  const letter = String(json.agent_speaker || '').trim().toUpperCase();
+  const confidence = String(json.confidence || '').trim().toLowerCase();
+  if (!speakers.has(letter) || !['high', 'medium'].includes(confidence)) return null;
+  return letter;
+}
+
+// ------------------------------------------------------------------
 // Call analysis (summary + scores in one request)
 // ------------------------------------------------------------------
 const ANALYSIS_PROMPT = `You review phone calls for a mortgage company's quality team. Speakers are labelled by diarization ("Speaker A", "Speaker B"); one is the company's agent (loan officer or processor) and one is the customer. Personal information has been replaced with placeholders like [PHONE_NUMBER]; keep them as-is and never guess what they contain.
@@ -196,7 +230,7 @@ Reply with only JSON in this exact shape:
 "topics":["..."],"keywords":["..."],"key_moments":[],"objections":[],"action_items":[],"sentiment_timeline":[],"coaching_tips":[]}
 `;
 
-export function buildAnalysisPrompt(utterances) {
+export function buildAnalysisPrompt(utterances, agentSpeaker = null) {
   const stats = computeTranscriptStats(utterances);
   let transcript = utterances.map(u => `[${mmss(u.start)}] Speaker ${u.speaker}: ${u.text}`).join('\n');
   if (transcript.length > MAX_ANALYSIS_TRANSCRIPT_CHARS) {
@@ -209,7 +243,11 @@ export function buildAnalysisPrompt(utterances) {
     `Interruptions (started before the other finished): ${Object.entries(stats.interruptions).map(([s, n]) => `${s} ${n}`).join(', ') || 'none'}`,
     `Dead air (pauses of 2s or more): ${mmss(stats.deadAirMs)} total, longest silence ${mmss(stats.longestSilenceMs)}`
   ].join('\n');
-  return `${ANALYSIS_PROMPT}\nMeasured stats:\n${measured}\n\nTranscript:\n${transcript}`;
+  const customers = [...new Set(utterances.map(u => u.speaker))].filter(sp => sp !== agentSpeaker);
+  const roles = agentSpeaker
+    ? `\nSpeaker ${agentSpeaker} is the agent and ${customers.map(sp => `Speaker ${sp}`).join(' and ')} is the customer. Score Speaker ${agentSpeaker} and set agent_speaker to "${agentSpeaker}".\n`
+    : '';
+  return `${ANALYSIS_PROMPT}${roles}\nMeasured stats:\n${measured}\n\nTranscript:\n${transcript}`;
 }
 
 const clampScore = value => {
@@ -222,11 +260,14 @@ const strList = (value, maxItems, maxLen = 300) => (Array.isArray(value) ? value
 
 // Validates and normalises the model's JSON. Scores are clamped to -10..10 and the
 // overall score is computed here as the plain average of the categories that apply.
-export function validateAnalysis(json, utterances) {
+// detectedSpeaker (from identifyAgentSpeaker) wins over the scoring reply's agent_speaker.
+export function validateAnalysis(json, utterances, detectedSpeaker = null) {
   const speakers = new Set(utterances.map(u => u.speaker));
-  const agentSpeaker = speakers.has(String(json.agent_speaker || '').trim().toUpperCase())
-    ? String(json.agent_speaker).trim().toUpperCase()
-    : utterances[0]?.speaker || null; // the agent usually speaks first on a recorded line
+  const replied = String(json.agent_speaker || '').trim().toUpperCase();
+  let agentSpeaker, agentSpeakerSource;
+  if (detectedSpeaker && speakers.has(detectedSpeaker)) [agentSpeaker, agentSpeakerSource] = [detectedSpeaker, 'detected'];
+  else if (speakers.has(replied)) [agentSpeaker, agentSpeakerSource] = [replied, 'scoring'];
+  else [agentSpeaker, agentSpeakerSource] = [utterances[0]?.speaker || null, 'first_speaker']; // the agent usually speaks first on a recorded line
 
   if (!json.scores || typeof json.scores !== 'object') throw new Error('Analysis has no "scores" object');
   const scores = {};
@@ -265,6 +306,7 @@ export function validateAnalysis(json, utterances) {
     agentSpeaker,
     analysis: {
       agentSpeaker,
+      agentSpeakerSource,
       callReason: str(json.call_reason, 200),
       outcome: str(json.outcome, 200),
       categories,
@@ -278,13 +320,21 @@ export function validateAnalysis(json, utterances) {
 }
 
 // Runs the analysis request, retrying once if the reply can't be parsed or validated.
+// First asks which speaker is the agent; if that can't be decided, the scoring reply
+// (or the first speaker) decides as before.
 export async function analyzeCall(utterances, llm) {
-  const prompt = buildAnalysisPrompt(utterances);
+  let detected = null;
+  try {
+    detected = await identifyAgentSpeaker(utterances, llm);
+  } catch (err) {
+    console.warn(`⚠️ [ANALYZE] Speaker check failed, using the scoring reply: ${err.message}`);
+  }
+  const prompt = buildAnalysisPrompt(utterances, detected);
   let result;
   try {
-    result = validateAnalysis(extractJson(await llm(prompt)), utterances);
+    result = validateAnalysis(extractJson(await llm(prompt)), utterances, detected);
   } catch (err) {
-    result = validateAnalysis(extractJson(await llm(prompt)), utterances);
+    result = validateAnalysis(extractJson(await llm(prompt)), utterances, detected);
   }
   return { ...result, stats: computeTranscriptStats(utterances, result.agentSpeaker) };
 }

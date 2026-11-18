@@ -376,6 +376,8 @@ export async function initializeDatabase() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // Set when the agent/customer speaker check has run for this scorecard (older ones are re-checked in the background).
+  await pool.query(`ALTER TABLE call_analyses ADD COLUMN IF NOT EXISTS speaker_checked_at TIMESTAMP;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_analyses_overall ON call_analyses(overall_score);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_analyses_created ON call_analyses(created_at);`);
 
@@ -2421,13 +2423,14 @@ export async function saveCallAnalysis(filePath, result, model) {
     const s = result.scores;
     await client.query(`
       INSERT INTO call_analyses (file_path, status, model, error, overall_score, intro_score, retention_score, info_score,
-        sentiment_score, objection_score, control_score, analysis, stats)
-      VALUES ($1, 'completed', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        sentiment_score, objection_score, control_score, analysis, stats, speaker_checked_at)
+      VALUES ($1, 'completed', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
       ON CONFLICT (file_path) DO UPDATE SET
         status = 'completed', model = EXCLUDED.model, error = NULL, overall_score = EXCLUDED.overall_score,
         intro_score = EXCLUDED.intro_score, retention_score = EXCLUDED.retention_score, info_score = EXCLUDED.info_score,
         sentiment_score = EXCLUDED.sentiment_score, objection_score = EXCLUDED.objection_score,
-        control_score = EXCLUDED.control_score, analysis = EXCLUDED.analysis, stats = EXCLUDED.stats, updated_at = NOW()
+        control_score = EXCLUDED.control_score, analysis = EXCLUDED.analysis, stats = EXCLUDED.stats,
+        speaker_checked_at = NOW(), updated_at = NOW()
     `, [filePath, model, result.overall, s.intro, s.retention, s.info, s.sentiment, s.objection, s.control,
       JSON.stringify(result.analysis), JSON.stringify(result.stats)]);
     await client.query('DELETE FROM call_topics WHERE file_path = $1', [filePath]);
@@ -2455,6 +2458,23 @@ export async function saveCallAnalysisError(filePath, error, model) {
     INSERT INTO call_analyses (file_path, status, model, error) VALUES ($1, 'error', $2, $3)
     ON CONFLICT (file_path) DO UPDATE SET status = 'error', model = EXCLUDED.model, error = EXCLUDED.error, updated_at = NOW()
   `, [filePath, model, error]);
+}
+
+// Scorecards made before the speaker check existed, newest first.
+export async function getAnalysesNeedingSpeakerCheck(limit) {
+  const { rows } = await pool.query(`
+    SELECT ca.file_path, t.scriberr_id, ca.analysis->>'agentSpeaker' AS agent_speaker, t.utterances
+    FROM call_analyses ca JOIN transcriptions t ON t.file_path = ca.file_path
+    WHERE ca.status = 'completed' AND ca.speaker_checked_at IS NULL
+      AND t.utterances IS NOT NULL AND jsonb_array_length(t.utterances) > 0
+    ORDER BY ca.created_at DESC
+    LIMIT $1
+  `, [limit]);
+  return rows;
+}
+
+export async function markSpeakerChecked(filePath) {
+  await pool.query('UPDATE call_analyses SET speaker_checked_at = NOW() WHERE file_path = $1', [filePath]);
 }
 
 export async function deleteCallAnalysis(filePath) {
