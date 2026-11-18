@@ -163,8 +163,18 @@ function FileViewer({ darkMode }) {
   const [emailFilter, setEmailFilter] = useState("");
   const [sortColumn, setSortColumn] = useState("date");
   const [sortDirection, setSortDirection] = useState("asc");
+  // Seconds (the server compares duration_ms against value * 1000).
   const [durationMin, setDurationMin] = useState("");
-  // Removed durationMode; durationMin now always interpreted as minutes
+  // Max duration (seconds) and transcript filter ('', '1' has one, '0' none).
+  // Mirrored in a ref so fetchFiles sees a value set in the same tick (URL links).
+  const [durationMax, setDurationMax] = useState("");
+  const [hasTranscript, setHasTranscript] = useState("");
+  const extraFiltersRef = React.useRef({ durationMax: '', hasTranscript: '' });
+  const setExtraFilters = (patch) => {
+    extraFiltersRef.current = { ...extraFiltersRef.current, ...patch };
+    if ('durationMax' in patch) setDurationMax(patch.durationMax);
+    if ('hasTranscript' in patch) setHasTranscript(patch.hasTranscript);
+  };
   const [timeMode, setTimeMode] = useState("range");
   const [callIdFilter, setCallIdFilter] = useState("");
   const [dispositionFilter, setDispositionFilter] = useState("");
@@ -259,6 +269,10 @@ function FileViewer({ darkMode }) {
       if (durationValue !== null && durationValue !== "") {
         url += `&durationMin=${encodeURIComponent(durationValue)}`;
       }
+
+      const { durationMax: durationMaxValue, hasTranscript: hasTranscriptValue } = extraFiltersRef.current;
+      if (durationMaxValue !== '') url += `&durationMax=${encodeURIComponent(durationMaxValue)}`;
+      if (hasTranscriptValue === '0' || hasTranscriptValue === '1') url += `&hasTranscript=${hasTranscriptValue}`;
 
       if (normalizedPhoneValue) {
         url += `&phone=${encodeURIComponent(normalizedPhoneValue)}`;
@@ -507,6 +521,11 @@ function FileViewer({ darkMode }) {
     if (params.has('durationMin')) {
       durationValue = params.get('durationMin') || '';
       setDurationMin(durationValue);
+    }
+    if (params.has('durationMax')) setExtraFilters({ durationMax: params.get('durationMax') || '' });
+    if (params.has('hasTranscript')) {
+      const value = params.get('hasTranscript');
+      setExtraFilters({ hasTranscript: value === '0' || value === '1' ? value : '' });
     }
 
     let phoneValue = phoneFilter;
@@ -1148,7 +1167,7 @@ function FileViewer({ darkMode }) {
       }
     }, 300);
     return () => clearTimeout(filterDebounceRef.current);
-  }, [phoneFilter, emailFilter, durationMin, timePickerStart, timePickerEnd, timeMode]);
+  }, [phoneFilter, emailFilter, durationMin, durationMax, timePickerStart, timePickerEnd, timeMode]);
 
   // Keyboard controls for audio player
   useEffect(() => {
@@ -1276,17 +1295,20 @@ function FileViewer({ darkMode }) {
     callIdFilter && { key: 'callId', label: `Call ID: ${callIdFilter}`, onRemove: () => refetchAfter(() => setCallIdFilter('')) },
     emailFilter && { key: 'email', label: `Agent: ${emailFilter}`, onRemove: () => refetchAfter(() => setEmailFilter('')) },
     dispositionFilter && { key: 'disp', label: `Disposition: ${dispositionFilter}`, onRemove: () => refetchAfter(() => setDispositionFilter('')) },
-    durationMin && { key: 'dur', label: `Over ${durationMin} min`, onRemove: () => refetchAfter(() => setDurationMin('')) },
+    durationMin && { key: 'dur', label: `≥ ${durationMin} s`, onRemove: () => refetchAfter(() => setDurationMin('')) },
+    durationMax && { key: 'durMax', label: `≤ ${durationMax} s`, onRemove: () => refetchAfter(() => setExtraFilters({ durationMax: '' })) },
+    hasTranscript && { key: 'transcript', label: hasTranscript === '1' ? 'Has transcript' : 'No transcript', onRemove: () => refetchAfter(() => setExtraFilters({ hasTranscript: '' })) },
     timeRangeSet && { key: 'time', label: `Time: ${timePickerStart ? dayjs(timePickerStart).format('h:mm A') : 'any'} – ${timePickerEnd ? dayjs(timePickerEnd).format('h:mm A') : 'any'}`, onRemove: () => refetchAfter(() => { setTimePickerStart(null); setTimePickerEnd(null); }) },
     onlyMine && { key: 'mine', label: 'Only my calls', onRemove: () => handleOnlyMineChange({ target: { checked: false } }) },
     lowScoreOnly && { key: 'low', label: `Score ≤ ${LOW_SCORE_MAX}`, onRemove: () => handleLowScoreChange({ target: { checked: false } }) }
   ].filter(Boolean);
   const clearAllFilters = () => refetchAfter(() => {
     setPhoneFilter(''); setCallIdFilter(''); setEmailFilter(''); setDispositionFilter(''); setDurationMin('');
+    setExtraFilters({ durationMax: '', hasTranscript: '' });
     setTimePickerStart(null); setTimePickerEnd(null);
     updateView({ onlyMine: false, lowScoreOnly: false });
   });
-  const moreCount = (durationMin ? 1 : 0) + (timeRangeSet ? 1 : 0);
+  const moreCount = (durationMin ? 1 : 0) + (durationMax ? 1 : 0) + (timeRangeSet ? 1 : 0);
 
   // ---- Bottom player: the call page's player bar, driven by this page's audio ----
   const playingRow = currentTrack ? files.find(f => f.file === currentTrack) : null;
@@ -1395,6 +1417,19 @@ function FileViewer({ darkMode }) {
                 {fileDispositions.map(d => <MenuItem key={d} value={d}>{d}</MenuItem>)}
               </Select>
             </FormControl>
+            <FormControl size="small">
+              <InputLabel id="file-transcript-label">Transcript</InputLabel>
+              <Select
+                labelId="file-transcript-label"
+                value={hasTranscript}
+                label="Transcript"
+                onChange={(e) => refetchAfter(() => setExtraFilters({ hasTranscript: e.target.value }))}
+              >
+                <MenuItem value=""><em>Any</em></MenuItem>
+                <MenuItem value="1">Has transcript</MenuItem>
+                <MenuItem value="0">No transcript</MenuItem>
+              </Select>
+            </FormControl>
           </FilterGrid>
 
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 2, alignItems: 'center' }}>
@@ -1405,7 +1440,8 @@ function FileViewer({ darkMode }) {
 
           {moreFilters && (
             <FilterGrid sx={{ borderTop: 1, borderColor: 'divider', borderTopStyle: 'dashed', pt: 2 }}>
-              <TextField size="small" label="Min duration (min)" value={durationMin} onChange={(e) => setDurationMin(e.target.value)} />
+              <TextField size="small" label="Min duration (sec)" type="number" inputProps={{ min: 0 }} value={durationMin} onChange={(e) => setDurationMin(e.target.value)} />
+              <TextField size="small" label="Max duration (sec)" type="number" inputProps={{ min: 0 }} value={durationMax} onChange={(e) => setExtraFilters({ durationMax: e.target.value })} />
               <FormControl size="small">
                 <InputLabel id="time-filter-label">Time filter</InputLabel>
                 <Select labelId="time-filter-label" label="Time filter" value={timeMode} onChange={(e) => setTimeMode(e.target.value)}>

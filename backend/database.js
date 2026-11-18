@@ -875,6 +875,8 @@ export async function queryFiles(filters = {}) {
     phone,
     email,
     durationMin,
+    durationMax,
+    hasTranscript,
     timeStart,
     timeEnd,
     callId,
@@ -903,6 +905,11 @@ export async function queryFiles(filters = {}) {
   if (phone) { conditions.push(`phone LIKE '%' || $${paramIdx++} || '%'`); params.push(phone); }
   if (email) { conditions.push(`email LIKE '%' || $${paramIdx++} || '%'`); params.push(email); }
   if (durationMin) { conditions.push(`duration_ms >= $${paramIdx++} * 1000`); params.push(durationMin); }
+  if (durationMax) { conditions.push(`duration_ms <= $${paramIdx++} * 1000`); params.push(durationMax); }
+  // A finished transcript; in-progress and failed ones count as "no transcript".
+  if (hasTranscript === '1' || hasTranscript === '0') {
+    conditions.push(`${hasTranscript === '0' ? 'NOT ' : ''}EXISTS (SELECT 1 FROM transcriptions t WHERE t.file_path = f.file_path AND t.status = 'completed')`);
+  }
   if (timeStart) { conditions.push(`call_time >= $${paramIdx++}`); params.push(timeStart); }
   if (timeEnd) { conditions.push(`call_time <= $${paramIdx++}`); params.push(timeEnd); }
   if (callId) { conditions.push(`call_id LIKE '%' || $${paramIdx++} || '%'`); params.push(callId); }
