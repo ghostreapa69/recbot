@@ -2365,6 +2365,16 @@ export async function getFilesNeedingTranscription(cutoffDate, minDurationMs, li
   return rows.map(r => r.file_path);
 }
 
+// Points a recording at a different Scriberr job (found by title after its own ID went missing).
+export async function adoptScriberrJob(filePath, scriberrId) {
+  await pool.query(`UPDATE transcriptions SET scriberr_id = $2, status = 'processing', error = NULL, updated_at = NOW() WHERE file_path = $1`, [filePath, scriberrId]);
+}
+
+// Forgets a recording's transcription so the worker submits it again.
+export async function resetTranscription(filePath) {
+  await pool.query('DELETE FROM transcriptions WHERE file_path = $1', [filePath]);
+}
+
 // Scriberr jobs still running, plus ones whose redaction failed and should be retried.
 export async function getPendingTranscriptions() {
   const { rows } = await pool.query(`

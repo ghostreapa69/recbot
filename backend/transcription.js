@@ -10,7 +10,7 @@ import { GetObjectCommand } from '@aws-sdk/client-s3';
 import {
   pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription, markRedactionFailed,
   getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError,
-  getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis
+  getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis, adoptScriberrJob, resetTranscription
 } from './database.js';
 import * as scriberr from './scriberr.js';
 import { redactUtterances, analyzeCall, identifyAgentSpeaker } from './analysis.js';
@@ -55,6 +55,17 @@ async function downloadAsWav(s3, bucket, filePath) {
   return outPath;
 }
 
+const RUNNING = ['processing', 'pending', 'uploaded'];
+// Scriberr marks jobs that were running when it restarted as failed with this message.
+const INTERRUPTED = /interrupted by server restart/i;
+
+// Another Scriberr job for the same recording (jobs are titled with the file name):
+// a completed one first, else one still running. Null if there is none.
+async function findExistingJob(filePath) {
+  const jobs = await scriberr.findJobsByTitle(filePath.split('/').pop());
+  return jobs.find(j => j.status === 'completed') || jobs.find(j => RUNNING.includes(j.status)) || null;
+}
+
 async function submitNew(s3, bucket) {
   const cutoff = dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
   const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_SECONDS * 1000, MAX_PER_TICK);
@@ -62,6 +73,19 @@ async function submitNew(s3, bucket) {
   for (const filePath of filePaths) {
     let wavPath;
     try {
+      // A redeploy can interrupt a submit after Scriberr already has the job; reuse it instead of uploading again.
+      let existing = null;
+      try {
+        existing = await findExistingJob(filePath);
+      } catch (err) {
+        console.warn(`⚠️ [TRANSCRIBE] Job lookup failed for ${filePath}, submitting: ${err.message}`);
+      }
+      if (existing) {
+        await upsertTranscription(filePath, { scriberrId: existing.id, status: 'processing' });
+        console.log(`🔗 [TRANSCRIBE] ${filePath} already in Scriberr as job ${existing.id} (${existing.status}); not resubmitting`);
+        submitted++;
+        continue;
+      }
       wavPath = await downloadAsWav(s3, bucket, filePath);
       const scriberrId = await scriberr.submit(wavPath, filePath.split('/').pop());
       await upsertTranscription(filePath, { scriberrId, status: 'processing' });
@@ -88,15 +112,37 @@ async function pollPending() {
   for (const row of pending) {
     if (redacted >= MAX_PER_TICK) break; // redaction is the slow step; leave the rest for the next tick
     try {
-      const job = await scriberr.status(row.scriberr_id);
+      let id = row.scriberr_id;
+      let job;
+      try {
+        job = await scriberr.status(id);
+      } catch (err) {
+        if (!err.notFound) throw err;
+        job = { status: 'missing' };
+      }
+      // The job is gone, or Scriberr restarted mid-job: use another job for this recording if
+      // Scriberr has one, otherwise submit the recording again.
+      if (job.status === 'missing' || (job.status === 'failed' && INTERRUPTED.test(job.error || ''))) {
+        const why = job.status === 'missing' ? `job ${id} not found` : `job ${id} interrupted by a Scriberr restart`;
+        const found = await findExistingJob(row.file_path);
+        if (!found) {
+          await resetTranscription(row.file_path);
+          console.log(`🔁 [TRANSCRIBE] ${row.file_path}: ${why} and no other job has this title; resubmitting`);
+          continue;
+        }
+        await adoptScriberrJob(row.file_path, found.id);
+        console.log(`🔗 [TRANSCRIBE] ${row.file_path}: ${why}; using job ${found.id} (${found.status})`);
+        id = found.id;
+        job = found;
+      }
       if (job.status === 'failed') {
         await upsertTranscription(row.file_path, { status: 'error', error: job.error || 'Scriberr reported the job failed' });
-        console.error(`❌ [TRANSCRIBE] Scriberr failed ${row.file_path} id=${row.scriberr_id}: ${job.error || ''}`);
+        console.error(`❌ [TRANSCRIBE] Scriberr failed ${row.file_path} id=${id}: ${job.error || ''}`);
         continue;
       }
       if (job.status !== 'completed') continue;
 
-      const raw = await scriberr.transcript(row.scriberr_id);
+      const raw = await scriberr.transcript(id);
       if (!raw.length) {
         await upsertTranscription(row.file_path, { status: 'completed', transcriptText: '', utterances: [] });
         completed++;
@@ -105,7 +151,7 @@ async function pollPending() {
       redacted++;
       let utterances;
       try {
-        utterances = await redactUtterances(raw, llm(row.scriberr_id));
+        utterances = await redactUtterances(raw, llm(id));
       } catch (err) {
         const attempts = await markRedactionFailed(row.file_path, `Redaction failed: ${err.message}`, MAX_REDACTION_ATTEMPTS);
         console.error(`❌ [TRANSCRIBE] Redaction failed for ${row.file_path} (attempt ${attempts}/${MAX_REDACTION_ATTEMPTS}): ${err.message}`);
@@ -116,7 +162,7 @@ async function pollPending() {
         transcriptText: utterances.map(u => u.text).join(' '),
         utterances
       });
-      console.log(`📝 [TRANSCRIBE] Completed ${row.file_path} id=${row.scriberr_id} lines=${utterances.length}`);
+      console.log(`📝 [TRANSCRIBE] Completed ${row.file_path} id=${id} lines=${utterances.length}`);
       completed++;
     } catch (err) {
       console.error(`❌ [TRANSCRIBE] Poll failed for ${row.file_path}:`, err.message);
