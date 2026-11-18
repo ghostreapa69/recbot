@@ -34,7 +34,9 @@ async function request(urlPath, { method = 'GET', body, headers = {}, timeoutMs 
       const json = JSON.parse(text);
       message = json.error || json.message || text;
     } catch {}
-    throw new ScriberrError(`HTTP ${res.status} ${method} ${urlPath}: ${String(message).slice(0, 300)}`);
+    const err = new ScriberrError(`HTTP ${res.status} ${method} ${urlPath}: ${String(message).slice(0, 300)}`);
+    err.notFound = res.status === 404;
+    throw err;
   }
   return res;
 }
@@ -61,6 +63,17 @@ export async function status(id) {
   const res = await request(`/api/v1/transcription/${encodeURIComponent(id)}/status`);
   const job = await res.json();
   return { status: String(job.status || '').toLowerCase(), error: job.error_message || job.error || null };
+}
+
+// Jobs submitted with exactly this title (RecBot uses the recording's file name), newest first.
+// Scriberr's search is a LIKE match where "_" is a wildcard, so titles are compared exactly here.
+export async function findJobsByTitle(title) {
+  const qs = new URLSearchParams({ q: title, limit: '20', page: '1', sort_by: 'created_at', sort_order: 'desc' });
+  const res = await request(`/api/v1/transcription/list?${qs}`);
+  const body = await res.json();
+  return (Array.isArray(body?.jobs) ? body.jobs : [])
+    .filter(j => j && j.title === title && j.id && !j.deleted_at)
+    .map(j => ({ id: String(j.id), status: String(j.status || '').toLowerCase(), error: j.error_message || null }));
 }
 
 export async function transcript(id) {
