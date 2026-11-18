@@ -27,9 +27,49 @@ export function formatPhone(raw) {
 
 export const recordingUrl = (path, extra = '') => `/recordings/view?path=${encodeURIComponent(path)}${extra}`;
 
-export function ScoreChip({ score, size = 'small', pending = false }) {
+// The transcription worker's rules ({ minDurationMs, skipDispositions }), fetched once and shared; null until loaded.
+let scoringConfigPromise = null;
+export function useScoringConfig() {
+  const { getToken } = useAuth();
+  const [value, setValue] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    if (!scoringConfigPromise) {
+      scoringConfigPromise = (async () => {
+        const token = await getToken();
+        const res = await fetch('/api/scoring/config', { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await res.json();
+      })().catch(() => { scoringConfigPromise = null; return null; });
+    }
+    scoringConfigPromise.then(v => { if (alive) setValue(v); });
+    return () => { alive = false; };
+  }, [getToken]);
+  return value;
+}
+
+export const TOO_SHORT_LABEL = 'Not Scored: Call not long enough';
+
+// Why an unscored call will never be scored, as a label, or null. A skipped disposition is
+// named exactly (e.g. "Not Scored: Voicemail"); calls at or below the minimum length are too short.
+export function notScoredReason({ durationMs, disposition }, config) {
+  if (!config) return null;
+  const d = String(disposition || '').trim();
+  if (d && (config.skipDispositions || []).some(s => s.toLowerCase() === d.toLowerCase())) return `Not Scored: ${d}`;
+  if (durationMs > 0 && config.minDurationMs !== null && config.minDurationMs !== undefined && durationMs <= config.minDurationMs) return TOO_SHORT_LABEL;
+  return null;
+}
+
+export function ScoreChip({ score, size = 'small', pending = false, durationMs, disposition }) {
   const theme = useTheme();
+  const config = useScoringConfig();
   if (score === null || score === undefined) {
+    const reason = notScoredReason({ durationMs, disposition }, config);
+    if (reason) {
+      // Long label: on narrow screens it wraps to two lines instead of squeezing the row.
+      return <Chip size={size} label={reason} variant="outlined"
+        sx={{ color: 'text.secondary', height: 'auto', maxWidth: { xs: 130, sm: 'none' }, '& .MuiChip-label': { whiteSpace: { xs: 'normal', sm: 'nowrap' }, textAlign: 'center', py: 0.25 } }} />;
+    }
     return <Chip size={size} label={pending ? 'Scoring…' : 'No score'} variant="outlined" sx={{ color: 'text.secondary' }} />;
   }
   const tone = scoreTone(score);

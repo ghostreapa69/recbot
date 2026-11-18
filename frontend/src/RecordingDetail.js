@@ -15,7 +15,7 @@ import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import SearchIcon from "@mui/icons-material/Search";
 import { useAuth, useUser } from './auth';
 import { requestNotificationsRefresh } from './NotificationBell';
-import { Card, ScoreChip, DivergingBar, useApi, Loadable, fmtScore, formatMs, formatPhone, postJson, recordingUrl, CATEGORY_LABELS } from './ui';
+import { Card, ScoreChip, DivergingBar, useApi, Loadable, fmtScore, formatMs, formatPhone, postJson, recordingUrl, CATEGORY_LABELS, useScoringConfig, notScoredReason } from './ui';
 import { SentimentChart, TalkShareDonut } from './charts';
 import { useRecordingPlayer, PlayerBar } from './RecordingPlayer';
 import { scoreTone, softBg } from './theme';
@@ -141,9 +141,16 @@ function Scorecard({ analysis, onSeek }) {
   );
 }
 
-function AnalysisPending({ transcription, analysis }) {
+function AnalysisPending({ transcription, analysis, durationMs, disposition }) {
+  const config = useScoringConfig();
+  const reason = notScoredReason({ durationMs, disposition }, config);
   let message;
-  if (!transcription || transcription.status === 'none') message = 'This call has not been transcribed. Only recent calls above the minimum length are transcribed and scored.';
+  if ((!transcription || transcription.status === 'none') && reason) {
+    message = reason.endsWith(': Call not long enough')
+      ? `${reason}. Calls of ${Math.round(config.minDurationMs / 1000)} seconds or less aren't transcribed or scored.`
+      : `${reason}. Calls with this disposition aren't transcribed or scored.`;
+  }
+  else if (!transcription || transcription.status === 'none') message = 'This call has not been transcribed. Only recent calls above the minimum length are transcribed and scored.';
   else if (transcription.status === 'processing' || transcription.status === 'redaction_failed') message = 'Transcription is in progress. The scorecard appears a few minutes after it finishes.';
   else if (transcription.status === 'error') message = `Transcription failed: ${transcription.error || 'unknown error'}`;
   else if (analysis?.status === 'error') message = `Scoring failed: ${analysis.error || 'unknown error'}`;
@@ -408,6 +415,7 @@ export default function RecordingDetail() {
   const utterances = transcription?.utterances || [];
   const agentSpeaker = details.agentSpeaker || stats.agentSpeaker || null;
   const durationMs = file?.duration_ms || 0;
+  const disposition = report?.disposition || file?.call_disposition || '';
   const agentFullName = data?.agentName || report?.agent_display_name || report?.agent_name || file?.email || null;
 
   const markers = [
@@ -459,7 +467,7 @@ export default function RecordingDetail() {
                   <Typography sx={{ fontFamily: '"Manrope", sans-serif', fontWeight: 800, fontSize: 30, lineHeight: 1 }}>{fmtScore(analysis.overall_score)}</Typography>
                   <Box><Typography variant="caption" sx={{ display: 'block', fontWeight: 700 }}>CALL SCORE</Typography><Typography variant="caption">out of ±10</Typography></Box>
                 </Box>
-              ) : <ScoreChip score={null} pending={transcription?.status === 'processing'} />}
+              ) : <ScoreChip score={null} pending={transcription?.status === 'processing'} durationMs={durationMs} disposition={disposition} />}
               <Tooltip title={linkCopied ? 'Link copied' : 'Copy link to this call'}>
                 <IconButton onClick={copyLink} aria-label="Copy link to this call"><LinkIcon /></IconButton>
               </Tooltip>
@@ -497,7 +505,7 @@ export default function RecordingDetail() {
                       : <Typography variant="body2" color="text.secondary">No summary yet.</Typography>}
                   </Card>
                 </Box>
-                {analysis ? <Scorecard analysis={analysis} onSeek={seekMs} /> : <Card title="Scorecard"><AnalysisPending transcription={transcription} analysis={data.analysis} /></Card>}
+                {analysis ? <Scorecard analysis={analysis} onSeek={seekMs} /> : <Card title="Scorecard"><AnalysisPending transcription={transcription} analysis={data.analysis} durationMs={durationMs} disposition={disposition} /></Card>}
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, minWidth: 0 }}>
                   {stats.agentTalkShare !== null && stats.agentTalkShare !== undefined && (
                     <Card title="Talk share">
@@ -533,7 +541,7 @@ export default function RecordingDetail() {
               <Card title="Transcript" action={<Typography variant="caption" color="text.secondary">Personal information is replaced with tags like [SSN]. Click a message to play the call from that moment.</Typography>}>
                 {transcription?.status === 'completed'
                   ? <Transcript utterances={utterances} agentSpeaker={agentSpeaker} currentMs={player.ready ? player.time * 1000 : -1} onSeek={seekMs} focusMs={focusMs} />
-                  : <AnalysisPending transcription={transcription} analysis={data.analysis} />}
+                  : <AnalysisPending transcription={transcription} analysis={data.analysis} durationMs={durationMs} disposition={disposition} />}
               </Card>
             )}
 
@@ -575,7 +583,7 @@ export default function RecordingDetail() {
                   ))}
                 </Card>
               </Box>
-            ) : <Card><AnalysisPending transcription={transcription} analysis={data.analysis} /></Card>)}
+            ) : <Card><AnalysisPending transcription={transcription} analysis={data.analysis} durationMs={durationMs} disposition={disposition} /></Card>)}
 
             {tab === 'activity' && (
               <Activity path={path} activity={data.activity} onChange={reload} currentMs={player.time * 1000} onSeek={seekMs} />

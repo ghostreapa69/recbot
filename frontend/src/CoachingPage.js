@@ -66,7 +66,7 @@ export default function CoachingPage() {
                   <ButtonBase onClick={() => navigate(recordingUrl(item.file_path))} sx={{ color: 'primary.main', textAlign: 'left', fontWeight: 600 }}>
                     {item.customer_name || item.phone || 'Unknown caller'} · {agentLabel(item)} · {dayjs(item.call_date).format('MMM D')}
                   </ButtonBase>
-                  <ScoreChip score={item.overall_score} />
+                  <ScoreChip score={item.overall_score} durationMs={item.duration_ms} disposition={item.disposition} />
                 </Box>
                 {item.note && <Typography variant="body2" sx={{ my: 0.75, whiteSpace: 'pre-wrap' }}>{item.note}</Typography>}
                 <Box display="flex" justifyContent="space-between" alignItems="center" gap={1} flexWrap="wrap">
