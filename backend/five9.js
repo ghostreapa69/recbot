@@ -4,6 +4,7 @@ import utc from 'dayjs/plugin/utc.js';
 import timezone from 'dayjs/plugin/timezone.js';
 import customParseFormat from 'dayjs/plugin/customParseFormat.js';
 import { XMLParser } from 'fast-xml-parser';
+import { trackJob } from './activity.js';
 import { bulkUpsertReports, logAuditEvent, normalizeReportTimestamp } from './database.js';
 
 dayjs.extend(utc);
@@ -473,7 +474,7 @@ export function scheduleRecurringIngestion() {
     autoIngestionLock = true;
     const started = Date.now();
     console.log(`🚀 [Five9] Auto ingestion starting (interval ${intervalMinutes}m, window ${intervalMinutes + REPORT_LOOKBACK_PADDING_MINUTES}m)`);
-    fetchLastHourCallLog().then(result => {
+    trackJob('five9-call-log', () => fetchLastHourCallLog()).then(result => {
       const ms = Date.now() - started;
       console.log('✅ [Five9] Auto ingestion finished', { durationMs: ms, ...result });
     }).catch(err => {

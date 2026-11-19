@@ -29,7 +29,7 @@ import { fetchLastHourCallLog, fetchCallLog, five9Configured, five9AdminCall, sc
 import { syncFive9Teams } from './five9Teams.js';
 import { scheduleTeamSync } from './teamSyncSchedule.js';
 import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
-import { monitorEventLoopDelay } from 'perf_hooks';
+import { trackRequests, trackJob, startBlockMonitor } from './activity.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -47,6 +47,8 @@ const REPORT_FILTER_FALLBACK_TIMEZONE = process.env.REPORTS_QUERY_TIMEZONE || pr
 app.use(cors());
 // Gzip JSON, HTML, JS and CSS. Audio (audio/wav) isn't compressible, so streams are untouched.
 app.use(compression());
+
+app.use(trackRequests);
 
 // Logs API requests that take 500ms or more, so slow spots show up in the logs.
 const SLOW_REQUEST_MS = 500;
@@ -423,14 +425,9 @@ const audioCache = createAudioCache({
   onOriginalFetch: err => (err ? recordS3Failure(`${err.name || 'Error'} ${err.message}`.trim()) : recordS3Success())
 });
 
-// Warn when the event loop stalls: a blocked loop fails the healthcheck and times out S3 requests.
-const loopDelay = monitorEventLoopDelay({ resolution: 50 });
-loopDelay.enable();
-setInterval(() => {
-  const maxMs = loopDelay.max / 1e6;
-  if (maxMs > 1000) console.warn(`🐢 [EVENT LOOP] blocked for up to ${Math.round(maxMs)}ms in the last 10s`);
-  loopDelay.reset();
-}, 10000).unref();
+// Warn when the event loop stalls (a blocked loop fails the healthcheck and times out S3
+// requests), naming the requests and background jobs that were running.
+startBlockMonitor();
 
 // --- AUTO SESSION EXPIRATION (4h) ---
 const MAX_SESSION_HOURS = parseInt(process.env.MAX_SESSION_HOURS || '4');
@@ -1766,6 +1763,7 @@ async function runTeamSync(trigger) {
     const started = Date.now();
     const result = await syncFive9Teams({ call: five9AdminCall, saveSnapshot: saveFive9TeamSnapshot });
     teamCache.clear();
+    dashboardCache.clear();
     lastTeamSync = { at: new Date().toISOString(), trigger, ok: true, ...result };
     console.log(`👥 [FIVE9 TEAMS] Synced (${trigger}) in ${Date.now() - started}ms: ${result.groups} groups, ${result.supervisors} supervisors, ${result.agents} agents, ${result.memberships} memberships, ${result.usersWithoutEmail} users without email`);
     return result;
@@ -1789,17 +1787,28 @@ app.get('/api/teams/me', requireAuth, ensureSession, requireAuthenticatedUser, a
   }
 });
 
+// Team dashboards are cached briefly: Home refetches on every visit and range change, and
+// several managers often open it at once. Cleared when the teams are re-synced.
+const DASHBOARD_CACHE_MS = 60 * 1000;
+const dashboardCache = new Map(); // key -> { at, body }
+
 app.get('/api/teams/dashboard', requireAuth, ensureSession, requireManagerOrAdmin, async (req, res) => {
   try {
-    const team = await teamFor(req.user, typeof req.query.group === 'string' ? req.query.group : null);
+    const group = typeof req.query.group === 'string' ? req.query.group : null;
     const period = periodFor(req.query.range);
+    const cacheKey = `${req.user.email.toLowerCase()}|${req.user.role}|${group || ''}|${period.range}`;
+    const cached = dashboardCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < DASHBOARD_CACHE_MS) return res.json(cached.body);
+    for (const [key, entry] of dashboardCache) if (Date.now() - entry.at >= DASHBOARD_CACHE_MS) dashboardCache.delete(key);
+
+    const team = await teamFor(req.user, group);
     if (!team.hasTeam) {
       return res.json({ ...team, period, message: team.isAdmin ? 'No Five9 agent groups have been synced yet.' : 'No Five9 agent group lists you as a supervisor.' });
     }
     const emails = team.members.map(m => m.email);
     const [dashboard, leaderboard] = await Promise.all([getAgentDashboard(emails, period), getTeamLeaderboard(emails, period)]);
     const names = new Map(team.members.map(m => [m.email, m.name]));
-    res.json({
+    const body = {
       ...team,
       period,
       ...dashboard,
@@ -1807,7 +1816,9 @@ app.get('/api/teams/dashboard', requireAuth, ensureSession, requireManagerOrAdmi
       worst: withAgentNames(dashboard.worst),
       best: withAgentNames(dashboard.best),
       leaderboard: leaderboard.map(row => ({ ...row, name: names.get(row.email) || row.five9_name || row.email }))
-    });
+    };
+    dashboardCache.set(cacheKey, { at: Date.now(), body });
+    res.json(body);
   } catch (err) {
     console.error('Error in /api/teams/dashboard:', err);
     res.status(500).json({ error: err.message });
@@ -2633,7 +2644,7 @@ app.get('*', (req, res) => {
 
 // Every 5 minutes: index today's new recordings, fetch their Five9 call log
 // rows if missing, and copy the agent and customer onto each recording.
-const syncCurrentDay = createRecordingScan({
+const recordingScan = createRecordingScan({
   listDayFiles: day => listWavFilesFromS3(process.env.AWS_BUCKET, `recordings/${day}/`),
   insertNewFiles,
   fillFileAgents,
@@ -2641,6 +2652,8 @@ const syncCurrentDay = createRecordingScan({
   fetchCallLog,
   five9Configured
 });
+
+const syncCurrentDay = () => trackJob('recording-scan', recordingScan);
 
 // Initialize PostgreSQL database and start server
 initializeDatabase().then(() => {
@@ -2666,7 +2679,7 @@ initializeDatabase().then(() => {
 
     // Five9 agent groups → manager teams: daily at 9 PM, or every 6 hours with FIVE9_TEAM_SYNC_SCHEDULE=6h.
     if (five9Configured) {
-      scheduleTeamSync({ schedule: process.env.FIVE9_TEAM_SYNC_SCHEDULE, run: () => runTeamSync('scheduled').catch(() => {}), tz: APP_TIMEZONE });
+      scheduleTeamSync({ schedule: process.env.FIVE9_TEAM_SYNC_SCHEDULE, run: () => trackJob('five9-team-sync', () => runTeamSync('scheduled')).catch(() => {}), tz: APP_TIMEZONE });
     }
 
     // Load the agent list now so the first dropdown doesn't wait for it.

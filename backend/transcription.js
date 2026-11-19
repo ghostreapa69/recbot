@@ -15,6 +15,7 @@ import {
 import * as scriberr from './scriberr.js';
 import { redactUtterances, analyzeCall, identifyAgentSpeaker } from './analysis.js';
 import { claudeConfigured, createClaudeLlm, CLAUDE_SCORING_MODEL } from './claude.js';
+import { trackJob } from './activity.js';
 
 dayjs.extend(utcPlugin);
 dayjs.extend(timezonePlugin);
@@ -283,7 +284,7 @@ export function startTranscriptionWorker({ s3, bucket }) {
     return;
   }
   console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s maxPerTick=${MAX_PER_TICK} redactionLlm=${scriberr.scriberrLlmModel || '(Scriberr default)'} scoring=${claudeConfigured ? `Claude ${CLAUDE_SCORING_MODEL}` : 'local Scriberr LLM'}`);
-  const tick = () => runTranscriptionTick({ s3, bucket });
+  const tick = () => trackJob('transcription-tick', () => runTranscriptionTick({ s3, bucket }));
   setTimeout(tick, 60 * 1000);
   setInterval(tick, INTERVAL_MS);
 }

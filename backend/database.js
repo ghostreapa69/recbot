@@ -2570,6 +2570,20 @@ const SCORE_COLUMNS = ['intro', 'retention', 'info', 'sentiment', 'objection', '
 
 // Aggregates for a set of agents ($1, a text[]) for the current period ($2..$3)
 // and the previous one ($4..$5), in one pass.
+// Runs a dashboard query and logs it when it takes over a second, with the agent count
+// and date range, so a slow Home page names the query responsible.
+const SLOW_QUERY_MS = 1000;
+async function timedQuery(label, text, params) {
+  const started = Date.now();
+  const result = await pool.query(text, params);
+  const ms = Date.now() - started;
+  if (ms >= SLOW_QUERY_MS) {
+    const emails = Array.isArray(params[0]) ? `${params[0].length} agents, ` : '';
+    console.warn(`🐌 [DB] ${label} ${ms}ms (${emails}${params[1]}..${params[2]})`);
+  }
+  return result;
+}
+
 async function periodKpis(emails, start, end, prevStart, prevEnd) {
   const columns = (alias, from, to) => {
     const f = `FILTER (WHERE f.call_date >= ${from} AND f.call_date <= ${to})`;
@@ -2582,7 +2596,7 @@ async function periodKpis(emails, start, end, prevStart, prevEnd) {
       ...SCORE_COLUMNS.map(c => `AVG(ca.${c}_score) ${f}::float AS ${alias}_${c}`)
     ].join(',\n      ');
   };
-  const { rows: [row] } = await pool.query(`
+  const { rows: [row] } = await timedQuery('dashboard kpis', `
     SELECT ${columns('cur', '$2', '$3')},
       ${columns('prev', '$4', '$5')}
     FROM ${CALLS_FROM}
@@ -2616,26 +2630,26 @@ export async function getAgentDashboard(emails, { start, end, prevStart, prevEnd
     ? `to_char(f.call_date::date, 'YYYY-MM-DD') || ' ' || CASE WHEN f.call_time ~ '^[0-9]{2}:' THEN left(f.call_time, 2) ELSE '00' END || ':00'`
     : `to_char(date_trunc('${trunc}', f.call_date::date), 'YYYY-MM-DD')`;
   const [trend, dispositions, recent, worst, best] = await Promise.all([
-    pool.query(`
+    timedQuery('dashboard trend', `
       SELECT ${bucketSql} AS bucket,
         AVG(ca.overall_score)::float AS avg_score, COUNT(*)::int AS calls
       FROM ${CALLS_FROM}
       WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $2 AND f.call_date <= $3
       GROUP BY 1 ORDER BY 1
     `, [emails, start, end]),
-    pool.query(`
+    timedQuery('dashboard outcomes', `
       SELECT COALESCE(r.disposition, f.call_disposition, 'Unknown') AS disposition, COUNT(*)::int AS calls
       FROM ${CALLS_FROM}
       WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $2 AND f.call_date <= $3
       GROUP BY 1 ORDER BY calls DESC LIMIT 6
     `, [emails, start, end]),
-    pool.query(`
+    timedQuery('dashboard recent', `
       SELECT ${CALL_ROW_SQL} FROM ${CALLS_FROM}
       WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $2 AND f.call_date <= $3
       ORDER BY f.call_date DESC, f.call_time DESC LIMIT 8
     `, [emails, start, end]),
-    pool.query(scoredCallsSql('ASC'), [emails, start, end]),
-    pool.query(scoredCallsSql('DESC'), [emails, start, end])
+    timedQuery('dashboard worst', scoredCallsSql('ASC'), [emails, start, end]),
+    timedQuery('dashboard best', scoredCallsSql('DESC'), [emails, start, end])
   ]);
   return {
     current,
@@ -2664,7 +2678,7 @@ export async function getAgentScoreHistory(emails) {
 // calls still get a row.
 export async function getTeamLeaderboard(emails, { start, end, prevStart, prevEnd }) {
   const cur = 'FILTER (WHERE f.call_date >= $2 AND f.call_date <= $3)';
-  const { rows } = await pool.query(`
+  const { rows } = await timedQuery('team leaderboard', `
     WITH s AS (
       SELECT ${AGENT_SQL} AS email,
         MAX(f.agent_name) AS five9_name,
