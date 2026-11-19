@@ -1,6 +1,6 @@
-// Call scoring and the agent/customer speaker check on Claude Haiku, used when
-// ANTHROPIC_API_KEY is set. Only redacted transcripts reach this module; transcription
-// and redaction stay on the local Scriberr server.
+// Call scoring and the agent/customer speaker check on Claude, used when ANTHROPIC_API_KEY
+// is set (redaction also goes to Claude then, through scriberr.js). Transcription stays on
+// the local Scriberr server.
 //
 // Structured outputs guarantee each reply matches its schema, so the JSON always parses
 // and always has the scores. The returned function has the same shape as Scriberr's llm()
@@ -10,7 +10,8 @@ import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import * as z from 'zod/v4';
 import { TOPICS } from './analysis.js';
 
-export const CLAUDE_SCORING_MODEL = 'claude-haiku-5-5';
+// Same setting as the redaction path in scriberr.js, so one model does both.
+export const CLAUDE_SCORING_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
 export const claudeConfigured = Boolean(process.env.ANTHROPIC_API_KEY);
 
 const category = z.object({ score: z.number(), reason: z.string(), quote: z.string(), at: z.string() });

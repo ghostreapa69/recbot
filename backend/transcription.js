@@ -43,8 +43,8 @@ const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 const llm = scriberrId => prompt => scriberr.llm(prompt, scriberrId);
 
-// Scoring and the speaker check use Claude Haiku when ANTHROPIC_API_KEY is set; redaction
-// always stays on the local Scriberr LLM (it sees the unredacted text).
+// Scoring and the speaker check use Claude (claude.js, structured outputs) when ANTHROPIC_API_KEY
+// is set; redaction then goes to Claude too, through scriberr.llm().
 const claudeLlm = claudeConfigured ? createClaudeLlm() : null;
 const scoringLlm = scriberrId => claudeLlm || llm(scriberrId);
 const SCORING_MODEL = claudeConfigured ? CLAUDE_SCORING_MODEL : (scriberr.scriberrLlmModel || null);
