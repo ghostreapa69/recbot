@@ -27,6 +27,7 @@ import { createRecordingScan } from './recordingScan.js';
 import { startTranscriptionWorker, MIN_DURATION_MS, SKIP_DISPOSITIONS } from './transcription.js';
 import { fetchLastHourCallLog, fetchCallLog, five9Configured, five9AdminCall, scheduleRecurringIngestion } from './five9.js';
 import { syncFive9Teams } from './five9Teams.js';
+import { scheduleTeamSync } from './teamSyncSchedule.js';
 import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
 import { monitorEventLoopDelay } from 'perf_hooks';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
@@ -1750,7 +1751,6 @@ async function teamFor(user, group = null) {
   return team;
 }
 
-const TEAM_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const TEAM_SYNC_LOCK = 727003;
 let lastTeamSync = null;
 
@@ -2664,11 +2664,9 @@ initializeDatabase().then(() => {
     // One-time: index and fill agent columns on existing recordings (no-op once done).
     runFileAgentBackfill().catch(err => console.error('❌ [AGENT BACKFILL] Failed:', err.message));
 
-    // Five9 agent groups → manager teams: shortly after start, then every 6 hours.
+    // Five9 agent groups → manager teams: daily at 9 PM, or every 6 hours with FIVE9_TEAM_SYNC_SCHEDULE=6h.
     if (five9Configured) {
-      const syncTeams = () => runTeamSync('scheduled').catch(() => {});
-      setTimeout(syncTeams, 60 * 1000);
-      setInterval(syncTeams, TEAM_SYNC_INTERVAL_MS);
+      scheduleTeamSync({ schedule: process.env.FIVE9_TEAM_SYNC_SCHEDULE, run: () => runTeamSync('scheduled').catch(() => {}), tz: APP_TIMEZONE });
     }
 
     // Load the agent list now so the first dropdown doesn't wait for it.

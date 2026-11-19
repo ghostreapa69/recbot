@@ -99,6 +99,7 @@ services:
       - FIVE9_TIMEZONE=America/Los_Angeles
       - REACT_APP_FIVE9_TIMEZONE=America/Los_Angeles
       - FIVE9_AUTO_INGEST_MINUTES=5
+      #- FIVE9_TEAM_SYNC_SCHEDULE=9pm  # Five9 team sync: 9pm (daily, default) or 6h
       - REPORT_TIME_DEBUG=true
 
       # --- Scriberr: transcription, PII redaction, summaries and call scores ---

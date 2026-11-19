@@ -54,7 +54,7 @@ RecBot is a production-focused web platform for browsing, filtering, auditing, a
 
 ### 👥 Five9 Teams
 - **Teams come from Five9 agent groups**: a user with the Five9 supervisor role who is in an agent group manages that group's other (active) members. RecBot access still comes from the RecBot manager/admin role; Five9 only decides who is on whose team
-- **Synced** about a minute after start and every 6 hours (`getAgentGroups` and `getUsersInfo`), or on demand from Admin → Database Management → **Five9 teams → Sync now**. A failed sync keeps the previous teams. People are matched by their Five9 email (or username when it is an email)
+- **Synced** daily at 9 PM in `FIVE9_TIMEZONE` (`getAgentGroups` and `getUsersInfo`); set `FIVE9_TEAM_SYNC_SCHEDULE=6h` to sync a minute after start and every 6 hours instead. Also on demand from Admin → Database Management → **Five9 teams → Sync now**. A failed sync keeps the previous teams. People are matched by their Five9 email (or username when it is an email)
 - **Managers with a team** open Home on a team dashboard (team totals, trend, categories, best and lowest calls, and a sortable per-agent table; click an agent to open their dashboard). Coaching defaults to their team, and Recordings and Trends get a **My team** option
 - **Admins** see every Five9 agent as their team and can narrow it to one group
 
