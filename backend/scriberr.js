@@ -18,9 +18,15 @@ const REQUEST_TIMEOUT_MS = 30 * 1000;
 const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 // Local LLMs on modest GPUs can take minutes for a long transcript.
 const LLM_TIMEOUT_MS = parseInt(process.env.SCRIBERR_LLM_TIMEOUT_MS || String(10 * 60 * 1000), 10);
+// With an Anthropic API key set, LLM prompts go straight to the Claude API instead of
+// through Scriberr's /summarize (which sends no max_tokens and only reaches Claude via
+// the OpenAI-compatibility layer).
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
+const ANTHROPIC_MAX_TOKENS = parseInt(process.env.ANTHROPIC_MAX_TOKENS || '16000', 10);
 
 export const scriberrConfigured = Boolean(BASE_URL);
-export const scriberrLlmModel = LLM_MODEL;
+export const scriberrLlmModel = ANTHROPIC_API_KEY ? ANTHROPIC_MODEL : LLM_MODEL;
 
 export class ScriberrError extends Error {}
 
@@ -180,6 +186,7 @@ function pickText(json) {
 // Runs one prompt through the LLM configured in Scriberr. The prompt is sent as the
 // content to summarize, tied to the job it is about.
 export async function llm(prompt, transcriptionId) {
+  if (ANTHROPIC_API_KEY) return claude(prompt);
   const res = await request('/api/v1/summarize', {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
@@ -189,4 +196,26 @@ export async function llm(prompt, transcriptionId) {
   const text = parseLlmBody(await res.text());
   // Drop any reasoning block the model emits before its answer.
   return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+}
+
+// One prompt through the Claude Messages API. Rate-limit and overload responses are
+// retried a few times, honoring retry-after.
+async function claude(prompt) {
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: ANTHROPIC_MAX_TOKENS, messages: [{ role: 'user', content: prompt }] }),
+      signal: AbortSignal.timeout(LLM_TIMEOUT_MS)
+    });
+    if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+      const wait = parseFloat(res.headers.get('retry-after')) || 5 * attempt;
+      await new Promise(r => setTimeout(r, wait * 1000));
+      continue;
+    }
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Claude API HTTP ${res.status}: ${json.error?.message || 'no details'}`);
+    if (json.stop_reason === 'max_tokens') throw new Error(`Claude reply cut off at ${ANTHROPIC_MAX_TOKENS} tokens`);
+    return (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  }
 }

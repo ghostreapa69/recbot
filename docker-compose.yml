@@ -115,6 +115,9 @@ services:
       #- SCRIBERR_LANGUAGE=en
       # LLM configured in Scriberr for redaction, summaries and scoring.
       #- SCRIBERR_LLM_MODEL=
+      # Or send redaction + scoring prompts straight to Claude (company API key; overrides the Scriberr LLM).
+      #- ANTHROPIC_API_KEY=your-anthropic-api-key-here
+      #- ANTHROPIC_MODEL=claude-haiku-5-5
       # Optional: how long to wait for one LLM reply (ms); local models can be slow.
       #- SCRIBERR_LLM_TIMEOUT_MS=600000
       # Only transcribe calls from the last N days...
@@ -123,6 +126,8 @@ services:
       - TRANSCRIBE_MIN_DURATION_SECONDS=50
       # Max recordings submitted, redacted and scored per 5-minute tick (sets the load on the Scriberr GPU).
       #- TRANSCRIBE_MAX_PER_TICK=10
+      # Stop submitting while this many jobs are still in Scriberr (its queue holds at most 200).
+      #- SCRIBERR_MAX_QUEUED=50
 
       # --- Optional / Feature Flags ---
       #- EXTRA_LOGGING=true

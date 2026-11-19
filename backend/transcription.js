@@ -29,6 +29,9 @@ export const SKIP_DISPOSITIONS = [
 ];
 // On-prem GPU capacity sets the pace, so each step's batch size is configurable.
 const MAX_PER_TICK = parseInt(process.env.TRANSCRIBE_MAX_PER_TICK || '10', 10);
+// Scriberr's in-memory queue holds 200 waiting jobs; past that, submits fail with
+// "Failed to enqueue job" and the job is stranded. Keep our in-flight count well under it.
+const MAX_QUEUED = parseInt(process.env.SCRIBERR_MAX_QUEUED || '50', 10);
 const MAX_REDACTION_ATTEMPTS = 3;
 const TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
 
@@ -74,8 +77,14 @@ async function findExistingJob(filePath) {
 }
 
 async function submitNew(s3, bucket) {
+  const { rows: [{ n: inFlight }] } = await pool.query("SELECT count(*)::int AS n FROM transcriptions WHERE status = 'processing'");
+  const room = Math.min(MAX_PER_TICK, MAX_QUEUED - inFlight);
+  if (room <= 0) {
+    console.log(`📝 [TRANSCRIBE] Scriberr has ${inFlight} jobs in flight (max ${MAX_QUEUED}); not submitting this tick`);
+    return { submitted: 0, failed: 0 };
+  }
   const cutoff = dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
-  const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_MS, MAX_PER_TICK, SKIP_DISPOSITIONS.map(d => d.toLowerCase()));
+  const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_MS, room, SKIP_DISPOSITIONS.map(d => d.toLowerCase()));
   let submitted = 0;
   for (const filePath of filePaths) {
     let wavPath;
