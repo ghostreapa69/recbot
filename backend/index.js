@@ -1693,12 +1693,16 @@ app.post('/api/recordings/analysis/rescore', requireAuth, ensureSession, require
 const APP_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
 
 // Current and previous period for a Week/Month/Year toggle, as YYYY-MM-DD strings.
-// Week: last 7 days by day; Month: last 5 weeks by week; Year: last 12 months by month.
+// Today: today by hour (compared with yesterday); Week: last 7 days by day;
+// Month: last 5 weeks by week; Year: last 12 months by month.
 function periodFor(range) {
   const today = dayjs().tz(APP_TIMEZONE).startOf('day');
   let start;
   let bucket;
-  if (range === 'year') {
+  if (range === 'today') {
+    start = today;
+    bucket = 'hour';
+  } else if (range === 'year') {
     start = today.startOf('month').subtract(11, 'month');
     bucket = 'month';
   } else if (range === 'month') {
@@ -1712,7 +1716,7 @@ function periodFor(range) {
   const prevEnd = start.subtract(1, 'day');
   const prevStart = prevEnd.subtract(days - 1, 'day');
   const fmt = d => d.format('YYYY-MM-DD');
-  return { start: fmt(start), end: fmt(today), prevStart: fmt(prevStart), prevEnd: fmt(prevEnd), bucket, range: ['week', 'month', 'year'].includes(range) ? range : 'week' };
+  return { start: fmt(start), end: fmt(today), prevStart: fmt(prevStart), prevEnd: fmt(prevEnd), bucket, range: ['today', 'week', 'month', 'year'].includes(range) ? range : 'week' };
 }
 
 const agentDirectory = createAgentDirectory({ query: (text, params) => pool.query(text, params) });
