@@ -9,11 +9,12 @@ import crypto from 'crypto';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import {
   pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription, markRedactionFailed,
-  getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError,
+  getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError, saveCallAnalysisRetry,
   getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis, adoptScriberrJob, resetTranscription, requeueFailedAnalyses
 } from './database.js';
 import * as scriberr from './scriberr.js';
 import { redactUtterances, analyzeCall, identifyAgentSpeaker } from './analysis.js';
+import { claudeConfigured, createClaudeLlm, CLAUDE_SCORING_MODEL } from './claude.js';
 
 dayjs.extend(utcPlugin);
 dayjs.extend(timezonePlugin);
@@ -38,6 +39,13 @@ const TRANSCRIBE_LOCK_KEY = 727001;
 const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 const llm = scriberrId => prompt => scriberr.llm(prompt, scriberrId);
+
+// Scoring and the speaker check use Claude Haiku when ANTHROPIC_API_KEY is set; redaction
+// always stays on the local Scriberr LLM (it sees the unredacted text).
+const claudeLlm = claudeConfigured ? createClaudeLlm() : null;
+const scoringLlm = scriberrId => claudeLlm || llm(scriberrId);
+const SCORING_MODEL = claudeConfigured ? CLAUDE_SCORING_MODEL : (scriberr.scriberrLlmModel || null);
+const MAX_CLAUDE_ATTEMPTS = 3;
 
 // Telephony formats vary, so every recording goes to Scriberr as 16 kHz mono WAV.
 async function downloadAsWav(s3, bucket, filePath) {
@@ -184,13 +192,19 @@ async function analyzeMissing() {
   let analyzed = 0;
   for (const row of await getTranscriptionsNeedingAnalysis(MAX_PER_TICK)) {
     try {
-      const result = await analyzeCall(row.utterances, llm(row.scriberr_id));
-      await saveCallAnalysis(row.file_path, result, scriberr.scriberrLlmModel || null);
+      const result = await analyzeCall(row.utterances, scoringLlm(row.scriberr_id));
+      await saveCallAnalysis(row.file_path, result, SCORING_MODEL);
       console.log(`📊 [ANALYZE] ${row.file_path} overall=${result.overall}`);
       analyzed++;
     } catch (err) {
-      await saveCallAnalysisError(row.file_path, `Analysis failed: ${err.message}`, scriberr.scriberrLlmModel || null);
-      console.error(`❌ [ANALYZE] Failed for ${row.file_path}: ${err.message}`);
+      if (claudeConfigured) {
+        // Claude failures (outage, rate limit, refusal) are retried on a later tick.
+        const { attempts, status } = await saveCallAnalysisRetry(row.file_path, `Analysis failed: ${err.message}`, SCORING_MODEL, MAX_CLAUDE_ATTEMPTS);
+        console.error(`❌ [ANALYZE] Failed for ${row.file_path} (attempt ${attempts}/${MAX_CLAUDE_ATTEMPTS}${status === 'retry' ? ', will retry' : ''}): ${err.message}`);
+      } else {
+        await saveCallAnalysisError(row.file_path, `Analysis failed: ${err.message}`, SCORING_MODEL);
+        console.error(`❌ [ANALYZE] Failed for ${row.file_path}: ${err.message}`);
+      }
     }
   }
   return analyzed;
@@ -202,7 +216,7 @@ export async function recheckSpeakers(limit = MAX_PER_TICK) {
   let rescored = 0;
   for (const row of await getAnalysesNeedingSpeakerCheck(limit)) {
     try {
-      const detected = await identifyAgentSpeaker(row.utterances, llm(row.scriberr_id));
+      const detected = await identifyAgentSpeaker(row.utterances, scoringLlm(row.scriberr_id));
       if (detected && row.agent_speaker && detected !== row.agent_speaker) {
         console.log(`🔁 [SPEAKER] ${row.file_path} agent was ${row.agent_speaker}, detected ${detected} — rescoring`);
         await deleteCallAnalysis(row.file_path);
@@ -259,7 +273,7 @@ export function startTranscriptionWorker({ s3, bucket }) {
     console.log('📝 [TRANSCRIBE] SCRIBERR_URL not set; transcription disabled');
     return;
   }
-  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s maxPerTick=${MAX_PER_TICK} llmModel=${scriberr.scriberrLlmModel || '(Scriberr default)'}`);
+  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s maxPerTick=${MAX_PER_TICK} redactionLlm=${scriberr.scriberrLlmModel || '(Scriberr default)'} scoring=${claudeConfigured ? `Claude ${CLAUDE_SCORING_MODEL}` : 'local Scriberr LLM'}`);
   const tick = () => runTranscriptionTick({ s3, bucket });
   setTimeout(tick, 60 * 1000);
   setInterval(tick, INTERVAL_MS);

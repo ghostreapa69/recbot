@@ -113,6 +113,10 @@ services:
       #- SCRIBERR_LLM_MODEL=
       # Optional: how long to wait for one LLM reply (ms); local models can be slow.
       #- SCRIBERR_LLM_TIMEOUT_MS=600000
+      # Claude API key: when set, call scoring, summaries and the agent/customer speaker check use
+      # Claude Haiku (claude-haiku-5-5) instead of the Scriberr LLM. Only redacted transcripts are sent;
+      # transcription and redaction stay on Scriberr. Failed Claude scoring is retried up to 3 times.
+      #- ANTHROPIC_API_KEY=your-anthropic-api-key-here
       # Only transcribe calls from the last N days...
       - TRANSCRIBE_LOOKBACK_DAYS=7
       # ...that are longer than this many seconds.

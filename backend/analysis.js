@@ -258,7 +258,7 @@ export function buildSpeakerPrompt(utterances) {
 export async function identifyAgentSpeaker(utterances, llm) {
   const speakers = new Set(utterances.map(u => u.speaker));
   if (speakers.size < 2) return null;
-  const reply = await llm(buildSpeakerPrompt(utterances));
+  const reply = await llm(buildSpeakerPrompt(utterances), { schema: 'speaker' });
   let json;
   try { json = extractJson(reply); } catch { return null; }
   const letter = String(json.agent_speaker || '').trim().toUpperCase();
@@ -468,14 +468,16 @@ export async function analyzeCall(utterances, llm) {
   };
   const finish = result => ({ ...result, stats: computeTranscriptStats(utterances, result.agentSpeaker) });
 
-  const firstReply = await llm(prompt);
+  const firstReply = await llm(prompt, { schema: 'analysis' });
   const first = parse(firstReply);
   if (first) {
     try { return finish(validateAnalysis(first, utterances, detected)); } catch (err) { logUnusable(err, firstReply, first); }
   }
   // A reply with everything but the scores gets a short scores-only follow-up, merged with
   // the first reply's summary and other fields; an unreadable one is simply asked again.
-  const secondReply = await llm(first ? buildAnalysisPrompt(utterances, detected, SCORES_ONLY_PROMPT) : prompt);
+  const secondReply = first
+    ? await llm(buildAnalysisPrompt(utterances, detected, SCORES_ONLY_PROMPT), { schema: 'scores' })
+    : await llm(prompt, { schema: 'analysis' });
   const second = parse(secondReply);
   if (!second) throw new Error('Reply contained no usable JSON');
   const merged = first ? { ...first, agent_speaker: second.agent_speaker ?? first.agent_speaker, scores: second } : second;
