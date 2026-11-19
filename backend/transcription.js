@@ -10,7 +10,7 @@ import { GetObjectCommand } from '@aws-sdk/client-s3';
 import {
   pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription, markRedactionFailed,
   getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError,
-  getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis, adoptScriberrJob, resetTranscription
+  getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis, adoptScriberrJob, resetTranscription, requeueFailedAnalyses
 } from './database.js';
 import * as scriberr from './scriberr.js';
 import { redactUtterances, analyzeCall, identifyAgentSpeaker } from './analysis.js';
@@ -219,6 +219,9 @@ export async function recheckSpeakers(limit = MAX_PER_TICK) {
 }
 
 let isRunning = false;
+// Scoring used to give up on replies whose scores it couldn't find; retry those once per start.
+const REQUEUE_ERROR = 'Analysis failed: Analysis has no "scores" object';
+let requeueDone = false;
 
 // One pass of the worker: poll finished jobs, score new transcripts, submit new recordings.
 export async function runTranscriptionTick({ s3, bucket }) {
@@ -232,6 +235,11 @@ export async function runTranscriptionTick({ s3, bucket }) {
     client = await pool.connect();
     ({ rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [TRANSCRIBE_LOCK_KEY]));
     if (!locked) return;
+    if (!requeueDone) {
+      const requeued = await requeueFailedAnalyses(REQUEUE_ERROR);
+      requeueDone = true;
+      if (requeued) console.log(`🔁 [ANALYZE] Re-queued ${requeued} call(s) that failed with "no scores"`);
+    }
     const completed = await pollPending();
     const analyzed = await analyzeMissing();
     const rescored = await recheckSpeakers();

@@ -2492,6 +2492,12 @@ export async function markSpeakerChecked(filePath) {
   await pool.query('UPDATE call_analyses SET speaker_checked_at = NOW() WHERE file_path = $1', [filePath]);
 }
 
+// Deletes scorecards that failed with exactly this error, so the worker scores those calls again.
+export async function requeueFailedAnalyses(error) {
+  const { rowCount } = await pool.query(`DELETE FROM call_analyses WHERE status = 'error' AND error = $1`, [error]);
+  return rowCount;
+}
+
 export async function deleteCallAnalysis(filePath) {
   const { rowCount } = await pool.query('DELETE FROM call_analyses WHERE file_path = $1', [filePath]);
   await pool.query('DELETE FROM call_topics WHERE file_path = $1', [filePath]);
