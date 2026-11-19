@@ -152,6 +152,7 @@ SCRIBERR_API_KEY=your_scriberr_api_key
 # SCRIBERR_LANGUAGE=en
 # SCRIBERR_LLM_MODEL=               # LLM configured in Scriberr
 # SCRIBERR_LLM_TIMEOUT_MS=600000
+# ANTHROPIC_API_KEY=sk-ant-...      # set to score calls with Claude Haiku (claude-haiku-5-5); Scriberr still transcribes and redacts
 # TRANSCRIBE_LOOKBACK_DAYS=7
 # TRANSCRIBE_MIN_DURATION_SECONDS=50
 # TRANSCRIBE_MAX_PER_TICK=10        # recordings submitted, redacted and scored per 5-minute pass

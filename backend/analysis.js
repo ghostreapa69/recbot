@@ -258,7 +258,7 @@ export function buildSpeakerPrompt(utterances) {
 export async function identifyAgentSpeaker(utterances, llm) {
   const speakers = new Set(utterances.map(u => u.speaker));
   if (speakers.size < 2) return null;
-  const reply = await llm(buildSpeakerPrompt(utterances));
+  const reply = await llm(buildSpeakerPrompt(utterances), { schema: 'speaker' });
   let json;
   try { json = extractJson(reply); } catch { return null; }
   const letter = String(json.agent_speaker || '').trim().toUpperCase();
@@ -270,7 +270,7 @@ export async function identifyAgentSpeaker(utterances, llm) {
 // ------------------------------------------------------------------
 // Call analysis (summary + scores in one request)
 // ------------------------------------------------------------------
-const ANALYSIS_PROMPT = `You review phone calls for a mortgage company's quality team. Speakers are labelled by diarization ("Speaker A", "Speaker B"); one is the company's agent (loan officer or processor) and one is the customer. Personal information has been replaced with placeholders like [PHONE_NUMBER]; keep them as-is and never guess what they contain.
+const RUBRIC = `You review phone calls for a mortgage company's quality team. Speakers are labelled by diarization ("Speaker A", "Speaker B"); one is the company's agent (loan officer or processor) and one is the customer. Personal information has been replaced with placeholders like [PHONE_NUMBER]; keep them as-is and never guess what they contain.
 
 Score the AGENT's performance from -10 (worst) to +10 (best) in each category. 0 means average or mixed.
 - intro (Introduction): +10 = greets warmly, gives full name and company, NMLS ID if applicable, recording disclosure, asks the customer's name, states the purpose. -10 = no name, no company, no disclosure, rude or abrupt opening.
@@ -281,7 +281,9 @@ Score the AGENT's performance from -10 (worst) to +10 (best) in each category. 0
 - control (Call control & professionalism): +10 = leads the call with clear questions, polite and professional language, good hold etiquette, little dead air, no talking over the customer. -10 = rambling, unprofessional language, long dead air, constant interrupting. Use the measured stats below as evidence.
 
 For each category give a one-sentence reason and a short exact quote from the transcript with its timestamp.
+`;
 
+const ANALYSIS_PROMPT = `${RUBRIC}
 Also give:
 - agent_speaker: the letter of the agent's speaker label
 - summary: 3-6 short bullet points (purpose, key details, outcome, next steps)
@@ -300,7 +302,13 @@ Reply with only JSON in this exact shape:
 "topics":["..."],"keywords":["..."],"key_moments":[],"objections":[],"action_items":[],"sentiment_timeline":[],"coaching_tips":[]}
 `;
 
-export function buildAnalysisPrompt(utterances, agentSpeaker = null) {
+// Retry used when a reply had everything but the scores: ask for the scores alone.
+const SCORES_ONLY_PROMPT = `${RUBRIC}
+Reply with only JSON in this exact shape and nothing else (no summary or other fields):
+{"agent_speaker":"A","scores":{"intro":{"score":0,"reason":"...","quote":"...","at":"0:00"},"retention":{"score":0,"reason":"...","quote":"...","at":"0:00"},"info":{"score":0,"reason":"...","quote":"...","at":"0:00"},"sentiment":{"score":0,"reason":"...","quote":"...","at":"0:00"},"objection":{"present":false,"score":0,"reason":"...","quote":"...","at":"0:00"},"control":{"score":0,"reason":"...","quote":"...","at":"0:00"}}}
+`;
+
+export function buildAnalysisPrompt(utterances, agentSpeaker = null, base = ANALYSIS_PROMPT) {
   const stats = computeTranscriptStats(utterances);
   let transcript = utterances.map(u => `[${mmss(u.start)}] Speaker ${u.speaker}: ${u.text}`).join('\n');
   if (transcript.length > MAX_ANALYSIS_TRANSCRIPT_CHARS) {
@@ -317,7 +325,7 @@ export function buildAnalysisPrompt(utterances, agentSpeaker = null) {
   const roles = agentSpeaker
     ? `\nSpeaker ${agentSpeaker} is the agent and ${customers.map(sp => `Speaker ${sp}`).join(' and ')} is the customer. Score Speaker ${agentSpeaker} and set agent_speaker to "${agentSpeaker}".\n`
     : '';
-  return `${ANALYSIS_PROMPT}${roles}\nMeasured stats:\n${measured}\n\nTranscript:\n${transcript}`;
+  return `${base}${roles}\nMeasured stats:\n${measured}\n\nTranscript:\n${transcript}`;
 }
 
 const clampScore = value => {
@@ -331,11 +339,49 @@ const strList = (value, maxItems, maxLen = 300) => (Array.isArray(value) ? value
 // Validates and normalises the model's JSON. Scores are clamped to -10..10 and the
 // overall score is computed here as the plain average of the categories that apply.
 const lowerKeys = obj => (obj ? Object.fromEntries(Object.entries(obj).map(([k, v]) => [k.trim().toLowerCase(), v])) : null);
-// A scoring reply: has a "scores" object, or the categories at the top level.
-const looksLikeAnalysis = obj => {
-  const o = lowerKeys(obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null);
-  return Boolean(o && ((o.scores && typeof o.scores === 'object') || CATEGORIES.filter(k => k in o).length >= 3));
+// Names models use for each category, compared with case, spaces and punctuation removed.
+const CATEGORY_ALIASES = {
+  intro: ['intro', 'introduction', 'opening'],
+  retention: ['retention', 'clientretention', 'customerretention'],
+  info: ['info', 'information', 'informationgathered', 'infogathered'],
+  sentiment: ['sentiment', 'clientsentiment', 'averageclientsentiment', 'customersentiment'],
+  objection: ['objection', 'objectionhandling', 'objections'],
+  control: ['control', 'callcontrol', 'professionalism', 'callcontrolprofessionalism', 'callcontrolandprofessionalism']
 };
+const ALIAS_TO_CATEGORY = new Map(Object.entries(CATEGORY_ALIASES).flatMap(([key, names]) => names.map(n => [n, key])));
+const normKey = k => String(k).toLowerCase().replace(/[^a-z]/g, '');
+const isPlainObject = v => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+const isScoreValue = v => isPlainObject(v) || (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)));
+
+// The categories an object holds directly, as { intro: value, ... }, or null unless all five
+// non-objection categories are there (objection is optional).
+function categoriesIn(obj) {
+  if (!isPlainObject(obj)) return null;
+  const found = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const key = ALIAS_TO_CATEGORY.get(normKey(k));
+    if (key && !(key in found) && isScoreValue(v)) found[key] = v;
+  }
+  return CATEGORIES.every(k => k === 'objection' || k in found) ? found : null;
+}
+
+// Finds the scores in a reply: the "scores" object, then the top level, then any nested
+// object (e.g. "ratings", "category_scores"). Null if there are none.
+export function findScores(json, depth = 0) {
+  if (!isPlainObject(json) || depth > 3) return null;
+  const scoresKey = Object.keys(json).find(k => normKey(k) === 'scores');
+  const fromScores = scoresKey ? categoriesIn(json[scoresKey]) : null;
+  if (fromScores) return fromScores;
+  const top = categoriesIn(json);
+  if (top) return top;
+  for (const value of Object.values(json)) {
+    const nested = findScores(value, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+const looksLikeAnalysis = obj => findScores(obj) !== null;
 
 // detectedSpeaker (from identifyAgentSpeaker) wins over the scoring reply's agent_speaker.
 export function validateAnalysis(rawJson, utterances, detectedSpeaker = null) {
@@ -347,14 +393,15 @@ export function validateAnalysis(rawJson, utterances, detectedSpeaker = null) {
   else if (speakers.has(replied)) [agentSpeaker, agentSpeakerSource] = [replied, 'scoring'];
   else [agentSpeaker, agentSpeakerSource] = [utterances[0]?.speaker || null, 'first_speaker']; // the agent usually speaks first on a recorded line
 
-  // Some models drop the "scores" wrapper or capitalise keys; accept both.
-  const scoreSource = lowerKeys(json.scores && typeof json.scores === 'object' ? json.scores : CATEGORIES.some(k => k in json) ? json : null);
+  // Models name and nest the scores in different ways; findScores accepts the common ones.
+  const scoreSource = findScores(rawJson);
   if (!scoreSource) throw new Error('Analysis has no "scores" object');
   const scores = {};
   const categories = {};
   for (const key of CATEGORIES) {
-    const raw = scoreSource[key];
-    if (!raw || typeof raw !== 'object') throw new Error(`Analysis is missing the "${key}" score`);
+    // A plain number is a score with no reason; a missing objection means there was none.
+    const value = scoreSource[key];
+    const raw = isPlainObject(value) ? lowerKeys(value) : value === undefined ? { present: false, score: 0 } : { score: value };
     const present = key === 'objection' ? raw.present !== false : true;
     scores[key] = present ? clampScore(raw.score) : null;
     categories[key] = {
@@ -410,21 +457,34 @@ export async function analyzeCall(utterances, llm) {
     console.warn(`⚠️ [ANALYZE] Speaker check failed, using the scoring reply: ${err.message}`);
   }
   const prompt = buildAnalysisPrompt(utterances, detected);
-  const attempt = async () => {
-    const reply = await llm(prompt);
-    try {
-      return validateAnalysis(extractJson(reply, looksLikeAnalysis), utterances, detected);
-    } catch (err) {
-      // The start of the reply, so the next failure can be diagnosed from the log.
-      console.warn(`⚠️ [ANALYZE] Unusable scoring reply (${err.message}): ${JSON.stringify(String(reply).slice(0, 400))}`);
-      throw err;
-    }
+  // Enough of the reply to see what the model sent: start, end, length and the JSON's keys.
+  const logUnusable = (err, reply, json) => {
+    const text = String(reply);
+    const keys = isPlainObject(json) ? ` keys=[${Object.keys(json).join(', ')}]` : '';
+    console.warn(`⚠️ [ANALYZE] Unusable scoring reply (${err.message}) length=${text.length}${keys} start=${JSON.stringify(text.slice(0, 400))} end=${JSON.stringify(text.slice(-300))}`);
   };
-  let result;
-  try {
-    result = await attempt();
-  } catch {
-    result = await attempt();
+  const parse = reply => {
+    try { return extractJson(reply, looksLikeAnalysis); } catch (err) { logUnusable(err, reply, null); return null; }
+  };
+  const finish = result => ({ ...result, stats: computeTranscriptStats(utterances, result.agentSpeaker) });
+
+  const firstReply = await llm(prompt, { schema: 'analysis' });
+  const first = parse(firstReply);
+  if (first) {
+    try { return finish(validateAnalysis(first, utterances, detected)); } catch (err) { logUnusable(err, firstReply, first); }
   }
-  return { ...result, stats: computeTranscriptStats(utterances, result.agentSpeaker) };
+  // A reply with everything but the scores gets a short scores-only follow-up, merged with
+  // the first reply's summary and other fields; an unreadable one is simply asked again.
+  const secondReply = first
+    ? await llm(buildAnalysisPrompt(utterances, detected, SCORES_ONLY_PROMPT), { schema: 'scores' })
+    : await llm(prompt, { schema: 'analysis' });
+  const second = parse(secondReply);
+  if (!second) throw new Error('Reply contained no usable JSON');
+  const merged = first ? { ...first, agent_speaker: second.agent_speaker ?? first.agent_speaker, scores: second } : second;
+  try {
+    return finish(validateAnalysis(merged, utterances, detected));
+  } catch (err) {
+    logUnusable(err, secondReply, second);
+    throw err;
+  }
 }

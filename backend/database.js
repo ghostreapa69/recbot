@@ -378,6 +378,8 @@ export async function initializeDatabase() {
   `);
   // Set when the agent/customer speaker check has run for this scorecard (older ones are re-checked in the background).
   await pool.query(`ALTER TABLE call_analyses ADD COLUMN IF NOT EXISTS speaker_checked_at TIMESTAMP;`);
+  // Failed Claude scoring attempts; status 'retry' until the limit, then 'error'.
+  await pool.query(`ALTER TABLE call_analyses ADD COLUMN IF NOT EXISTS attempts SMALLINT NOT NULL DEFAULT 0;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_analyses_overall ON call_analyses(overall_score);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_call_analyses_created ON call_analyses(created_at);`);
 
@@ -2418,12 +2420,14 @@ export async function markRedactionFailed(filePath, error, maxAttempts) {
   return rows[0]?.attempts ?? 0;
 }
 
-// Completed transcripts (Scriberr or older AssemblyAI ones) that have not been scored yet.
+// Completed transcripts (Scriberr or older AssemblyAI ones) that have not been scored yet,
+// plus failed Claude attempts waiting to be retried (10 minutes after the last try).
 export async function getTranscriptionsNeedingAnalysis(limit) {
   const { rows } = await pool.query(`
     SELECT t.file_path, t.scriberr_id, t.utterances FROM transcriptions t
     LEFT JOIN call_analyses ca ON ca.file_path = t.file_path
-    WHERE t.status = 'completed' AND ca.file_path IS NULL
+    WHERE t.status = 'completed'
+      AND (ca.file_path IS NULL OR (ca.status = 'retry' AND ca.updated_at < NOW() - INTERVAL '10 minutes'))
       AND t.utterances IS NOT NULL AND jsonb_array_length(t.utterances) > 0
     ORDER BY t.updated_at DESC
     LIMIT $1
@@ -2467,6 +2471,20 @@ export async function saveCallAnalysis(filePath, result, model) {
   }
 }
 
+// Records a failed attempt that will be retried; after maxAttempts it becomes a permanent error.
+export async function saveCallAnalysisRetry(filePath, error, model, maxAttempts) {
+  const { rows } = await pool.query(`
+    INSERT INTO call_analyses (file_path, status, model, error, attempts)
+    VALUES ($1, CASE WHEN 1 >= $4 THEN 'error' ELSE 'retry' END, $2, $3, 1)
+    ON CONFLICT (file_path) DO UPDATE SET
+      attempts = call_analyses.attempts + 1,
+      status = CASE WHEN call_analyses.attempts + 1 >= $4 THEN 'error' ELSE 'retry' END,
+      model = EXCLUDED.model, error = EXCLUDED.error, updated_at = NOW()
+    RETURNING attempts, status
+  `, [filePath, model, error, maxAttempts]);
+  return rows[0];
+}
+
 // Failed analyses are not retried automatically; an admin re-score deletes the row.
 export async function saveCallAnalysisError(filePath, error, model) {
   await pool.query(`
@@ -2490,6 +2508,12 @@ export async function getAnalysesNeedingSpeakerCheck(limit) {
 
 export async function markSpeakerChecked(filePath) {
   await pool.query('UPDATE call_analyses SET speaker_checked_at = NOW() WHERE file_path = $1', [filePath]);
+}
+
+// Deletes scorecards that failed with exactly this error, so the worker scores those calls again.
+export async function requeueFailedAnalyses(error) {
+  const { rowCount } = await pool.query(`DELETE FROM call_analyses WHERE status = 'error' AND error = $1`, [error]);
+  return rowCount;
 }
 
 export async function deleteCallAnalysis(filePath) {
