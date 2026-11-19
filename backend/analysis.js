@@ -20,32 +20,29 @@ function parseTimestamp(value) {
   return ((Number(m[1] || 0) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000;
 }
 
-// The first complete {...} object in the text, found by matching braces outside strings,
-// so anything the model writes after the JSON is ignored. Unbalanced: the rest of the text.
-function firstJsonObject(text) {
-  const start = text.indexOf('{');
-  if (start === -1) return null;
+// Every complete top-level {...} object in the text, in order, found by matching braces
+// outside strings. An unbalanced object at the end is included as-is (JSON.parse reports it).
+function jsonObjects(text) {
+  const found = [];
+  let start = -1;
   let depth = 0;
   let inString = false;
   let escaped = false;
-  for (let i = start; i < text.length; i++) {
+  for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (inString) {
       if (escaped) escaped = false;
       else if (c === '\\') escaped = true;
       else if (c === '"') inString = false;
-    } else if (c === '"') inString = true;
-    else if (c === '{') depth++;
-    else if (c === '}' && --depth === 0) return text.slice(start, i + 1);
+    } else if (c === '"') { if (depth > 0) inString = true; }
+    else if (c === '{') { if (depth++ === 0) start = i; }
+    else if (c === '}' && depth > 0 && --depth === 0) found.push(text.slice(start, i + 1));
   }
-  return text.slice(start);
+  if (depth > 0) found.push(text.slice(start));
+  return found;
 }
 
-// Pulls the first JSON object out of a model reply (which may wrap it in prose or ``` fences,
-// or add text after it). Trailing commas are forgiven; anything else still throws.
-export function extractJson(text) {
-  const candidate = firstJsonObject(String(text).replace(/```(?:json)?/gi, ''));
-  if (!candidate) throw new Error('Reply contained no JSON object');
+function parseLoose(candidate) {
   try {
     return JSON.parse(candidate);
   } catch (err) {
@@ -55,6 +52,27 @@ export function extractJson(text) {
       throw err;
     }
   }
+}
+
+// Pulls a JSON object out of a model reply, which may wrap it in prose or ``` fences, add text
+// after it, or write other small objects first. Returns the first object `isWanted` accepts,
+// else the first one that parses. Trailing commas are forgiven; anything else still throws.
+export function extractJson(text, isWanted = () => true) {
+  const candidates = jsonObjects(String(text).replace(/```(?:json)?/gi, ''));
+  if (!candidates.length) throw new Error('Reply contained no JSON object');
+  let firstParsed;
+  let firstError;
+  for (const candidate of candidates) {
+    try {
+      const obj = parseLoose(candidate);
+      if (isWanted(obj)) return obj;
+      if (firstParsed === undefined) firstParsed = obj;
+    } catch (err) {
+      if (!firstError) firstError = err;
+    }
+  }
+  if (firstParsed !== undefined) return firstParsed;
+  throw firstError;
 }
 
 // ------------------------------------------------------------------
@@ -312,8 +330,16 @@ const strList = (value, maxItems, maxLen = 300) => (Array.isArray(value) ? value
 
 // Validates and normalises the model's JSON. Scores are clamped to -10..10 and the
 // overall score is computed here as the plain average of the categories that apply.
+const lowerKeys = obj => (obj ? Object.fromEntries(Object.entries(obj).map(([k, v]) => [k.trim().toLowerCase(), v])) : null);
+// A scoring reply: has a "scores" object, or the categories at the top level.
+const looksLikeAnalysis = obj => {
+  const o = lowerKeys(obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null);
+  return Boolean(o && ((o.scores && typeof o.scores === 'object') || CATEGORIES.filter(k => k in o).length >= 3));
+};
+
 // detectedSpeaker (from identifyAgentSpeaker) wins over the scoring reply's agent_speaker.
-export function validateAnalysis(json, utterances, detectedSpeaker = null) {
+export function validateAnalysis(rawJson, utterances, detectedSpeaker = null) {
+  const json = lowerKeys(rawJson) || {};
   const speakers = new Set(utterances.map(u => u.speaker));
   const replied = String(json.agent_speaker || '').trim().toUpperCase();
   let agentSpeaker, agentSpeakerSource;
@@ -321,11 +347,13 @@ export function validateAnalysis(json, utterances, detectedSpeaker = null) {
   else if (speakers.has(replied)) [agentSpeaker, agentSpeakerSource] = [replied, 'scoring'];
   else [agentSpeaker, agentSpeakerSource] = [utterances[0]?.speaker || null, 'first_speaker']; // the agent usually speaks first on a recorded line
 
-  if (!json.scores || typeof json.scores !== 'object') throw new Error('Analysis has no "scores" object');
+  // Some models drop the "scores" wrapper or capitalise keys; accept both.
+  const scoreSource = lowerKeys(json.scores && typeof json.scores === 'object' ? json.scores : CATEGORIES.some(k => k in json) ? json : null);
+  if (!scoreSource) throw new Error('Analysis has no "scores" object');
   const scores = {};
   const categories = {};
   for (const key of CATEGORIES) {
-    const raw = json.scores[key];
+    const raw = scoreSource[key];
     if (!raw || typeof raw !== 'object') throw new Error(`Analysis is missing the "${key}" score`);
     const present = key === 'objection' ? raw.present !== false : true;
     scores[key] = present ? clampScore(raw.score) : null;
@@ -382,11 +410,21 @@ export async function analyzeCall(utterances, llm) {
     console.warn(`⚠️ [ANALYZE] Speaker check failed, using the scoring reply: ${err.message}`);
   }
   const prompt = buildAnalysisPrompt(utterances, detected);
+  const attempt = async () => {
+    const reply = await llm(prompt);
+    try {
+      return validateAnalysis(extractJson(reply, looksLikeAnalysis), utterances, detected);
+    } catch (err) {
+      // The start of the reply, so the next failure can be diagnosed from the log.
+      console.warn(`⚠️ [ANALYZE] Unusable scoring reply (${err.message}): ${JSON.stringify(String(reply).slice(0, 400))}`);
+      throw err;
+    }
+  };
   let result;
   try {
-    result = validateAnalysis(extractJson(await llm(prompt)), utterances, detected);
-  } catch (err) {
-    result = validateAnalysis(extractJson(await llm(prompt)), utterances, detected);
+    result = await attempt();
+  } catch {
+    result = await attempt();
   }
   return { ...result, stats: computeTranscriptStats(utterances, result.agentSpeaker) };
 }

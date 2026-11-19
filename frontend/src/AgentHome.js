@@ -14,8 +14,8 @@ import { ScoreTrendChart, CountBar } from './charts';
 import { softBg } from './theme';
 import AgentPicker from './AgentPicker';
 
-export const RANGES = { week: 'last week', month: 'the 5 weeks before', year: 'the year before' };
-export const BUCKET_LABEL = { day: 'ddd', week: 'MMM D', month: 'MMM' };
+export const RANGES = { today: 'yesterday', week: 'last week', month: 'the 5 weeks before' };
+export const BUCKET_LABEL = { hour: 'h A', day: 'ddd', week: 'MMM D', month: 'MMM' };
 
 export function Delta({ value, unit = '', goodWhenUp = true, digits = 0, onBrand = false }) {
   if (value === null || value === undefined || Number.isNaN(value)) return null;
@@ -147,9 +147,9 @@ export default function AgentHome({ initialEmail = null, onBackToTeam = null, no
             {onBackToTeam && <Button variant="outlined" onClick={onBackToTeam}>‹ Back to team</Button>}
             <AgentPicker value={email} onChange={setEmail} teamOption={onBackToTeam ? { label: 'My team', onPick: onBackToTeam } : null} />
             <ToggleButtonGroup size="small" exclusive value={range} onChange={(_e, v) => v && setRange(v)} aria-label="Range">
+              <ToggleButton value="today">Today</ToggleButton>
               <ToggleButton value="week">Week</ToggleButton>
               <ToggleButton value="month">Month</ToggleButton>
-              <ToggleButton value="year">Year</ToggleButton>
             </ToggleButtonGroup>
           </>
         )}

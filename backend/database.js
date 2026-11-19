@@ -2587,9 +2587,13 @@ const scoredCallsSql = (direction) => `
 export async function getAgentDashboard(emails, { start, end, prevStart, prevEnd, bucket }) {
   const { current, previous } = await periodKpis(emails, start, end, prevStart, prevEnd);
   const trunc = { day: 'day', week: 'week', month: 'month' }[bucket] || 'day';
+  // Hourly buckets (Today) come from call_time, stored as HH:MM:SS.
+  const bucketSql = bucket === 'hour'
+    ? `to_char(f.call_date::date, 'YYYY-MM-DD') || ' ' || CASE WHEN f.call_time ~ '^[0-9]{2}:' THEN left(f.call_time, 2) ELSE '00' END || ':00'`
+    : `to_char(date_trunc('${trunc}', f.call_date::date), 'YYYY-MM-DD')`;
   const [trend, dispositions, recent, worst, best] = await Promise.all([
     pool.query(`
-      SELECT to_char(date_trunc('${trunc}', f.call_date::date), 'YYYY-MM-DD') AS bucket,
+      SELECT ${bucketSql} AS bucket,
         AVG(ca.overall_score)::float AS avg_score, COUNT(*)::int AS calls
       FROM ${CALLS_FROM}
       WHERE ${AGENT_SQL} = ANY($1::text[]) AND f.call_date >= $2 AND f.call_date <= $3

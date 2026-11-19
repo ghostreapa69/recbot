@@ -146,9 +146,9 @@ function TeamDashboard({ onSelectAgent }) {
             )}
             <AgentPicker value={null} onChange={onSelectAgent} label="Open an agent" placeholder="Agent or me" width={220} />
             <ToggleButtonGroup size="small" exclusive value={range} onChange={(_e, v) => v && setRange(v)} aria-label="Range">
+              <ToggleButton value="today">Today</ToggleButton>
               <ToggleButton value="week">Week</ToggleButton>
               <ToggleButton value="month">Month</ToggleButton>
-              <ToggleButton value="year">Year</ToggleButton>
             </ToggleButtonGroup>
           </>
         )}

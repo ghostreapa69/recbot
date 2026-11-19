@@ -27,6 +27,7 @@ import { createRecordingScan } from './recordingScan.js';
 import { startTranscriptionWorker, MIN_DURATION_MS, SKIP_DISPOSITIONS } from './transcription.js';
 import { fetchLastHourCallLog, fetchCallLog, five9Configured, five9AdminCall, scheduleRecurringIngestion } from './five9.js';
 import { syncFive9Teams } from './five9Teams.js';
+import { scheduleTeamSync } from './teamSyncSchedule.js';
 import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
 import { monitorEventLoopDelay } from 'perf_hooks';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
@@ -1693,12 +1694,16 @@ app.post('/api/recordings/analysis/rescore', requireAuth, ensureSession, require
 const APP_TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
 
 // Current and previous period for a Week/Month/Year toggle, as YYYY-MM-DD strings.
-// Week: last 7 days by day; Month: last 5 weeks by week; Year: last 12 months by month.
+// Today: today by hour (compared with yesterday); Week: last 7 days by day;
+// Month: last 5 weeks by week; Year: last 12 months by month.
 function periodFor(range) {
   const today = dayjs().tz(APP_TIMEZONE).startOf('day');
   let start;
   let bucket;
-  if (range === 'year') {
+  if (range === 'today') {
+    start = today;
+    bucket = 'hour';
+  } else if (range === 'year') {
     start = today.startOf('month').subtract(11, 'month');
     bucket = 'month';
   } else if (range === 'month') {
@@ -1712,7 +1717,7 @@ function periodFor(range) {
   const prevEnd = start.subtract(1, 'day');
   const prevStart = prevEnd.subtract(days - 1, 'day');
   const fmt = d => d.format('YYYY-MM-DD');
-  return { start: fmt(start), end: fmt(today), prevStart: fmt(prevStart), prevEnd: fmt(prevEnd), bucket, range: ['week', 'month', 'year'].includes(range) ? range : 'week' };
+  return { start: fmt(start), end: fmt(today), prevStart: fmt(prevStart), prevEnd: fmt(prevEnd), bucket, range: ['today', 'week', 'month', 'year'].includes(range) ? range : 'week' };
 }
 
 const agentDirectory = createAgentDirectory({ query: (text, params) => pool.query(text, params) });
@@ -1746,7 +1751,6 @@ async function teamFor(user, group = null) {
   return team;
 }
 
-const TEAM_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const TEAM_SYNC_LOCK = 727003;
 let lastTeamSync = null;
 
@@ -2660,11 +2664,9 @@ initializeDatabase().then(() => {
     // One-time: index and fill agent columns on existing recordings (no-op once done).
     runFileAgentBackfill().catch(err => console.error('❌ [AGENT BACKFILL] Failed:', err.message));
 
-    // Five9 agent groups → manager teams: shortly after start, then every 6 hours.
+    // Five9 agent groups → manager teams: daily at 9 PM, or every 6 hours with FIVE9_TEAM_SYNC_SCHEDULE=6h.
     if (five9Configured) {
-      const syncTeams = () => runTeamSync('scheduled').catch(() => {});
-      setTimeout(syncTeams, 60 * 1000);
-      setInterval(syncTeams, TEAM_SYNC_INTERVAL_MS);
+      scheduleTeamSync({ schedule: process.env.FIVE9_TEAM_SYNC_SCHEDULE, run: () => runTeamSync('scheduled').catch(() => {}), tz: APP_TIMEZONE });
     }
 
     // Load the agent list now so the first dropdown doesn't wait for it.
