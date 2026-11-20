@@ -134,7 +134,7 @@ export default function AgentHome({ initialEmail = null, onEmailChange = null, o
   const copyShareLink = async () => {
     try {
       const { url } = await postJson(getToken, '/api/agents/share-link', { email });
-      setShareMessage(await copyText(url) ? 'Link copied — it previews with stats in Slack for 30 days' : `Copy this link: ${url}`);
+      setShareMessage(await copyText(url) ? 'Link copied' : `Copy this link: ${url}`);
     } catch (err) {
       setShareMessage(`Could not create a link: ${err.message}`);
     }
