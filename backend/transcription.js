@@ -95,7 +95,7 @@ async function findExistingJob(filePath) {
 async function submitNew(s3, bucket) {
   const inFlight = await countJobsInScriberr();
   const room = MAX_QUEUED - inFlight;
-  if (room <= 0) return { submitted: 0, failed: 0, inFlight };
+  if (room <= 0) return { submitted: 0, failed: 0, inFlight, eligible: null };
   const cutoff = dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
   const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_MS, room, SKIP_DISPOSITIONS.map(d => d.toLowerCase()));
   let submitted = 0;
@@ -128,11 +128,11 @@ async function submitNew(s3, bucket) {
       if (wavPath) fs.promises.unlink(wavPath).catch(() => {});
     }
   }
-  return { submitted, failed: filePaths.length - submitted, inFlight };
+  return { submitted, failed: filePaths.length - submitted, inFlight, eligible: filePaths.length };
 }
 
-// Checks every job still in Scriberr. Finished ones become 'transcribed' (waiting for
-// redaction); missing or restart-interrupted ones are recovered as before.
+// Checks every job still in Scriberr (run by the feeder). Finished ones become 'transcribed'
+// (waiting for redaction); missing or restart-interrupted ones are recovered as before.
 async function checkJobs() {
   let checked = 0;
   let finished = 0;
@@ -285,7 +285,7 @@ async function withLock(key, fn) {
   }
 }
 
-// Processor pass: check Scriberr jobs, redact finished transcripts, score, re-check speakers.
+// Processor pass: redact finished transcripts, score, re-check speakers.
 // Returns true when it did any work, so the next pass can start straight away.
 export async function runProcessorPass() {
   const result = await withLock(PROCESS_LOCK_KEY, async () => {
@@ -294,23 +294,32 @@ export async function runProcessorPass() {
       requeueDone = true;
       if (requeued) console.log(`🔁 [ANALYZE] Re-queued ${requeued} call(s) that failed with "no scores"`);
     }
-    const { checked, finished } = await checkJobs();
     const redacted = await redactFinished();
     const analyzed = await analyzeMissing();
     const rescored = await recheckSpeakers();
-    const worked = finished + redacted + analyzed + rescored > 0;
-    if (worked) console.log(`📝 [TRANSCRIBE] checked ${checked} jobs (${finished} finished), redacted ${redacted}, analyzed ${analyzed}, speakerRescores ${rescored}`);
+    const worked = redacted + analyzed + rescored > 0;
+    if (worked) console.log(`📝 [TRANSCRIBE] redacted ${redacted}, analyzed ${analyzed}, speakerRescores ${rescored}`);
     return worked;
   });
   return Boolean(result);
 }
 
-// Feeder pass: keep Scriberr supplied with recordings, independent of redaction and scoring.
+// Feeder pass: mark the jobs Scriberr finished (quick status requests, no LLM), then top it
+// back up to MAX_QUEUED, so finished jobs never hold up new work while analysis is busy.
+let lastIdleLog = 0;
 export async function runFeederPass({ s3, bucket }) {
   return withLock(FEED_LOCK_KEY, async () => {
-    const { submitted, failed, inFlight } = await submitNew(s3, bucket);
-    if (submitted || failed) console.log(`📤 [TRANSCRIBE] submitted ${submitted}${failed ? `, ${failed} failed` : ''} (Scriberr had ${inFlight} jobs in flight, max ${MAX_QUEUED})`);
-    return { submitted, failed, inFlight };
+    const { checked, finished } = await checkJobs();
+    const { submitted, failed, inFlight, eligible } = await submitNew(s3, bucket);
+    if (submitted || failed || finished) {
+      console.log(`📤 [TRANSCRIBE] ${finished} of ${checked} jobs finished; submitted ${submitted}${failed ? `, ${failed} failed` : ''} (Scriberr had ${inFlight} in flight, max ${MAX_QUEUED})`);
+    }
+    // Room in Scriberr but nothing eligible to send: say so now and then, so idle time is explained.
+    if (eligible === 0 && Date.now() - lastIdleLog > 10 * 60 * 1000) {
+      lastIdleLog = Date.now();
+      console.log(`📭 [TRANSCRIBE] Scriberr has ${inFlight} jobs; no more recordings waiting (last ${LOOKBACK_DAYS} days, over ${MIN_DURATION_SECONDS}s, not a skipped disposition)`);
+    }
+    return { checked, finished, submitted, failed, inFlight };
   });
 }
 
