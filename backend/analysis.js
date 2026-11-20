@@ -273,7 +273,7 @@ export async function identifyAgentSpeaker(utterances, llm) {
 const RUBRIC = `You review phone calls for a mortgage company's quality team. Speakers are labelled by diarization ("Speaker A", "Speaker B"); one is the company's agent (loan officer or processor) and one is the customer. Personal information has been replaced with placeholders like [PHONE_NUMBER]; keep them as-is and never guess what they contain.
 
 Score the AGENT's performance from -10 (worst) to +10 (best) in each category. 0 means average or mixed.
-- intro (Introduction): +10 = greets warmly, gives full name and company, NMLS ID if applicable, recording disclosure, asks the customer's name, states the purpose. -10 = no name, no company, no disclosure, rude or abrupt opening.
+- intro (Introduction): +10 = greets warmly, gives full name and company, asks the customer's name, states the purpose. -10 = no name, no company, rude or abrupt opening. Do not expect or score an NMLS ID or a recording disclosure.
 - retention (Client retention): +10 = keeps the customer engaged, builds trust, sets a concrete next step (appointment, application, documents). -10 = customer leaves unhappy or goes elsewhere and the agent makes no attempt to keep them.
 - info (Information gathered): +10 = collects the details needed (purpose, occupancy, balance, rate, income, credit, timeline, contact preference) before advising. -10 = asks nothing useful or gives advice blind.
 - sentiment (Average client sentiment): the customer's mood across the whole call. +10 = consistently positive, grateful. -10 = angry or distressed throughout.
