@@ -30,21 +30,41 @@ export function createShareLinks({ query, envSecret = process.env.SHARE_LINK_SEC
     }
     return secretPromise;
   };
-  const sign = async (agent, exp) => crypto.createHmac('sha256', await getSecret()).update(`${agent}|${exp}`).digest('base64url');
+  const hmac = async payload => crypto.createHmac('sha256', await getSecret()).update(payload).digest('base64url');
+  // Agent links sign "agent|exp", call links "call|path|exp". Agent emails may not contain "|",
+  // so a signature made for one kind of link can never verify as the other.
+  const sign = (agent, exp) => hmac(`${agent}|${exp}`);
+  const signCall = (path, exp) => hmac(`call|${path}|${exp}`);
+  const expiry = () => Math.floor(now() / 1000) + SHARE_LINK_DAYS * 24 * 3600;
+  const checkSig = async (expected, sig) => {
+    const a = Buffer.from(await expected);
+    const b = Buffer.from(sig);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+  const live = exp => typeof exp === 'string' && /^\d+$/.test(exp) && Number(exp) * 1000 >= now();
 
   return {
     // A link to the agent's Home page that previews with stats until it expires.
     async makeLink(baseUrl, agent) {
-      const exp = Math.floor(now() / 1000) + SHARE_LINK_DAYS * 24 * 3600;
+      if (agent.includes('|')) throw new Error('Invalid agent');
+      const exp = expiry();
       const params = new URLSearchParams({ agent, exp: String(exp), sig: await sign(agent, exp) });
       return { url: `${baseUrl}/?${params}`, expiresAt: new Date(exp * 1000).toISOString() };
     },
     async verify(agent, exp, sig) {
-      if (typeof agent !== 'string' || typeof exp !== 'string' || typeof sig !== 'string') return false;
-      if (!/^\d+$/.test(exp) || Number(exp) * 1000 < now()) return false;
-      const expected = Buffer.from(await sign(agent, exp));
-      const given = Buffer.from(sig);
-      return expected.length === given.length && crypto.timingSafeEqual(expected, given);
+      if (typeof agent !== 'string' || agent.includes('|') || typeof sig !== 'string' || !live(exp)) return false;
+      return checkSig(sign(agent, exp), sig);
+    },
+    // A link to a call page that previews with the call's stats until it expires. It only
+    // unlocks the preview text: the recording itself always needs a signed-in session.
+    async makeCallLink(baseUrl, path) {
+      const exp = expiry();
+      const params = new URLSearchParams({ path, exp: String(exp), sig: await signCall(path, exp) });
+      return { url: `${baseUrl}/recordings/view?${params}`, expiresAt: new Date(exp * 1000).toISOString() };
+    },
+    async verifyCall(path, exp, sig) {
+      if (typeof path !== 'string' || !path || typeof sig !== 'string' || !live(exp)) return false;
+      return checkSig(signCall(path, exp), sig);
     }
   };
 }
@@ -72,6 +92,50 @@ export function describeAgentWeek(name, { current = {}, previous = {} }) {
     fields: [
       ['Avg score (7 days)', avg === null || avg === undefined ? 'Not scored yet' : `${fmtScore(avg)}${change !== null ? ` ${fmtChange(change)}` : ''}`],
       ['Calls', `${calls} (${scored} scored)`]
+    ]
+  };
+}
+
+const formatDuration = ms => {
+  const total = Math.max(0, Math.round((ms || 0) / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+};
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const formatWhen = (date, time) => {
+  const d = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(date || ''));
+  const t = /^(\d{1,2}):(\d{2})/.exec(String(time || ''));
+  const day = d ? `${MONTHS[Number(d[2]) - 1]} ${Number(d[3])}` : '';
+  const clock = t ? `${Number(t[1]) % 12 || 12}:${t[2]} ${Number(t[1]) < 12 ? 'AM' : 'PM'}` : '';
+  return [day, clock].filter(Boolean).join(', ');
+};
+
+// The preview text for one call. Deliberately limited to the agent, when, how long, the
+// disposition, scores and the short reason/outcome: no customer name, phone, transcript or audio.
+export function describeCall({ agentName, file, disposition, analysis, notScoredReason }) {
+  const when = formatWhen(file.call_date, file.call_time);
+  const duration = formatDuration(file.duration_ms);
+  const scored = analysis && analysis.status === 'completed' && analysis.overall_score !== null && analysis.overall_score !== undefined;
+  const details = analysis?.analysis || {};
+  const head = [scored ? `Score ${fmtScore(analysis.overall_score)}` : (notScoredReason || 'Not scored yet'), duration, disposition].filter(Boolean).join(' · ');
+  const parts = [`${head}.`];
+  if (scored && details.callReason) parts.push(`Reason: ${details.callReason}.`);
+  if (scored && details.outcome) parts.push(`Outcome: ${details.outcome}.`);
+  if (scored) {
+    const cats = Object.keys(CATEGORY_LABELS)
+      .map(k => [k, analysis[`${k}_score`]])
+      .filter(([, v]) => v !== null && v !== undefined)
+      .sort((a, b) => b[1] - a[1]);
+    if (cats.length >= 2) parts.push(`Strongest: ${CATEGORY_LABELS[cats[0][0]]} ${fmtScore(cats[0][1])}. Needs work: ${CATEGORY_LABELS[cats[cats.length - 1][0]]} ${fmtScore(cats[cats.length - 1][1])}.`);
+  }
+  return {
+    title: ['Call', agentName, when].filter(Boolean).join(' · '),
+    description: parts.join(' '),
+    fields: [
+      ['Call score', scored ? fmtScore(analysis.overall_score) : (notScoredReason || 'Not scored yet')],
+      ['Duration', duration]
     ]
   };
 }

@@ -368,6 +368,15 @@ export default function RecordingDetail() {
   const path = params.get('path');
   const tab = TABS.includes(params.get('tab')) ? params.get('tab') : 'overview';
   const focusMs = params.get('t') !== null && !Number.isNaN(Number(params.get('t'))) ? Number(params.get('t')) : null;
+  // A signed share link carries exp/sig for link previews only; keep them out of the address bar.
+  useEffect(() => {
+    const current = new URLSearchParams(location.search);
+    if (current.has('exp') || current.has('sig')) {
+      current.delete('exp');
+      current.delete('sig');
+      navigate(`${location.pathname}?${current}`, { replace: true });
+    }
+  }, [location.pathname, location.search, navigate]);
   const role = user?.publicMetadata?.role;
   const isModerator = role === 'admin' || role === 'manager';
   const { data, error, loading, reload } = useApi(path ? `/api/recordings/detail?path=${encodeURIComponent(path)}` : null);
@@ -408,8 +417,13 @@ export default function RecordingDetail() {
     ...(details.objections || []).map(o => ({ atMs: o.atMs, label: `Objection: ${o.text}`, color: theme.palette.warning.main }))
   ];
 
+  // A signed link that previews with this call's stats in Slack (never the audio); if it
+  // can't be created, the plain page link is copied instead.
   const copyLink = async () => {
-    const url = `${window.location.origin}${recordingUrl(path)}`;
+    let url = `${window.location.origin}${recordingUrl(path)}`;
+    try {
+      ({ url } = await postJson(getToken, '/api/recordings/share-link', { path }));
+    } catch (e) { /* fall back to the plain link */ }
     try {
       if (await copyText(url)) {
         setLinkCopied(true);

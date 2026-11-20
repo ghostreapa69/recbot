@@ -2203,7 +2203,7 @@ export async function getLegacyReportTimestampStats(limit = 10) {
 // both count. Returns null when the recording isn't indexed.
 export async function getRecordingContext(filePath) {
   const { rows } = await pool.query(`
-    SELECT f.file_path, f.phone, f.email, f.call_date, f.call_time, f.call_id, f.duration_ms, r.agent
+    SELECT f.file_path, f.phone, f.email, f.call_date, f.call_time, f.call_id, f.duration_ms, f.call_disposition, r.agent
     FROM files f
     LEFT JOIN reporting r ON r.call_id = f.call_id
     WHERE f.file_path = $1

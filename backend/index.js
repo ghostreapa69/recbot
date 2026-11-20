@@ -30,7 +30,7 @@ import { syncFive9Teams } from './five9Teams.js';
 import { scheduleTeamSync } from './teamSyncSchedule.js';
 import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
 import { trackRequests, trackJob, startBlockMonitor } from './activity.js';
-import { createShareLinks, describeAgentWeek, injectPreview, GENERIC_PREVIEW } from './shareLinks.js';
+import { createShareLinks, describeAgentWeek, describeCall, injectPreview, GENERIC_PREVIEW } from './shareLinks.js';
 import { createEntraPhotos } from './entraPhotos.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
@@ -1852,6 +1852,23 @@ const readEmail = value => (typeof value === 'string' && value.includes('@') && 
 const shareLinks = createShareLinks({ query: (text, params) => pool.query(text, params) });
 const entraPhotos = createEntraPhotos();
 
+// A signed link to a call page; pasted in Slack it previews with the call's stats. It only
+// unlocks that preview text: the audio routes still require a signed-in session.
+app.post('/api/recordings/share-link', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.body?.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+    const link = await shareLinks.makeCallLink(`${req.protocol}://${req.get('host')}`, recordingPath);
+    await auditRecordingAction(req, 'SHARE_RECORDING_LINK', recordingPath, context.file, { expiresAt: link.expiresAt });
+    res.json(link);
+  } catch (err) {
+    console.error('Error in /api/recordings/share-link:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // The agent's Entra photo for a share-link preview. Chat apps fetch it without logging in,
 // so it needs the same valid signature as the link itself.
 app.get('/share/agent-photo', async (req, res) => {
@@ -1868,7 +1885,7 @@ app.get('/share/agent-photo', async (req, res) => {
 app.post('/api/agents/share-link', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
   try {
     const email = readEmail(req.body?.email);
-    if (!email) return res.status(400).json({ error: 'email is required' });
+    if (!email || email.includes('|')) return res.status(400).json({ error: 'email is required' });
     const link = await shareLinks.makeLink(`${req.protocol}://${req.get('host')}`, email);
     logAuditEvent(req.user.id, req.user.email, 'SHARE_AGENT_LINK', null, null, req.user.ipAddress, req.user.userAgent,
       req.currentSessionId || null, { agent: email, expiresAt: link.expiresAt }).catch(err => console.error('⚠️ [AUDIT] share link:', err.message));
@@ -2689,6 +2706,45 @@ app.get('/', async (req, res, next) => {
     }
     res.setHeader('Cache-Control', 'no-cache');
     res.type('html').send(injectPreview(indexHtmlCache, preview, `${req.protocol}://${req.get('host')}${req.originalUrl}`));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Call links (/recordings/view?path=...) get link-preview tags the same way: stats only for a
+// valid signed share link. Never any audio: no og:audio/og:video and no audio URL, and the
+// page still requires login before it fetches or plays the recording.
+app.get('/recordings/view', async (req, res, next) => {
+  try {
+    indexHtmlCache ??= await fs.promises.readFile(path.join(BUILD_DIR, 'index.html'), 'utf8');
+    let preview = GENERIC_PREVIEW;
+    const recordingPath = readRecordingPath(req.query.path);
+    if (recordingPath && await shareLinks.verifyCall(recordingPath, req.query.exp, req.query.sig)) {
+      try {
+        const context = await getRecordingContext(recordingPath);
+        if (context) {
+          const [report, analysis] = await Promise.all([getRecordingReport(context.file.call_id), getCallAnalysis(recordingPath)]);
+          const agentEmail = (report?.agent || context.file.email || '').toLowerCase();
+          const disposition = report?.disposition || context.file.call_disposition || '';
+          // Same "why not scored" rules as the app's ScoreChip.
+          const skipped = SKIP_DISPOSITIONS.find(d => d.toLowerCase() === disposition.trim().toLowerCase());
+          const notScoredReason = skipped ? `Not Scored: ${disposition.trim()}`
+            : (context.file.duration_ms > 0 && context.file.duration_ms <= MIN_DURATION_MS) ? 'Not Scored: Call not long enough'
+            : null;
+          preview = describeCall({
+            agentName: agentDirectory.agentName(agentEmail) || report?.agent_name || agentEmail,
+            file: context.file, disposition, analysis, notScoredReason
+          });
+          const photo = agentDirectory.agentAvatar(agentEmail);
+          if (photo) preview = { ...preview, image: photo };
+        }
+      } catch (err) {
+        console.error('⚠️ [SHARE] Call preview failed:', err.message);
+      }
+    }
+    res.setHeader('Cache-Control', 'no-cache');
+    // No og:url here: a recording path holds the customer's phone number, so it isn't repeated.
+    res.type('html').send(injectPreview(indexHtmlCache, preview));
   } catch (err) {
     next(err);
   }
