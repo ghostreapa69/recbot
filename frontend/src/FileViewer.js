@@ -201,6 +201,8 @@ function FileViewer({ darkMode }) {
   const [lowScoreOnly, setLowScoreOnly] = useState(false);
   // "My team": the manager's Five9 team (the server works out who that is).
   const [myTeam, setMyTeam] = useState(false);
+  // One agent's calls ({ email, name }), from an agent page's "View all" (?agent=...).
+  const [agentFilter, setAgentFilter] = useState(null);
   const { team } = useMyTeam();
   const [moreFilters, setMoreFilters] = useState(false);
   // Bumped after a filter chip is removed, so the refetch sees the updated state.
@@ -208,7 +210,7 @@ function FileViewer({ darkMode }) {
   // fetchFiles reads the view from this ref, so every call site — including
   // debounced timers holding stale closures — uses the current one. Change the
   // view only through updateView().
-  const viewRef = React.useRef({ view: 'all', onlyMine: false, lowScoreOnly: false, myTeam: false });
+  const viewRef = React.useRef({ view: 'all', onlyMine: false, lowScoreOnly: false, myTeam: false, agent: null });
   // Recording shown by a ?recording= link. It is a one-off lookup: any other fetch clears it.
   const [focusedPath, setFocusedPath] = useState(null);
   const fetchSeqRef = React.useRef(0);
@@ -224,6 +226,7 @@ function FileViewer({ darkMode }) {
     if ('onlyMine' in patch) setOnlyMine(patch.onlyMine);
     if ('lowScoreOnly' in patch) setLowScoreOnly(patch.lowScoreOnly);
     if ('myTeam' in patch) setMyTeam(patch.myTeam);
+    if ('agent' in patch) setAgentFilter(patch.agent);
   };
 
   const userEmail = user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress || '';
@@ -232,7 +235,7 @@ function FileViewer({ darkMode }) {
   // the favorites views). options.path fetches exactly one recording — a
   // shared link — and ignores the filters.
   const fetchFiles = (start, end, offset = 0, limit = filesPerPage, customSortColumn = null, customSortDirection = null, customDurationMin = null, customPhoneFilter = null, customEmailFilter = null, customTimePickerStart = null, customTimePickerEnd = null, customTimeMode = null, customCallId = null, customDisposition = null, options = {}) => {
-    const { view: viewValue, onlyMine: onlyMineValue, lowScoreOnly: lowScoreValue, myTeam: myTeamValue } = viewRef.current;
+    const { view: viewValue, onlyMine: onlyMineValue, lowScoreOnly: lowScoreValue, myTeam: myTeamValue, agent: agentValue } = viewRef.current;
     const pathValue = options.path || null;
     if (!pathValue && !start && viewValue === 'all') return;
     // The date pickers emit invalid dates while a date is half-typed.
@@ -302,6 +305,7 @@ function FileViewer({ darkMode }) {
       if (onlyMineValue) url += `&mine=1`;
       if (lowScoreValue) url += `&scoreMax=${LOW_SCORE_MAX}`;
       if (myTeamValue) url += `&team=1`;
+      if (agentValue) url += `&agent=${encodeURIComponent(agentValue.email)}`;
     }
 
     // Audit VIEW_FILES only on the first fetch after a page load/refresh,
@@ -443,7 +447,12 @@ function FileViewer({ darkMode }) {
         historyNeedsUpdate = true;
       }
     }
-    updateView({ view: viewValue, onlyMine: !recordingParam && params.get('mine') === '1', myTeam: !recordingParam && params.get('team') === '1' });
+    updateView({
+      view: viewValue,
+      onlyMine: !recordingParam && params.get('mine') === '1',
+      myTeam: !recordingParam && params.get('team') === '1',
+      agent: !recordingParam && params.get('agent') ? { email: params.get('agent'), name: params.get('agentName') || '' } : null
+    });
 
     if (recordingParam) {
       startFromQuery = dateFromRecordingPath(recordingParam) || dayjs();
@@ -1314,13 +1323,22 @@ function FileViewer({ darkMode }) {
     timeRangeSet && { key: 'time', label: `Time: ${timePickerStart ? dayjs(timePickerStart).format('h:mm A') : 'any'} – ${timePickerEnd ? dayjs(timePickerEnd).format('h:mm A') : 'any'}`, onRemove: () => refetchAfter(() => { setTimePickerStart(null); setTimePickerEnd(null); }) },
     onlyMine && { key: 'mine', label: 'Only my calls', onRemove: () => handleOnlyMineChange({ target: { checked: false } }) },
     lowScoreOnly && { key: 'low', label: `Score ≤ ${LOW_SCORE_MAX}`, onRemove: () => handleLowScoreChange({ target: { checked: false } }) },
-    myTeam && { key: 'team', label: 'My team', onRemove: () => handleMyTeamChange({ target: { checked: false } }) }
+    myTeam && { key: 'team', label: 'My team', onRemove: () => handleMyTeamChange({ target: { checked: false } }) },
+    agentFilter && { key: 'agent', label: `Agent: ${agentFilter.name || agentFilter.email}`, onRemove: clearAgentFilter }
   ].filter(Boolean);
+  function clearAgentFilter() {
+    removeUrlParam('agent');
+    removeUrlParam('agentName');
+    updateView({ agent: null });
+    fetchFiles(calendarDateStart, calendarDateEnd, 0);
+  }
   const clearAllFilters = () => refetchAfter(() => {
     setPhoneFilter(''); setCallIdFilter(''); setEmailFilter(''); setDispositionFilter(''); setDurationMin('');
     setExtraFilters({ durationMax: '', hasTranscript: '' });
     setTimePickerStart(null); setTimePickerEnd(null);
-    updateView({ onlyMine: false, lowScoreOnly: false, myTeam: false });
+    removeUrlParam('agent');
+    removeUrlParam('agentName');
+    updateView({ onlyMine: false, lowScoreOnly: false, myTeam: false, agent: null });
   });
   const moreCount = (durationMin ? 1 : 0) + (durationMax ? 1 : 0) + (timeRangeSet ? 1 : 0);
 

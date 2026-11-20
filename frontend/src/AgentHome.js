@@ -140,7 +140,8 @@ export default function AgentHome({ initialEmail = null, onEmailChange = null, o
     }
   };
   const [range, setRange] = useState('week');
-  const { data, error, loading, reload } = useApi(email ? `/api/agents/dashboard?email=${encodeURIComponent(email)}&range=${range}` : null);
+  // Stats refresh every 30 minutes while the dashboard is open.
+  const { data, error, loading, reload } = useApi(email ? `/api/agents/dashboard?email=${encodeURIComponent(email)}&range=${range}` : null, { refreshMs: 30 * 60 * 1000 });
 
   // Full name from the server's agent directory (Logto, else Five9), else the email.
   const agentName = (data?.email === email && data?.name) || email;
@@ -199,7 +200,7 @@ export default function AgentHome({ initialEmail = null, onEmailChange = null, o
                   <Typography variant="caption" color="text.secondary">Bars start at 0. Objection handling only counts calls that had an objection.</Typography>
                 </Card>
               </Box>
-              <Card title="Recent calls" action={<Button size="small" variant="outlined" onClick={() => navigate('/recordings')}>View all</Button>}>
+              <Card title="Recent calls" action={<Button size="small" variant="outlined" onClick={() => navigate(`/recordings?${new URLSearchParams({ agent: email, agentName, dateStart: data.period.start, dateEnd: data.period.end })}`)}>View all</Button>}>
                 {data.recent.length ? data.recent.map(r => <CallRow key={r.file_path} row={r} />) : <Typography color="text.secondary">No calls in this period.</Typography>}
               </Card>
             </Box>

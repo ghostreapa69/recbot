@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Box, Chip, Paper, Typography, Alert, CircularProgress } from "@mui/material";
 import { useTheme } from "@mui/material/styles";
 import { useAuth } from './auth';
@@ -115,13 +115,26 @@ export function Card({ title, action, children, sx, ...rest }) {
 }
 
 // GET a JSON endpoint with the user's token. Returns { data, error, loading, reload }.
-export function useApi(url) {
+// refreshMs: fetch again this often while the page is open. Skipped while the tab is
+// hidden; an overdue refresh runs as soon as the tab is visible again.
+export function useApi(url, { refreshMs = null } = {}) {
   const { getToken } = useAuth();
   const [state, setState] = useState({ data: null, error: null, loading: Boolean(url) });
   const [reloadKey, setReloadKey] = useState(0);
+  const fetchedAtRef = useRef(0);
+  useEffect(() => {
+    if (!url || !refreshMs) return undefined;
+    const check = () => {
+      if (!document.hidden && Date.now() - fetchedAtRef.current >= refreshMs) setReloadKey(k => k + 1);
+    };
+    const timer = setInterval(check, Math.min(refreshMs, 60 * 1000));
+    document.addEventListener('visibilitychange', check);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', check); };
+  }, [url, refreshMs]);
   useEffect(() => {
     if (!url) return undefined;
     let cancelled = false;
+    fetchedAtRef.current = Date.now();
     setState(s => ({ ...s, loading: true, error: null }));
     (async () => {
       try {

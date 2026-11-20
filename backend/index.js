@@ -1462,7 +1462,9 @@ app.get('/api/wav-files', requireAuth, ensureSession, requireAuthenticatedUser, 
       favorites: ['mine', 'any'].includes(req.query.favorites) ? req.query.favorites : null,
       mine: req.query.mine === '1',
       // "My team": always the signed-in manager's own team, never from the query string.
-      agentEmails: req.query.team === '1' ? (await teamFor(req.user)).members.map(m => m.email) : undefined,
+      // One agent (an agent page's "View all"), else the manager's team; exact Five9 agent match.
+      agentEmails: readEmail(req.query.agent) ? [readEmail(req.query.agent)]
+        : req.query.team === '1' ? (await teamFor(req.user)).members.map(m => m.email) : undefined,
       viewerEmail: req.user.email.toLowerCase(),
       sortColumn,
       sortDirection,

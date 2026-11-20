@@ -128,7 +128,8 @@ function TeamDashboard({ onSelectAgent }) {
   const navigate = useNavigate();
   const [range, setRange] = useState('week');
   const [group, setGroup] = useState('');
-  const { data, error, loading, reload } = useApi(`/api/teams/dashboard?range=${range}${group ? `&group=${encodeURIComponent(group)}` : ''}`);
+  // Stats refresh every 30 minutes while the dashboard is open.
+  const { data, error, loading, reload } = useApi(`/api/teams/dashboard?range=${range}${group ? `&group=${encodeURIComponent(group)}` : ''}`, { refreshMs: 30 * 60 * 1000 });
 
   const cur = data?.current || {};
   const prev = data?.previous || {};
