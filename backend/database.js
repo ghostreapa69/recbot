@@ -2383,13 +2383,35 @@ export async function resetTranscription(filePath) {
 }
 
 // Scriberr jobs still running, plus ones whose redaction failed and should be retried.
-export async function getPendingTranscriptions() {
+// Jobs Scriberr is still working on (or has queued); their status is checked each pass.
+export async function getJobsInScriberr() {
   const { rows } = await pool.query(`
-    SELECT file_path, scriberr_id, attempts FROM transcriptions
-    WHERE status IN ('processing', 'redaction_failed') AND scriberr_id IS NOT NULL
+    SELECT file_path, scriberr_id FROM transcriptions
+    WHERE status = 'processing' AND scriberr_id IS NOT NULL
     ORDER BY updated_at
   `);
   return rows;
+}
+
+export async function countJobsInScriberr() {
+  const { rows: [{ n }] } = await pool.query(`SELECT count(*)::int AS n FROM transcriptions WHERE status = 'processing'`);
+  return n;
+}
+
+// Scriberr finished these ('transcribed'), or their redaction failed and is retried; oldest first.
+export async function getTranscriptsToRedact(limit) {
+  const { rows } = await pool.query(`
+    SELECT file_path, scriberr_id, attempts FROM transcriptions
+    WHERE status IN ('transcribed', 'redaction_failed') AND scriberr_id IS NOT NULL
+    ORDER BY updated_at
+    LIMIT $1
+  `, [limit]);
+  return rows;
+}
+
+// Scriberr has finished the job; it now waits for redaction and no longer counts as in flight.
+export async function markTranscribed(filePath, scriberrId) {
+  await pool.query(`UPDATE transcriptions SET status = 'transcribed', scriberr_id = $2, updated_at = NOW() WHERE file_path = $1`, [filePath, scriberrId]);
 }
 
 export async function upsertTranscription(filePath, { scriberrId = null, status, transcriptText = null, utterances = null, summary = null, error = null }) {

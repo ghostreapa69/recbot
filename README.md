@@ -156,7 +156,8 @@ SCRIBERR_API_KEY=your_scriberr_api_key
 # ANTHROPIC_MODEL=claude-haiku-5-5  # Claude model for redaction and scoring
 # TRANSCRIBE_LOOKBACK_DAYS=7
 # TRANSCRIBE_MIN_DURATION_SECONDS=50
-# TRANSCRIBE_MAX_PER_TICK=10        # recordings submitted, redacted and scored per 5-minute pass
+# TRANSCRIBE_MAX_PER_TICK=10        # batch size per redaction/scoring pass (passes run back to back while there is a backlog)
+# SCRIBERR_MAX_QUEUED=50            # jobs kept in Scriberr (queued or running); topped up every minute
 ```
 
 ### Quick Start

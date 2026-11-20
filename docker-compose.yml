@@ -126,9 +126,9 @@ services:
       - TRANSCRIBE_LOOKBACK_DAYS=7
       # ...that are longer than this many seconds.
       - TRANSCRIBE_MIN_DURATION_SECONDS=50
-      # Max recordings submitted, redacted and scored per 5-minute tick (sets the load on the Scriberr GPU).
+      # Batch size for each redaction / scoring pass (passes run back to back while there is a backlog).
       #- TRANSCRIBE_MAX_PER_TICK=10
-      # Stop submitting while this many jobs are still in Scriberr (its queue holds at most 200).
+      # Recordings are submitted every minute to keep this many jobs in Scriberr (queued or running; its queue holds at most 200).
       #- SCRIBERR_MAX_QUEUED=50
 
       # --- Optional / Feature Flags ---

@@ -8,7 +8,8 @@ import path from 'path';
 import crypto from 'crypto';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import {
-  pool, getFilesNeedingTranscription, getPendingTranscriptions, upsertTranscription, markRedactionFailed,
+  pool, getFilesNeedingTranscription, getJobsInScriberr, countJobsInScriberr, getTranscriptsToRedact, markTranscribed,
+  upsertTranscription, markRedactionFailed,
   getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError, saveCallAnalysisRetry,
   getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis, adoptScriberrJob, resetTranscription, requeueFailedAnalyses
 } from './database.js';
@@ -29,17 +30,21 @@ export const SKIP_DISPOSITIONS = [
   'Agent Error', 'Answering Machine', 'DeadAir', 'Force Stop', 'Forced Logout',
   'Recycle', 'Sent To Voicemail', 'System Shutdown', 'Voicemail', 'X - DO NOT USE - ACW Expired'
 ];
-// On-prem GPU capacity sets the pace, so each step's batch size is configurable.
+// Batch size for each redaction / scoring / speaker re-check pass.
 const MAX_PER_TICK = parseInt(process.env.TRANSCRIBE_MAX_PER_TICK || '10', 10);
 // Scriberr's in-memory queue holds 200 waiting jobs; past that, submits fail with
-// "Failed to enqueue job" and the job is stranded. Keep our in-flight count well under it.
+// "Failed to enqueue job" and the job is stranded. The feeder keeps this many jobs in
+// Scriberr (queued or running) so it always has work.
 const MAX_QUEUED = parseInt(process.env.SCRIBERR_MAX_QUEUED || '50', 10);
 const MAX_REDACTION_ATTEMPTS = 3;
 const TIMEZONE = process.env.FIVE9_TIMEZONE || 'America/Los_Angeles';
 
-const INTERVAL_MS = 5 * 60 * 1000;
-// Postgres advisory lock key: only one container runs a tick at a time.
-const TRANSCRIBE_LOCK_KEY = 727001;
+// The feeder tops Scriberr up this often; the processor waits this long when it has nothing to do.
+const FEED_INTERVAL_MS = 60 * 1000;
+const IDLE_WAIT_MS = 60 * 1000;
+// Postgres advisory locks: one container processes and one submits at a time.
+const PROCESS_LOCK_KEY = 727001;
+const FEED_LOCK_KEY = 727004;
 const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 const llm = scriberrId => prompt => scriberr.llm(prompt, scriberrId);
@@ -85,13 +90,12 @@ async function findExistingJob(filePath) {
   return jobs.find(j => j.status === 'completed') || jobs.find(j => RUNNING.includes(j.status)) || null;
 }
 
+// Submits recordings until Scriberr holds MAX_QUEUED jobs. Only 'processing' rows count:
+// jobs Scriberr finished wait for redaction as 'transcribed' and don't hold up new work.
 async function submitNew(s3, bucket) {
-  const { rows: [{ n: inFlight }] } = await pool.query("SELECT count(*)::int AS n FROM transcriptions WHERE status = 'processing'");
-  const room = Math.min(MAX_PER_TICK, MAX_QUEUED - inFlight);
-  if (room <= 0) {
-    console.log(`📝 [TRANSCRIBE] Scriberr has ${inFlight} jobs in flight (max ${MAX_QUEUED}); not submitting this tick`);
-    return { submitted: 0, failed: 0 };
-  }
+  const inFlight = await countJobsInScriberr();
+  const room = MAX_QUEUED - inFlight;
+  if (room <= 0) return { submitted: 0, failed: 0, inFlight };
   const cutoff = dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
   const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_MS, room, SKIP_DISPOSITIONS.map(d => d.toLowerCase()));
   let submitted = 0;
@@ -124,18 +128,16 @@ async function submitNew(s3, bucket) {
       if (wavPath) fs.promises.unlink(wavPath).catch(() => {});
     }
   }
-  return { submitted, failed: filePaths.length - submitted };
+  return { submitted, failed: filePaths.length - submitted, inFlight };
 }
 
-// Finished jobs are fetched, redacted, and only then stored. The unredacted text
-// lives in memory for this function call only and is never written to the database.
-async function pollPending() {
-  let completed = 0;
-  let redacted = 0;
-  const pending = await getPendingTranscriptions();
-  console.log(`📝 [TRANSCRIBE] Tick start: pending=${pending.length}`);
-  for (const row of pending) {
-    if (redacted >= MAX_PER_TICK) break; // redaction is the slow step; leave the rest for the next tick
+// Checks every job still in Scriberr. Finished ones become 'transcribed' (waiting for
+// redaction); missing or restart-interrupted ones are recovered as before.
+async function checkJobs() {
+  let checked = 0;
+  let finished = 0;
+  for (const row of await getJobsInScriberr()) {
+    checked++;
     try {
       let id = row.scriberr_id;
       let job;
@@ -165,15 +167,38 @@ async function pollPending() {
         console.error(`❌ [TRANSCRIBE] Scriberr failed ${row.file_path} id=${id}: ${job.error || ''}`);
         continue;
       }
-      if (job.status !== 'completed') continue;
+      if (job.status === 'completed') {
+        await markTranscribed(row.file_path, id);
+        finished++;
+      }
+    } catch (err) {
+      console.error(`❌ [TRANSCRIBE] Status check failed for ${row.file_path}:`, err.message);
+    }
+  }
+  return { checked, finished };
+}
 
-      const raw = await scriberr.transcript(id);
+// Fetches finished transcripts, redacts them, and only then stores them. The unredacted
+// text lives in memory for this function call only and is never written to the database.
+async function redactFinished() {
+  let completed = 0;
+  for (const row of await getTranscriptsToRedact(MAX_PER_TICK)) {
+    const id = row.scriberr_id;
+    try {
+      let raw;
+      try {
+        raw = await scriberr.transcript(id);
+      } catch (err) {
+        if (!err.notFound) throw err;
+        await resetTranscription(row.file_path);
+        console.log(`🔁 [TRANSCRIBE] ${row.file_path}: job ${id} not found when fetching the transcript; resubmitting`);
+        continue;
+      }
       if (!raw.length) {
         await upsertTranscription(row.file_path, { status: 'completed', transcriptText: '', utterances: [] });
         completed++;
         continue;
       }
-      redacted++;
       let utterances;
       try {
         utterances = await redactUtterances(raw, llm(id));
@@ -190,7 +215,7 @@ async function pollPending() {
       console.log(`📝 [TRANSCRIBE] Completed ${row.file_path} id=${id} lines=${utterances.length}`);
       completed++;
     } catch (err) {
-      console.error(`❌ [TRANSCRIBE] Poll failed for ${row.file_path}:`, err.message);
+      console.error(`❌ [TRANSCRIBE] Redaction step failed for ${row.file_path}:`, err.message);
     }
   }
   return completed;
@@ -242,40 +267,51 @@ export async function recheckSpeakers(limit = MAX_PER_TICK) {
   return rescored;
 }
 
-let isRunning = false;
 // Scoring used to give up on replies whose scores it couldn't find; retry those once per start.
 const REQUEUE_ERROR = 'Analysis failed: Analysis has no "scores" object';
 let requeueDone = false;
 
-// One pass of the worker: poll finished jobs, score new transcripts, submit new recordings.
-export async function runTranscriptionTick({ s3, bucket }) {
-  if (isRunning) return;
-  isRunning = true;
-  let client;
+// Runs fn while holding a Postgres advisory lock (every container runs the worker; the
+// lock is freed automatically if this connection dies). Returns null if another has it.
+async function withLock(key, fn) {
+  const client = await pool.connect();
   let locked = false;
   try {
-    // Every container runs this worker. The lock stops two of them submitting
-    // the same recording; it's freed automatically if this connection dies.
-    client = await pool.connect();
-    ({ rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [TRANSCRIBE_LOCK_KEY]));
-    if (!locked) return;
+    ({ rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [key]));
+    return locked ? await fn() : null;
+  } finally {
+    if (locked) await client.query('SELECT pg_advisory_unlock($1)', [key]).catch(() => {});
+    client.release();
+  }
+}
+
+// Processor pass: check Scriberr jobs, redact finished transcripts, score, re-check speakers.
+// Returns true when it did any work, so the next pass can start straight away.
+export async function runProcessorPass() {
+  const result = await withLock(PROCESS_LOCK_KEY, async () => {
     if (!requeueDone) {
       const requeued = await requeueFailedAnalyses(REQUEUE_ERROR);
       requeueDone = true;
       if (requeued) console.log(`🔁 [ANALYZE] Re-queued ${requeued} call(s) that failed with "no scores"`);
     }
-    const completed = await pollPending();
+    const { checked, finished } = await checkJobs();
+    const redacted = await redactFinished();
     const analyzed = await analyzeMissing();
     const rescored = await recheckSpeakers();
-    const { submitted, failed } = await submitNew(s3, bucket);
-    console.log(`📝 [TRANSCRIBE] completed=${completed} analyzed=${analyzed} speakerRescores=${rescored} submitted=${submitted} failed=${failed}`);
-  } catch (err) {
-    console.error('❌ [TRANSCRIBE] Tick failed:', err.message);
-  } finally {
-    if (locked) await client.query('SELECT pg_advisory_unlock($1)', [TRANSCRIBE_LOCK_KEY]).catch(() => {});
-    client?.release();
-    isRunning = false;
-  }
+    const worked = finished + redacted + analyzed + rescored > 0;
+    if (worked) console.log(`📝 [TRANSCRIBE] checked ${checked} jobs (${finished} finished), redacted ${redacted}, analyzed ${analyzed}, speakerRescores ${rescored}`);
+    return worked;
+  });
+  return Boolean(result);
+}
+
+// Feeder pass: keep Scriberr supplied with recordings, independent of redaction and scoring.
+export async function runFeederPass({ s3, bucket }) {
+  return withLock(FEED_LOCK_KEY, async () => {
+    const { submitted, failed, inFlight } = await submitNew(s3, bucket);
+    if (submitted || failed) console.log(`📤 [TRANSCRIBE] submitted ${submitted}${failed ? `, ${failed} failed` : ''} (Scriberr had ${inFlight} jobs in flight, max ${MAX_QUEUED})`);
+    return { submitted, failed, inFlight };
+  });
 }
 
 export function startTranscriptionWorker({ s3, bucket }) {
@@ -283,8 +319,31 @@ export function startTranscriptionWorker({ s3, bucket }) {
     console.log('📝 [TRANSCRIBE] SCRIBERR_URL not set; transcription disabled');
     return;
   }
-  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s maxPerTick=${MAX_PER_TICK} redactionLlm=${scriberr.scriberrLlmModel || '(Scriberr default)'} scoring=${claudeConfigured ? `Claude ${CLAUDE_SCORING_MODEL}` : 'local Scriberr LLM'}`);
-  const tick = () => trackJob('transcription-tick', () => runTranscriptionTick({ s3, bucket }));
-  setTimeout(tick, 60 * 1000);
-  setInterval(tick, INTERVAL_MS);
+  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s batch=${MAX_PER_TICK} scriberrQueue=${MAX_QUEUED} redactionLlm=${scriberr.scriberrLlmModel || '(Scriberr default)'} scoring=${claudeConfigured ? `Claude ${CLAUDE_SCORING_MODEL}` : 'local Scriberr LLM'}`);
+
+  let feeding = false;
+  const feed = async () => {
+    if (feeding) return;
+    feeding = true;
+    try {
+      await trackJob('transcription-feed', () => runFeederPass({ s3, bucket }));
+    } catch (err) {
+      console.error('❌ [TRANSCRIBE] Feeder failed:', err.message);
+    } finally {
+      feeding = false;
+    }
+  };
+  // Back to back while there is work; a pause when there isn't (or another container has the lock).
+  const processLoop = async () => {
+    let worked = false;
+    try {
+      worked = await trackJob('transcription-process', runProcessorPass);
+    } catch (err) {
+      console.error('❌ [TRANSCRIBE] Processor failed:', err.message);
+    } finally {
+      setTimeout(processLoop, worked ? 1000 : IDLE_WAIT_MS);
+    }
+  };
+  setTimeout(() => { feed(); setInterval(feed, FEED_INTERVAL_MS); }, 60 * 1000);
+  setTimeout(processLoop, 60 * 1000);
 }

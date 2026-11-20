@@ -151,7 +151,7 @@ function AnalysisPending({ transcription, analysis, durationMs, disposition }) {
       : `${reason}. Calls with this disposition aren't transcribed or scored.`;
   }
   else if (!transcription || transcription.status === 'none') message = 'This call has not been transcribed. Only recent calls above the minimum length are transcribed and scored.';
-  else if (transcription.status === 'processing' || transcription.status === 'redaction_failed') message = 'Transcription is in progress. The scorecard appears a few minutes after it finishes.';
+  else if (['processing', 'transcribed', 'redaction_failed'].includes(transcription.status)) message = 'Transcription is in progress. The scorecard appears a few minutes after it finishes.';
   else if (transcription.status === 'error') message = `Transcription failed: ${transcription.error || 'unknown error'}`;
   else if (analysis?.status === 'error') message = `Scoring failed: ${analysis.error || 'unknown error'}`;
   else message = 'The transcript is ready; scoring runs on the next pass of the transcription worker (every 5 minutes).';
@@ -467,7 +467,7 @@ export default function RecordingDetail() {
                   <Typography sx={{ fontFamily: '"Manrope", sans-serif', fontWeight: 800, fontSize: 30, lineHeight: 1 }}>{fmtScore(analysis.overall_score)}</Typography>
                   <Box><Typography variant="caption" sx={{ display: 'block', fontWeight: 700 }}>CALL SCORE</Typography><Typography variant="caption">out of ±10</Typography></Box>
                 </Box>
-              ) : <ScoreChip score={null} pending={transcription?.status === 'processing'} durationMs={durationMs} disposition={disposition} />}
+              ) : <ScoreChip score={null} pending={['processing', 'transcribed', 'redaction_failed'].includes(transcription?.status)} durationMs={durationMs} disposition={disposition} />}
               <Tooltip title={linkCopied ? 'Link copied' : 'Copy link to this call'}>
                 <IconButton onClick={copyLink} aria-label="Copy link to this call"><LinkIcon /></IconButton>
               </Tooltip>
