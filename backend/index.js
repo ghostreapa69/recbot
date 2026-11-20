@@ -2672,10 +2672,14 @@ app.get('/', async (req, res, next) => {
     const email = readEmail(req.query.agent);
     if (email && await shareLinks.verify(req.query.agent, req.query.exp, req.query.sig)) {
       try {
-        const [week, photo] = await Promise.all([getAgentDashboard([email], periodFor('week')), entraPhotos.photoFor(email)]);
+        // Photo: the agent's Logto profile picture (linked directly), else Entra if configured.
+        const logtoPhoto = agentDirectory.agentAvatar(email);
+        const [week, photo] = await Promise.all([getAgentDashboard([email], periodFor('week')), logtoPhoto ? null : entraPhotos.photoFor(email)]);
         preview = describeAgentWeek(agentDirectory.agentName(email) || email, week);
-        // Only point at the photo when there is one, so the preview never shows a broken image.
-        if (photo) {
+        // Only point at a photo when there is one, so the preview never shows a broken image.
+        if (logtoPhoto) {
+          preview = { ...preview, image: logtoPhoto };
+        } else if (photo) {
           const q = new URLSearchParams({ agent: req.query.agent, exp: req.query.exp, sig: req.query.sig });
           preview = { ...preview, image: `${req.protocol}://${req.get('host')}/share/agent-photo?${q}` };
         }

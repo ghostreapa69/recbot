@@ -78,8 +78,9 @@ services:
       #- LOGTO_M2M_APP_ID=your-logto-m2m-app-id
       #- LOGTO_M2M_APP_SECRET=your-logto-m2m-app-secret
       #- LOGTO_MANAGEMENT_API_RESOURCE=https://default.logto.app/api
-      # Optional: agent photos from Microsoft Entra ID in Slack link previews. An Entra app registration
-      # with the Microsoft Graph application permission User.Read.All (admin consent granted).
+      # Agent photos in Slack link previews come from Logto (the M2M settings above). Optional fallback for
+      # agents without a Logto photo: Microsoft Entra ID, via an app registration with the Microsoft Graph
+      # application permission User.Read.All (admin consent granted).
       #- ENTRA_TENANT_ID=your-entra-tenant-id
       #- ENTRA_CLIENT_ID=your-entra-app-client-id
       #- ENTRA_CLIENT_SECRET=your-entra-app-client-secret

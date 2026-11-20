@@ -30,6 +30,7 @@ export function createAgentDirectory({ query, env = process.env, fetchImpl = fet
   let byEmail = new Map();
   let loadedAt = 0;
   let logtoNames = new Map();
+  let logtoAvatars = new Map(); // email -> https avatar URL from Logto (e.g. the Microsoft sign-in picture)
   let logtoLoadedAt = 0;
   let refreshing = null;
   let warnedLogto = false;
@@ -50,6 +51,7 @@ export function createAgentDirectory({ query, env = process.env, fetchImpl = fet
       body: new URLSearchParams({ grant_type: 'client_credentials', resource: managementResource, scope: 'all' }).toString()
     });
     const names = new Map();
+    const avatars = new Map();
     for (let page = 1; ; page++) {
       const { json: users, headers } = await fetchJson(`${endpoint}/api/users?page=${page}&page_size=${LOGTO_PAGE_SIZE}`, {
         headers: { authorization: `Bearer ${token.access_token}` }
@@ -58,11 +60,12 @@ export function createAgentDirectory({ query, env = process.env, fetchImpl = fet
         const email = typeof user.primaryEmail === 'string' ? user.primaryEmail.toLowerCase() : '';
         const name = titleName(user);
         if (email && name) names.set(email, name);
+        if (email && typeof user.avatar === 'string' && /^https:\/\//i.test(user.avatar.trim())) avatars.set(email, user.avatar.trim());
       }
       const total = parseInt(headers.get?.('total-number') ?? '', 10);
       if (users.length < LOGTO_PAGE_SIZE || (Number.isFinite(total) && page * LOGTO_PAGE_SIZE >= total)) break;
     }
-    return names;
+    return { names, avatars };
   }
 
   async function refresh() {
@@ -78,7 +81,7 @@ export function createAgentDirectory({ query, env = process.env, fetchImpl = fet
 
     if (logtoConfigured && now() - logtoLoadedAt > LOGTO_USERS_TTL_MS) {
       try {
-        logtoNames = await loadLogtoNames();
+        ({ names: logtoNames, avatars: logtoAvatars } = await loadLogtoNames());
         logtoLoadedAt = now();
       } catch (err) {
         // Keep the previous names (if any) and fall back to Five9 for the rest.
@@ -96,7 +99,7 @@ export function createAgentDirectory({ query, env = process.env, fetchImpl = fet
     byEmail = new Map(list.map(a => [a.email, a.name]));
     loadedAt = now();
     const fromLogto = list.filter(a => logtoNames.has(a.email)).length;
-    log.log(`👥 [AGENTS] Loaded ${list.length} agents (${fromLogto} names from Logto)`);
+    log.log(`👥 [AGENTS] Loaded ${list.length} agents (${fromLogto} names from Logto, ${logtoAvatars.size} Logto users with a photo)`);
     return list;
   }
 
@@ -119,6 +122,10 @@ export function createAgentDirectory({ query, env = process.env, fetchImpl = fet
     agentName(email) {
       if (!email) return null;
       return byEmail.get(String(email).toLowerCase()) || logtoNames.get(String(email).toLowerCase()) || null;
+    },
+    // The agent's Logto profile photo (an https URL), or null.
+    agentAvatar(email) {
+      return email ? logtoAvatars.get(String(email).toLowerCase()) || null : null;
     },
     refresh: startRefresh
   };
