@@ -139,6 +139,23 @@ export function useApi(url) {
   return { ...state, reload: () => setReloadKey(k => k + 1) };
 }
 
+// Copies text to the clipboard (with a fallback for non-HTTPS pages); true when copied.
+export async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textarea);
+  return copied;
+}
+
 export async function postJson(getToken, url, body) {
   const token = await getToken();
   const res = await fetch(url, {

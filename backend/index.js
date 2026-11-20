@@ -30,6 +30,7 @@ import { syncFive9Teams } from './five9Teams.js';
 import { scheduleTeamSync } from './teamSyncSchedule.js';
 import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
 import { trackRequests, trackJob, startBlockMonitor } from './activity.js';
+import { createShareLinks, describeAgentWeek, injectPreview, GENERIC_PREVIEW } from './shareLinks.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -1845,6 +1846,24 @@ app.post('/api/five9/teams/sync', requireAuth, ensureSession, requireAdmin, asyn
 });
 
 const readEmail = value => (typeof value === 'string' && value.includes('@') && value.length <= 320 ? value.trim().toLowerCase() : null);
+
+// Signed links to an agent's Home page; pasted in Slack they preview with that agent's week.
+const shareLinks = createShareLinks({ query: (text, params) => pool.query(text, params) });
+
+// Anyone who can view an agent's dashboard can share it (same rule as /api/agents/dashboard).
+app.post('/api/agents/share-link', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
+  try {
+    const email = readEmail(req.body?.email);
+    if (!email) return res.status(400).json({ error: 'email is required' });
+    const link = await shareLinks.makeLink(`${req.protocol}://${req.get('host')}`, email);
+    logAuditEvent(req.user.id, req.user.email, 'SHARE_AGENT_LINK', null, null, req.user.ipAddress, req.user.userAgent,
+      req.currentSessionId || null, { agent: email, expiresAt: link.expiresAt }).catch(err => console.error('⚠️ [AUDIT] share link:', err.message));
+    res.json(link);
+  } catch (err) {
+    console.error('Error in /api/agents/share-link:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 const readDate = value => (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null);
 
 app.get('/api/agents', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
@@ -2627,6 +2646,31 @@ app.get('/api/audit-users', requireAuth, ensureSession, requireAdmin, async (req
 // Serve React static files
 // Hashed bundles under /static never change, so browsers keep them for a year;
 // index.html is always revalidated so a deploy shows up on the next load.
+// Agent links (/?agent=...) get link-preview tags. Chat apps fetch previews without logging
+// in, so stats are added only for a valid signed share link; any other link gets generic tags.
+// The page itself still requires login to show anything.
+let indexHtmlCache = null;
+app.get('/', async (req, res, next) => {
+  if (typeof req.query.agent !== 'string') return next();
+  try {
+    indexHtmlCache ??= await fs.promises.readFile(path.join(BUILD_DIR, 'index.html'), 'utf8');
+    let preview = GENERIC_PREVIEW;
+    const email = readEmail(req.query.agent);
+    if (email && await shareLinks.verify(req.query.agent, req.query.exp, req.query.sig)) {
+      try {
+        const week = await getAgentDashboard([email], periodFor('week'));
+        preview = describeAgentWeek(agentDirectory.agentName(email) || email, week);
+      } catch (err) {
+        console.error('⚠️ [SHARE] Agent preview stats failed:', err.message);
+      }
+    }
+    res.setHeader('Cache-Control', 'no-cache');
+    res.type('html').send(injectPreview(indexHtmlCache, preview, `${req.protocol}://${req.get('host')}${req.originalUrl}`));
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use(express.static(BUILD_DIR, {
   setHeaders: (res, filePath) => {
     if (filePath.includes(`${path.sep}static${path.sep}`)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');

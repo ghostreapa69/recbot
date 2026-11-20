@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from "react";
-import { useNavigate } from 'react-router-dom';
+import React, { useEffect, useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Box, Typography, ToggleButton, ToggleButtonGroup, FormControl, InputLabel, Select, MenuItem,
   Table, TableHead, TableRow, TableCell, TableBody, TableContainer, TableSortLabel
@@ -25,20 +25,33 @@ export function useMyTeam() {
 
 // Home: managers with a Five9 team land on the team dashboard and can drill
 // into one agent; everyone else sees their own dashboard as before.
+// The agent being viewed is in the URL (?agent=email), so the page can be linked to.
 export default function Home() {
   const { team, loading } = useMyTeam();
-  const [agent, setAgent] = useState(null);
+  const [params, setParams] = useSearchParams();
+  const agent = params.get('agent');
+  // A signed share link carries exp/sig for link previews only; keep them out of the address bar.
+  useEffect(() => {
+    if (params.has('exp') || params.has('sig')) {
+      const next = new URLSearchParams(params);
+      next.delete('exp');
+      next.delete('sig');
+      setParams(next, { replace: true });
+    }
+  }, [params, setParams]);
+  const setAgent = email => setParams(email ? { agent: email } : {}, { replace: true });
+
   if (loading && !team) return <Loadable loading />;
-  if (!team) return <AgentHome />;
+  if (!team) return <AgentHome initialEmail={agent} onEmailChange={setAgent} />;
   if (!team.hasTeam) {
     return (
-      <AgentHome note={team.isAdmin
+      <AgentHome initialEmail={agent} onEmailChange={setAgent} note={team.isAdmin
         ? 'No Five9 agent groups have been synced yet, so this shows your own calls. Run "Sync now" under Admin → Five9 teams.'
         : 'No Five9 agent group lists you as a supervisor, so this shows your own calls.'}
       />
     );
   }
-  if (agent) return <AgentHome key={agent} initialEmail={agent} onBackToTeam={() => setAgent(null)} />;
+  if (agent) return <AgentHome initialEmail={agent} onEmailChange={setAgent} onBackToTeam={() => setAgent(null)} />;
   return <TeamDashboard onSelectAgent={setAgent} />;
 }
 

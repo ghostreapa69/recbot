@@ -1,15 +1,16 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from 'react-router-dom';
 import {
-  Box, Typography, ToggleButton, ToggleButtonGroup, ButtonBase, LinearProgress, Button, Alert
+  Box, Typography, ToggleButton, ToggleButtonGroup, ButtonBase, LinearProgress, Button, Alert, Snackbar
 } from "@mui/material";
 import { useTheme } from "@mui/material/styles";
 import dayjs from "dayjs";
 import LocalFireDepartmentIcon from "@mui/icons-material/LocalFireDepartment";
 import EmojiEventsOutlinedIcon from "@mui/icons-material/EmojiEventsOutlined";
-import { useUser } from './auth';
+import LinkIcon from "@mui/icons-material/Link";
+import { useAuth, useUser } from './auth';
 import { PageHeader } from './Layout';
-import { Card, ScoreChip, DivergingBar, useApi, Loadable, fmtScore, formatMs, recordingUrl, CATEGORY_LABELS } from './ui';
+import { Card, ScoreChip, DivergingBar, useApi, Loadable, fmtScore, formatMs, recordingUrl, CATEGORY_LABELS, postJson, copyText } from './ui';
 import { ScoreTrendChart, CountBar } from './charts';
 import { softBg } from './theme';
 import AgentPicker from './AgentPicker';
@@ -117,13 +118,27 @@ function BadgesCard({ streak, badges }) {
   );
 }
 
-// One agent's dashboard. From the team view it opens on `initialEmail` with a
-// "Back to team" button (`onBackToTeam`); `note` shows a one-line notice.
-export default function AgentHome({ initialEmail = null, onBackToTeam = null, note = null }) {
+// One agent's dashboard. It opens on `initialEmail` (from the URL) and reports picker
+// changes through `onEmailChange`; from the team view it has a "Back to team" button
+// (`onBackToTeam`); `note` shows a one-line notice.
+export default function AgentHome({ initialEmail = null, onEmailChange = null, onBackToTeam = null, note = null }) {
   const { user } = useUser();
+  const { getToken } = useAuth();
   const navigate = useNavigate();
   const myEmail = (user?.primaryEmailAddress?.emailAddress || '').toLowerCase();
-  const [email, setEmail] = useState(initialEmail || myEmail);
+  const [email, setEmailState] = useState(initialEmail || myEmail);
+  useEffect(() => { if (initialEmail && initialEmail !== email) setEmailState(initialEmail); }, [initialEmail]);
+  const setEmail = next => { setEmailState(next); onEmailChange?.(next); };
+  const [shareMessage, setShareMessage] = useState(null);
+  // A signed link that previews with this agent's week when pasted in Slack.
+  const copyShareLink = async () => {
+    try {
+      const { url } = await postJson(getToken, '/api/agents/share-link', { email });
+      setShareMessage(await copyText(url) ? 'Link copied — it previews with stats in Slack for 30 days' : `Copy this link: ${url}`);
+    } catch (err) {
+      setShareMessage(`Could not create a link: ${err.message}`);
+    }
+  };
   const [range, setRange] = useState('week');
   const { data, error, loading, reload } = useApi(email ? `/api/agents/dashboard?email=${encodeURIComponent(email)}&range=${range}` : null);
 
@@ -146,6 +161,7 @@ export default function AgentHome({ initialEmail = null, onBackToTeam = null, no
           <>
             {onBackToTeam && <Button variant="outlined" onClick={onBackToTeam}>‹ Back to team</Button>}
             <AgentPicker value={email} onChange={setEmail} teamOption={onBackToTeam ? { label: 'My team', onPick: onBackToTeam } : null} />
+            <Button variant="outlined" startIcon={<LinkIcon />} onClick={copyShareLink} disabled={!email}>Copy link</Button>
             <ToggleButtonGroup size="small" exclusive value={range} onChange={(_e, v) => v && setRange(v)} aria-label="Range">
               <ToggleButton value="today">Today</ToggleButton>
               <ToggleButton value="week">Week</ToggleButton>
@@ -155,6 +171,7 @@ export default function AgentHome({ initialEmail = null, onBackToTeam = null, no
         )}
       />
       {note && <Alert severity="info" sx={{ mb: 2.5 }}>{note}</Alert>}
+      <Snackbar open={Boolean(shareMessage)} autoHideDuration={5000} onClose={() => setShareMessage(null)} message={shareMessage} anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }} />
       <Loadable loading={loading && !data} error={error} onRetry={reload}>
         {data && (
           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0,1fr)', lg: 'minmax(0,2fr) minmax(0,1fr)' }, gap: 2.5, alignItems: 'start', opacity: loading ? 0.6 : 1 }}>

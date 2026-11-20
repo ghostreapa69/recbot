@@ -15,7 +15,7 @@ import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import SearchIcon from "@mui/icons-material/Search";
 import { useAuth, useUser } from './auth';
 import { requestNotificationsRefresh } from './NotificationBell';
-import { Card, ScoreChip, DivergingBar, useApi, Loadable, fmtScore, formatMs, formatPhone, postJson, recordingUrl, CATEGORY_LABELS, useScoringConfig, notScoredReason } from './ui';
+import { Card, ScoreChip, DivergingBar, useApi, Loadable, fmtScore, formatMs, formatPhone, postJson, recordingUrl, CATEGORY_LABELS, useScoringConfig, notScoredReason, copyText } from './ui';
 import { SentimentChart, TalkShareDonut } from './charts';
 import { useRecordingPlayer, PlayerBar } from './RecordingPlayer';
 import { scoreTone, softBg } from './theme';
@@ -33,22 +33,6 @@ export function rememberCallQueue(paths) {
 
 function readCallQueue() {
   try { return JSON.parse(sessionStorage.getItem(CALL_QUEUE_KEY) || '[]'); } catch (e) { return []; }
-}
-
-async function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(text);
-    return true;
-  }
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.style.position = 'fixed';
-  textarea.style.opacity = '0';
-  document.body.appendChild(textarea);
-  textarea.select();
-  const copied = document.execCommand('copy');
-  document.body.removeChild(textarea);
-  return copied;
 }
 
 const Label = ({ children }) => (
