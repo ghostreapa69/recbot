@@ -82,12 +82,12 @@ export function extractJson(text, isWanted = () => true) {
 // people say (quotes, commas, braces) needs escaping, so the reply can't be malformed that way.
 const REDACT_PROMPT = `You redact personal information from a mortgage company phone call transcript.
 Replace each piece of personal information with a tag in square brackets:
-[PERSON_NAME] for any person's full or last name (keep the agent's and customer's first names only if they are used alone),
 [SSN], [DATE_OF_BIRTH], [ACCOUNT_NUMBER] (loan, bank, routing, account numbers), [CARD_NUMBER], [CARD_CVV], [CARD_EXPIRATION],
 [PHONE_NUMBER], [EMAIL_ADDRESS], [ADDRESS] (street addresses, unit numbers, zip codes), [DRIVERS_LICENSE], [PASSPORT_NUMBER], [PASSWORD].
 Numbers spoken as words or digit by digit are still personal information.
-Do not change anything else: keep loan amounts, interest rates, dates of appointments, company names and all other words exactly as they are.
-Keep any existing [TAG] placeholders.
+Do not redact people's names (agent or customer), even when spelled out letter by letter; keep them exactly as spoken.
+Use only the tags listed above, exactly as written. Never put any other word in square brackets.
+Do not change anything else: keep names, loan amounts, interest rates, dates of appointments, company names and all other words exactly as they are.
 Each input line is "<number>|<text>". Reply with exactly one line for every input line, in the same order and the same form, "<number>|<redacted text>", using the same numbers. Write nothing else: no JSON, no notes.
 
 Lines:
@@ -136,6 +136,24 @@ export function parseRedaction(reply, indexes) {
 // Redacts the given lines: one request, then one retry for just the lines that didn't come
 // back, then halves of whatever is still missing, down to single lines. Throws if a single
 // line can't be redacted.
+// The tags redaction may produce; anything else the model puts in brackets is cleaned up.
+const REDACTION_TAGS = new Set(['SSN', 'DATE_OF_BIRTH', 'ACCOUNT_NUMBER', 'CARD_NUMBER', 'CARD_CVV', 'CARD_EXPIRATION',
+  'PHONE_NUMBER', 'EMAIL_ADDRESS', 'ADDRESS', 'DRIVERS_LICENSE', 'PASSPORT_NUMBER', 'PASSWORD', 'REDACTED']);
+
+// Fixes brackets the model invented (e.g. "[YEP]", "[RAQUEL]"): allowed tags and brackets
+// already in the original line stay; other bracketed text loses its brackets, unless it
+// contains a digit, which becomes [REDACTED] so a spoken number is never shown.
+// Returns { text, fixed } with the number of brackets changed.
+export function cleanRedactedLine(original, redacted) {
+  let fixed = 0;
+  const text = String(redacted).replace(/\[([^\[\]]*)\]/g, (match, inner) => {
+    if (REDACTION_TAGS.has(inner.trim()) || String(original).includes(match)) return match;
+    fixed++;
+    return /\d/.test(inner) ? '[REDACTED]' : inner;
+  });
+  return { text, fixed };
+}
+
 async function redactLines(utterances, indexes, llm) {
   const ask = async idx => parseRedaction(await llm(REDACT_PROMPT + idx.map(i => `${i}|${oneLine(utterances[i].text)}`).join('\n')), idx);
   const done = new Map();
@@ -157,12 +175,18 @@ async function redactLines(utterances, indexes, llm) {
 
 // Returns a redacted copy of the utterances. Timings and speakers come from the input,
 // never from the model. Throws if any line can't be redacted, so nothing unredacted is kept.
-export async function redactUtterances(utterances, llm) {
+export async function redactUtterances(utterances, llm, { label = 'transcript', log = console } = {}) {
   const redacted = utterances.map(u => ({ ...u }));
+  let fixed = 0;
   for (const indexes of chunkUtterances(utterances)) {
     const byIndex = await redactLines(utterances, indexes, llm);
-    for (const i of indexes) redacted[i].text = byIndex.get(i);
+    for (const i of indexes) {
+      const clean = cleanRedactedLine(utterances[i].text, byIndex.get(i));
+      redacted[i].text = clean.text;
+      fixed += clean.fixed;
+    }
   }
+  if (fixed) log.log(`🧹 [REDACT] fixed ${fixed} invented tag${fixed === 1 ? '' : 's'} in ${label}`);
   return redacted;
 }
 

@@ -201,7 +201,7 @@ async function redactFinished() {
       }
       let utterances;
       try {
-        utterances = await redactUtterances(raw, llm(id));
+        utterances = await redactUtterances(raw, llm(id), { label: row.file_path });
       } catch (err) {
         const attempts = await markRedactionFailed(row.file_path, `Redaction failed: ${err.message}`, MAX_REDACTION_ATTEMPTS);
         console.error(`❌ [TRANSCRIBE] Redaction failed for ${row.file_path} (attempt ${attempts}/${MAX_REDACTION_ATTEMPTS}): ${err.message}`);
