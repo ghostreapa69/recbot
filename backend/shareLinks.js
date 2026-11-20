@@ -79,13 +79,15 @@ export function describeAgentWeek(name, { current = {}, previous = {} }) {
 export const GENERIC_PREVIEW = { title: 'RecBot', description: 'Call recordings, scores and coaching.', fields: [] };
 
 // Adds Open Graph and Slack (twitter:label/data) tags to the page head and sets <title>.
-export function injectPreview(html, { title, description, fields = [] }, url = null) {
+// `image` (an absolute URL) shows as the preview's thumbnail.
+export function injectPreview(html, { title, description, fields = [], image = null }, url = null) {
   const tags = [
     ['og:site_name', 'RecBot'],
     ['og:type', 'website'],
     ['og:title', title],
     ['og:description', description],
     ...(url ? [['og:url', url]] : []),
+    ...(image ? [['og:image', image], ['og:image:width', '240'], ['og:image:height', '240'], ['og:image:alt', title], ['twitter:image', image]] : []),
     ['twitter:card', 'summary'],
     ['twitter:title', title],
     ['twitter:description', description],

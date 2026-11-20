@@ -132,6 +132,9 @@ LOGTO_API_RESOURCE=https://recbot.api
 # LOGTO_M2M_APP_ID=your_m2m_app_id
 # LOGTO_M2M_APP_SECRET=your_m2m_app_secret
 # LOGTO_MANAGEMENT_API_RESOURCE=https://default.logto.app/api
+# ENTRA_TENANT_ID=...               # optional: agent photos in Slack previews (Graph User.Read.All, application)
+# ENTRA_CLIENT_ID=...
+# ENTRA_CLIENT_SECRET=...
 # AGENT_LIST_DAYS=90   # agents with calls in the last N days appear in the agent dropdowns
 # Comma-separated domains or exact email addresses (e.g. company.com,@partners.io,admin@vendor.com)
 ALLOWED_LOGIN_IDENTIFIERS=yourcompany.com

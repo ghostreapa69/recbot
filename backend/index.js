@@ -31,6 +31,7 @@ import { scheduleTeamSync } from './teamSyncSchedule.js';
 import { createAudioCache, pipeToResponse, waveformCacheKey as waveformKeyFor } from './audioCache.js';
 import { trackRequests, trackJob, startBlockMonitor } from './activity.js';
 import { createShareLinks, describeAgentWeek, injectPreview, GENERIC_PREVIEW } from './shareLinks.js';
+import { createEntraPhotos } from './entraPhotos.js';
 import { logtoAuth, requireAuth, requireAdmin, requireMemberOrAdmin, requireAuthenticatedUser, requireManagerOrAdmin, allowedLoginConfig, ROLE_SCOPES, ROLE_NAMES, USE_ROLE_NAMES } from './auth.js';
 
 dayjs.extend(customParseFormat);
@@ -1849,6 +1850,19 @@ const readEmail = value => (typeof value === 'string' && value.includes('@') && 
 
 // Signed links to an agent's Home page; pasted in Slack they preview with that agent's week.
 const shareLinks = createShareLinks({ query: (text, params) => pool.query(text, params) });
+const entraPhotos = createEntraPhotos();
+
+// The agent's Entra photo for a share-link preview. Chat apps fetch it without logging in,
+// so it needs the same valid signature as the link itself.
+app.get('/share/agent-photo', async (req, res) => {
+  const email = readEmail(req.query.agent);
+  if (!email || !await shareLinks.verify(req.query.agent, req.query.exp, req.query.sig).catch(() => false)) return res.status(404).end();
+  const photo = await entraPhotos.photoFor(email);
+  if (!photo) return res.status(404).end();
+  res.setHeader('Content-Type', photo.contentType);
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.end(photo.body);
+});
 
 // Anyone who can view an agent's dashboard can share it (same rule as /api/agents/dashboard).
 app.post('/api/agents/share-link', requireAuth, ensureSession, requireAuthenticatedUser, async (req, res) => {
@@ -2658,8 +2672,13 @@ app.get('/', async (req, res, next) => {
     const email = readEmail(req.query.agent);
     if (email && await shareLinks.verify(req.query.agent, req.query.exp, req.query.sig)) {
       try {
-        const week = await getAgentDashboard([email], periodFor('week'));
+        const [week, photo] = await Promise.all([getAgentDashboard([email], periodFor('week')), entraPhotos.photoFor(email)]);
         preview = describeAgentWeek(agentDirectory.agentName(email) || email, week);
+        // Only point at the photo when there is one, so the preview never shows a broken image.
+        if (photo) {
+          const q = new URLSearchParams({ agent: req.query.agent, exp: req.query.exp, sig: req.query.sig });
+          preview = { ...preview, image: `${req.protocol}://${req.get('host')}/share/agent-photo?${q}` };
+        }
       } catch (err) {
         console.error('⚠️ [SHARE] Agent preview stats failed:', err.message);
       }
