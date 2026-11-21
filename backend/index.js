@@ -24,7 +24,7 @@ import { initializeDatabase, pool, queryFiles, indexFiles, indexFile, getDatabas
 import { computeBadges } from './badges.js';
 import { createAgentDirectory } from './agentDirectory.js';
 import { createRecordingScan } from './recordingScan.js';
-import { startTranscriptionWorker, MIN_DURATION_MS, SKIP_DISPOSITIONS } from './transcription.js';
+import { startTranscriptionWorker, requestRetranscribe, MIN_DURATION_MS, SKIP_DISPOSITIONS } from './transcription.js';
 import { fetchLastHourCallLog, fetchCallLog, five9Configured, five9AdminCall, scheduleRecurringIngestion } from './five9.js';
 import { syncFive9Teams } from './five9Teams.js';
 import { scheduleTeamSync } from './teamSyncSchedule.js';
@@ -1671,6 +1671,24 @@ app.get('/api/recordings/detail', requireAuth, ensureSession, requireAuthenticat
 // Lets the UI label calls that won't be transcribed and scored (too short, or a skipped disposition).
 app.get('/api/scoring/config', requireAuth, ensureSession, (req, res) => {
   res.json({ minDurationMs: MIN_DURATION_MS, skipDispositions: SKIP_DISPOSITIONS });
+});
+
+// Deletes the call's transcript (and scorecard) so it is transcribed again with the current
+// Scriberr settings, e.g. after changing SCRIBERR_DIARIZE_MODEL. Admins only.
+app.post('/api/recordings/retranscribe', requireAuth, ensureSession, requireAdmin, async (req, res) => {
+  try {
+    const recordingPath = readRecordingPath(req.body?.path);
+    if (!recordingPath) return res.status(400).json({ error: 'path is required' });
+    const context = await getRecordingContext(recordingPath);
+    if (!context) return res.status(404).json({ error: 'Recording not found' });
+    const result = await requestRetranscribe(recordingPath);
+    if (!result.queued) return res.status(409).json({ error: result.reason });
+    await auditRecordingAction(req, 'RETRANSCRIBE_RECORDING', recordingPath, context.file);
+    res.json(result);
+  } catch (err) {
+    console.error('Error in /api/recordings/retranscribe:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Deletes the call's scorecard so the transcription worker scores it again on its next tick.

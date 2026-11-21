@@ -114,6 +114,9 @@ services:
       #- SCRIBERR_API_KEY=your-scriberr-api-key-here
       # Transcription model and language Scriberr should use (blank = Scriberr's default model).
       #- SCRIBERR_TRANSCRIBE_MODEL=
+      # Speaker detection: pyannote (Scriberr's default) or nvidia_sortformer (better when people talk over
+      # each other on mono calls; must be installed on the Scriberr server). Admins can Re-transcribe a call to compare.
+      #- SCRIBERR_DIARIZE_MODEL=nvidia_sortformer
       # Where Scriberr runs the job (blank = CPU). For an NVIDIA GPU server: cuda / float16 / 8.
       #- SCRIBERR_DEVICE=cuda
       #- SCRIBERR_COMPUTE_TYPE=float16

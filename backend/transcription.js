@@ -11,7 +11,7 @@ import {
   pool, getFilesNeedingTranscription, getJobsInScriberr, countJobsInScriberr, getTranscriptsToRedact, markTranscribed,
   upsertTranscription, markRedactionFailed,
   getTranscriptionsNeedingAnalysis, saveCallAnalysis, saveCallAnalysisError, saveCallAnalysisRetry,
-  getAnalysesNeedingSpeakerCheck, markSpeakerChecked, deleteCallAnalysis, adoptScriberrJob, resetTranscription, requeueFailedAnalyses
+  getAnalysesNeedingSpeakerCheck, isFileTranscribable, markSpeakerChecked, deleteCallAnalysis, adoptScriberrJob, resetTranscription, requeueFailedAnalyses
 } from './database.js';
 import * as scriberr from './scriberr.js';
 import { redactUtterances, analyzeCall, identifyAgentSpeaker } from './analysis.js';
@@ -92,11 +92,27 @@ async function findExistingJob(filePath) {
 
 // Submits recordings until Scriberr holds MAX_QUEUED jobs. Only 'processing' rows count:
 // jobs Scriberr finished wait for redaction as 'transcribed' and don't hold up new work.
+function transcribeCutoff() {
+  return dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
+}
+
+// Admin "Re-transcribe": forget the call's transcript (and scorecard) so the feeder submits it
+// again with the current settings. Only for calls the feeder would pick up; returns
+// { queued: true } or { queued: false, reason }.
+export async function requestRetranscribe(filePath) {
+  if (!scriberr.scriberrConfigured) return { queued: false, reason: 'Transcription is not configured' };
+  if (!await isFileTranscribable(filePath, transcribeCutoff(), MIN_DURATION_MS, SKIP_DISPOSITIONS.map(d => d.toLowerCase()))) {
+    return { queued: false, reason: `Only calls from the last ${LOOKBACK_DAYS} days, over ${MIN_DURATION_SECONDS} seconds and without a skipped disposition are transcribed` };
+  }
+  await resetTranscription(filePath);
+  return { queued: true };
+}
+
 async function submitNew(s3, bucket) {
   const inFlight = await countJobsInScriberr();
   const room = MAX_QUEUED - inFlight;
   if (room <= 0) return { submitted: 0, failed: 0, inFlight, eligible: null };
-  const cutoff = dayjs().tz(TIMEZONE).subtract(LOOKBACK_DAYS, 'day').format('YYYY-MM-DD');
+  const cutoff = transcribeCutoff();
   const filePaths = await getFilesNeedingTranscription(cutoff, MIN_DURATION_MS, room, SKIP_DISPOSITIONS.map(d => d.toLowerCase()));
   let submitted = 0;
   for (const filePath of filePaths) {
@@ -328,7 +344,7 @@ export function startTranscriptionWorker({ s3, bucket }) {
     console.log('📝 [TRANSCRIBE] SCRIBERR_URL not set; transcription disabled');
     return;
   }
-  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s batch=${MAX_PER_TICK} scriberrQueue=${MAX_QUEUED} redactionLlm=${scriberr.scriberrLlmModel || '(Scriberr default)'} scoring=${claudeConfigured ? `Claude ${CLAUDE_SCORING_MODEL}` : 'local Scriberr LLM'}`);
+  console.log(`📝 [TRANSCRIBE] Worker started: lookback=${LOOKBACK_DAYS}d minDuration>${MIN_DURATION_SECONDS}s batch=${MAX_PER_TICK} scriberrQueue=${MAX_QUEUED} diarize=${scriberr.DIARIZE_MODEL || 'Scriberr default'} redactionLlm=${scriberr.scriberrLlmModel || '(Scriberr default)'} scoring=${claudeConfigured ? `Claude ${CLAUDE_SCORING_MODEL}` : 'local Scriberr LLM'}`);
 
   let feeding = false;
   const feed = async () => {

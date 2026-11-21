@@ -2382,6 +2382,19 @@ export async function resetTranscription(filePath) {
   await pool.query('DELETE FROM transcriptions WHERE file_path = $1', [filePath]);
 }
 
+// Whether the transcription feeder would pick this file up (ignoring any existing transcript):
+// same date, length and disposition rules as getFilesNeedingTranscription.
+export async function isFileTranscribable(filePath, cutoffDate, minDurationMs, skipDispositions = []) {
+  const { rows } = await pool.query(`
+    SELECT 1 FROM files f
+    WHERE f.file_path = $1 AND f.call_date >= $2 AND f.duration_ms > $3
+      AND lower(trim(COALESCE(
+        (SELECT r.disposition FROM reporting r WHERE r.call_id = f.call_id AND r.disposition <> '' LIMIT 1),
+        f.call_disposition, ''))) <> ALL($4::text[])
+  `, [filePath, cutoffDate, minDurationMs, skipDispositions]);
+  return rows.length > 0;
+}
+
 // Scriberr jobs still running, plus ones whose redaction failed and should be retried.
 // Jobs Scriberr is still working on (or has queued); their status is checked each pass.
 export async function getJobsInScriberr() {

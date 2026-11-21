@@ -383,6 +383,8 @@ export default function RecordingDetail() {
   const player = useRecordingPlayer(path);
   const [linkCopied, setLinkCopied] = useState(false);
   const [rescoreState, setRescoreState] = useState(null);
+  // Admin re-transcription: null | 'confirm' | 'working' | 'queued' | 'failed: …'
+  const [retranscribeState, setRetranscribeState] = useState(null);
 
   const setTab = (next) => {
     const p = new URLSearchParams(location.search);
@@ -440,6 +442,16 @@ export default function RecordingDetail() {
       reload();
     } catch (err) {
       setRescoreState(`failed: ${err.message}`);
+    }
+  };
+
+  const retranscribe = async () => {
+    setRetranscribeState('working');
+    try {
+      await postJson(getToken, '/api/recordings/retranscribe', { path });
+      setRetranscribeState('queued');
+    } catch (err) {
+      setRetranscribeState(`failed: ${err.message}`);
     }
   };
 
@@ -540,8 +552,24 @@ export default function RecordingDetail() {
                 {transcription?.status === 'completed'
                   ? <Transcript utterances={utterances} agentSpeaker={agentSpeaker} currentMs={player.ready ? player.time * 1000 : -1} onSeek={seekMs} focusMs={focusMs} />
                   : <AnalysisPending transcription={transcription} analysis={data.analysis} durationMs={durationMs} disposition={disposition} />}
+                {role === 'admin' && ['completed', 'error', 'redaction_failed'].includes(transcription?.status) && (
+                  <Box sx={{ mt: 2 }}>
+                    {retranscribeState === 'queued'
+                      ? <Alert severity="info">Re-transcription queued. The call is sent to Scriberr within a minute; the transcript and scorecard are replaced when it finishes.</Alert>
+                      : <Button size="small" onClick={() => setRetranscribeState('confirm')} disabled={retranscribeState === 'working'}>Re-transcribe this call</Button>}
+                    {retranscribeState?.startsWith('failed') && <Alert severity="error" sx={{ mt: 1 }}>Re-transcribe {retranscribeState}</Alert>}
+                  </Box>
+                )}
               </Card>
             )}
+            <Dialog open={retranscribeState === 'confirm'} onClose={() => setRetranscribeState(null)}>
+              <DialogTitle>Re-transcribe this call?</DialogTitle>
+              <DialogContent><Typography variant="body2">This replaces the transcript and scorecard. The call is transcribed again with the current Scriberr settings.</Typography></DialogContent>
+              <DialogActions>
+                <Button onClick={() => setRetranscribeState(null)}>Cancel</Button>
+                <Button variant="contained" onClick={retranscribe}>Re-transcribe</Button>
+              </DialogActions>
+            </Dialog>
 
             {tab === 'analysis' && (analysis ? (
               <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0,1fr)', md: 'repeat(3, minmax(0,1fr))' }, gap: 2.5, alignItems: 'start' }}>

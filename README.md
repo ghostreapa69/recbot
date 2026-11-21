@@ -149,6 +149,7 @@ WAV_DIR=/data/wav
 SCRIBERR_URL=https://scriberr.yourcompany.com
 SCRIBERR_API_KEY=your_scriberr_api_key
 # SCRIBERR_TRANSCRIBE_MODEL=        # blank = Scriberr's default model
+# SCRIBERR_DIARIZE_MODEL=           # pyannote (default) or nvidia_sortformer (handles overlapping speech better)
 # SCRIBERR_DEVICE=cuda              # blank = CPU; cuda for an NVIDIA GPU server
 # SCRIBERR_COMPUTE_TYPE=float16     # float16 on GPU, int8 on CPU
 # SCRIBERR_BATCH_SIZE=8

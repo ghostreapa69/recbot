@@ -13,6 +13,14 @@ const DEVICE = process.env.SCRIBERR_DEVICE || '';
 const COMPUTE_TYPE = process.env.SCRIBERR_COMPUTE_TYPE || '';
 const BATCH_SIZE = process.env.SCRIBERR_BATCH_SIZE || '';
 const LANGUAGE = process.env.SCRIBERR_LANGUAGE || 'en';
+// Speaker detection model. pyannote (Scriberr's default) struggles with people talking over
+// each other on mono calls; nvidia_sortformer is built for overlapping speech. Unset: Scriberr's default.
+const DIARIZE_MODELS = ['pyannote', 'nvidia_sortformer'];
+const RAW_DIARIZE_MODEL = (process.env.SCRIBERR_DIARIZE_MODEL || '').trim();
+export const DIARIZE_MODEL = DIARIZE_MODELS.includes(RAW_DIARIZE_MODEL) ? RAW_DIARIZE_MODEL : '';
+if (RAW_DIARIZE_MODEL && !DIARIZE_MODEL) {
+  console.warn(`⚠️ [SCRIBERR] Ignoring SCRIBERR_DIARIZE_MODEL="${RAW_DIARIZE_MODEL}" (use ${DIARIZE_MODELS.join(' or ')})`);
+}
 const LLM_MODEL = process.env.SCRIBERR_LLM_MODEL || '';
 const REQUEST_TIMEOUT_MS = 30 * 1000;
 const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
@@ -61,6 +69,7 @@ export async function submit(filePath, title) {
   form.append('max_speakers', '2');
   form.append('language', LANGUAGE);
   if (TRANSCRIBE_MODEL) form.append('model', TRANSCRIBE_MODEL);
+  if (DIARIZE_MODEL) form.append('diarize_model', DIARIZE_MODEL);
   if (DEVICE) form.append('device', DEVICE);
   if (COMPUTE_TYPE) form.append('compute_type', COMPUTE_TYPE);
   if (BATCH_SIZE) form.append('batch_size', BATCH_SIZE);
